@@ -5,6 +5,9 @@ const c = @cImport({
     @cInclude("nuklear.h");
     @cInclude("nuklear_sdl_renderer.h");
 });
+const World = @import("world.zig").World;
+const Camera = @import("camera.zig").Camera;
+const render = @import("render.zig");
 
 const render_w = 480;
 const render_h = 270;
@@ -12,9 +15,32 @@ const window_w = 960;
 const window_h = 540;
 
 var framebuffer: [render_w * render_h]u32 = undefined;
+var staging: [render_w * render_h]u32 = undefined;
 
 pub fn main(init: std.process.Init) !void {
-    _ = init;
+    const args = init.minimal.args.vector;
+    var headless_path: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = std.mem.span(args[i]);
+        if (std.mem.eql(u8, arg, "--headless")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHeadlessPath;
+            headless_path = std.mem.span(args[i]);
+        }
+    }
+
+    const allocator = init.gpa;
+    var world = try World.buildDemoRoom(allocator);
+    defer world.deinit();
+    const cam = Camera{ .x = 16, .y = 5.5, .z = 8, .yaw = std.math.pi / 2.0 };
+
+    if (headless_path) |path| {
+        render.render(&framebuffer, render_w, render_h, &world, cam);
+        render.transpose(&staging, &framebuffer, render_w, render_h);
+        try render.writePpm(init.io, allocator, path, &staging, render_w, render_h);
+        return;
+    }
 
     if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
         std.log.err("SDL_Init: {s}", .{c.SDL_GetError()});
@@ -92,9 +118,10 @@ pub fn main(init: std.process.Init) !void {
             fps = if (frame == 0) instant else fps * 0.95 + instant * 0.05;
         }
 
-        fillGradient(frame);
+        render.render(&framebuffer, render_w, render_h, &world, cam);
+        render.transpose(&staging, &framebuffer, render_w, render_h);
 
-        if (c.SDL_UpdateTexture(texture, null, &framebuffer, render_w * 4) != 0) {
+        if (c.SDL_UpdateTexture(texture, null, &staging, render_w * 4) != 0) {
             std.log.err("SDL_UpdateTexture: {s}", .{c.SDL_GetError()});
             return error.SdlTextureUpdateFailed;
         }
@@ -106,17 +133,6 @@ pub fn main(init: std.process.Init) !void {
 
         c.SDL_RenderPresent(renderer);
         frame +%= 1;
-    }
-}
-
-fn fillGradient(frame: u32) void {
-    for (0..render_h) |y| {
-        for (0..render_w) |x| {
-            const r: u32 = @truncate(x * 255 / (render_w - 1));
-            const g: u32 = @truncate(y * 255 / (render_h - 1));
-            const b: u32 = @truncate((x + y + frame * 2) % 256);
-            framebuffer[y * render_w + x] = 0xff000000 | (r << 16) | (g << 8) | b;
-        }
     }
 }
 
