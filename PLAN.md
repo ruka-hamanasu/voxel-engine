@@ -178,7 +178,8 @@ src/gen.zig          # demo world: heightmap terrain, caves, arches, emissive cr
 2. COMPLETED - Column DDA, flat shading, face-factor contrast (verify: headless PPM of a
    hand-built room).
 3. COMPLETED - RLE column storage + edit API, port initial demo world, verify render matches milestone 2.
-4. Fly camera.
+4. COMPLETED - Fly camera (mouse-captured yaw look, WASD + Space/Ctrl, Shift
+   boost, noclip clamped to world bounds; headless render unchanged).
 5. Procedural demo world (terrain, caves, arches).
 6. Colored flood-fill lighting + emissive voxels + incremental relight on edits.
 7. Sky light seeding/defaults + Model A shadows.
