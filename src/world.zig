@@ -8,6 +8,11 @@ pub const palette = [_]u32{
     0x5aa050, // 4: grass
     0x506ec8, // 5: blue
     0xdcdcd7, // 6: marble
+    0x7d5a38, // 7: dirt
+    0x4a4a52, // 8: dark stone
+    0x46e6e6, // 9: crystal cyan
+    0xe646c8, // 10: crystal magenta
+    0xf0a53c, // 11: crystal amber
 };
 
 pub const MatRun = struct {
@@ -104,6 +109,13 @@ pub const World = struct {
         const uz: usize = @intCast(z);
         if (ux >= self.w or uz >= self.d) return null;
         return &self.columns[ux * self.d + uz];
+    }
+
+    pub fn setColumnRuns(self: *World, x: usize, z: usize, runs: []MatRun) void {
+        std.debug.assert(x < self.w and z < self.d);
+        const col = &self.columns[x * self.d + z];
+        self.allocator.free(col.runs);
+        col.runs = runs;
     }
 
     pub fn get(self: *const World, x: i32, y: i32, z: i32) u8 {

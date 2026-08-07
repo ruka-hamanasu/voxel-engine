@@ -5,10 +5,9 @@ const c = @cImport({
     @cInclude("nuklear.h");
     @cInclude("nuklear_sdl_renderer.h");
 });
-const World = @import("world.zig").World;
-const Camera = @import("camera.zig").Camera;
 const Input = @import("camera.zig").Input;
 const render = @import("render.zig");
+const gen = @import("gen.zig");
 
 const render_w = 480;
 const render_h = 270;
@@ -21,6 +20,9 @@ var staging: [render_w * render_h]u32 = undefined;
 pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.vector;
     var headless_path: ?[]const u8 = null;
+    var opts: gen.Options = .{};
+    var generator: gen.Generator = .terrain;
+    var cam_override: ?[4]f32 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
@@ -28,16 +30,38 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingHeadlessPath;
             headless_path = std.mem.span(args[i]);
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSeedValue;
+            opts.seed = try std.fmt.parseInt(u64, std.mem.span(args[i]), 10);
+        } else if (std.mem.eql(u8, arg, "--gen")) {
+            i += 1;
+            if (i >= args.len) return error.MissingGeneratorName;
+            generator = std.meta.stringToEnum(gen.Generator, std.mem.span(args[i])) orelse return error.UnknownGenerator;
+        } else if (std.mem.eql(u8, arg, "--cam")) {
+            i += 1;
+            if (i >= args.len) return error.MissingCamValue;
+            var parts = std.mem.splitScalar(u8, std.mem.span(args[i]), ',');
+            var vals: [4]f32 = undefined;
+            for (&vals) |*v| {
+                const part = parts.next() orelse return error.BadCamValue;
+                v.* = try std.fmt.parseFloat(f32, part);
+            }
+            cam_override = vals;
         }
     }
 
     const allocator = init.gpa;
-    var world = try World.buildDemoRoom(allocator);
-    defer world.deinit();
-    var cam = Camera{ .x = 16, .y = 5.5, .z = 8, .yaw = std.math.pi / 2.0 };
+    var result = try gen.generate(generator, allocator, opts);
+    defer result.deinit(allocator);
+    const world = &result.world;
+    var cam = result.spawn;
+    if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
 
     if (headless_path) |path| {
-        render.render(&framebuffer, render_w, render_h, &world, cam);
+        for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
+        std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
+        render.render(&framebuffer, render_w, render_h, world, cam);
         render.transpose(&staging, &framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, &staging, render_w, render_h);
         return;
@@ -151,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         input.boost = keys[c.SDL_SCANCODE_LSHIFT] != 0;
         cam.update(input, @floatCast(dt), world.w, world.h, world.d);
 
-        render.render(&framebuffer, render_w, render_h, &world, cam);
+        render.render(&framebuffer, render_w, render_h, world, cam);
         render.transpose(&staging, &framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, &staging, render_w * 4) != 0) {

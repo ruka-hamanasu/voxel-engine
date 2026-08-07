@@ -169,7 +169,10 @@ src/world.zig        # columns, material + light RLE streams, edit API, palette
 src/lighting.zig     # colored flood-fill BFS, incremental updates, sky defaults
 src/render.zig       # column DDA rasterizer, single-pass stream merge, AO, fog, shadow march
 src/camera.zig       # yaw-only camera, WASD + mouse input
-src/gen.zig          # demo world: heightmap terrain, caves, arches, emissive crystals
+src/gen.zig          # generator facade: Options/Result/Landmark, Generator enum dispatch
+src/gen/noise.zig    # seeded value noise + fBm (shared by generators)
+src/gen/builder.zig  # dense-column scratch + run encoding (shared by generators)
+src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
 ```
 
 ## Milestones
@@ -180,7 +183,8 @@ src/gen.zig          # demo world: heightmap terrain, caves, arches, emissive cr
 3. COMPLETED - RLE column storage + edit API, port initial demo world, verify render matches milestone 2.
 4. COMPLETED - Fly camera (mouse-captured yaw look, WASD + Space/Ctrl, Shift
    boost, noclip clamped to world bounds; headless render unchanged).
-5. Procedural demo world (terrain, caves, arches).
+5. COMPLETED - Procedural demo world (terrain, caves, arches). Modular
+   generator facade (`--gen`, `--seed` args; `--cam` headless camera override).
 6. Colored flood-fill lighting + emissive voxels + incremental relight on edits.
 7. Sky light seeding/defaults + Model A shadows.
 8. Directional sun march (Model B) + animated sun.
