@@ -180,10 +180,13 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     const y_lo: i32 = @max(@as(i32, @intFromFloat(@floor(h_lo))), 0);
     const y_hi: i32 = @min(@as(i32, @intFromFloat(@floor(h_hi))), @as(i32, @intCast(world.h)) - 1);
     if (y_lo > y_hi) return;
+    const col = world.columnAt(ix, iz) orelse return;
 
     var y: i32 = y_lo;
+    var cur = world_mod.RunCursor.init(col.runs, @intCast(world.h), y_lo);
     while (y <= y_hi) : (y += 1) {
-        const mat = world.get(ix, y, iz);
+        const mat = cur.mat();
+        if (y < y_hi and y == cur.hi) cur.up();
         if (mat == 0) continue;
         const yf: f32 = @floatFromInt(y);
         claim(fb, height, sx, free, proj(yf + 1, t0, height, cam_y, f), proj(yf, t0, height, cam_y, f), shade(mat, axis));
@@ -192,8 +195,10 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     }
 
     y = y_hi;
+    cur = world_mod.RunCursor.init(col.runs, @intCast(world.h), y_hi);
     while (y >= y_lo) : (y -= 1) {
-        const mat = world.get(ix, y, iz);
+        const mat = cur.mat();
+        if (y > y_lo and y == cur.lo) cur.down();
         if (mat == 0) continue;
         const yf: f32 = @floatFromInt(y);
         claim(fb, height, sx, free, proj(yf + 1, t1, height, cam_y, f), proj(yf + 1, t0, height, cam_y, f), shade(mat, .top));
