@@ -177,9 +177,11 @@ src/gen.zig          # demo world: heightmap terrain, caves, arches, emissive cr
 1. COMPLETED - Zig + SDL2 + Nuklear skeleton, framebuffer to screen (verify: color gradient).
 2. COMPLETED - Column DDA, flat shading, face-factor contrast (verify: headless PPM of a
    hand-built room).
-3. Column storage + procedural demo world (terrain, caves, arches) + fly camera.
-4. Colored flood-fill lighting + emissive voxels + incremental relight on edits.
-5. Sky light seeding/defaults + Model A shadows.
-6. Directional sun march (Model B) + animated sun.
-7. Per-vertex fake AO + distance fog + tuning pass (resolution, fog cutoff,
+3. RLE column storage + edit API, port initial demo world, verify render matches milestone 2.
+4. Fly camera.
+5. Procedural demo world (terrain, caves, arches).
+6. Colored flood-fill lighting + emissive voxels + incremental relight on edits.
+7. Sky light seeding/defaults + Model A shadows.
+8. Directional sun march (Model B) + animated sun.
+9. Per-vertex fake AO + distance fog + tuning pass (resolution, fog cutoff,
    light radius).
