@@ -1,19 +1,31 @@
 const std = @import("std");
 
-pub const palette = [_]u32{
-    0x000000, // 0: air (unused)
-    0x8c8c91, // 1: stone
-    0xa5503c, // 2: brick
-    0xc8b482, // 3: sand
-    0x5aa050, // 4: grass
-    0x506ec8, // 5: blue
-    0xdcdcd7, // 6: marble
-    0x7d5a38, // 7: dirt
-    0x4a4a52, // 8: dark stone
-    0x46e6e6, // 9: crystal cyan
-    0xe646c8, // 10: crystal magenta
-    0xf0a53c, // 11: crystal amber
+/// emissive: 0 = normal shaded material; nonzero = emissive intensity
+/// (rendered full-bright, seeds the light flood in milestone 9).
+/// Crystals 9-11 flip to emissive in milestone 9, not here.
+pub const PaletteEntry = struct {
+    rgb: u32,
+    emissive: u8,
 };
+
+pub const default_palette = [_]PaletteEntry{
+    .{ .rgb = 0x000000, .emissive = 0 }, // 0: air (unused)
+    .{ .rgb = 0x8c8c91, .emissive = 0 }, // 1: stone
+    .{ .rgb = 0xa5503c, .emissive = 0 }, // 2: brick
+    .{ .rgb = 0xc8b482, .emissive = 0 }, // 3: sand
+    .{ .rgb = 0x5aa050, .emissive = 0 }, // 4: grass
+    .{ .rgb = 0x506ec8, .emissive = 0 }, // 5: blue
+    .{ .rgb = 0xdcdcd7, .emissive = 0 }, // 6: marble
+    .{ .rgb = 0x7d5a38, .emissive = 0 }, // 7: dirt
+    .{ .rgb = 0x4a4a52, .emissive = 0 }, // 8: dark stone
+    .{ .rgb = 0x46e6e6, .emissive = 0 }, // 9: crystal cyan
+    .{ .rgb = 0xe646c8, .emissive = 0 }, // 10: crystal magenta
+    .{ .rgb = 0xf0a53c, .emissive = 0 }, // 11: crystal amber
+};
+
+/// Runtime-mutable (milestone 10 animates entries); call
+/// render.rebuildShadeLut() after changing it.
+pub var palette = default_palette;
 
 pub const MatRun = struct {
     count: u8,

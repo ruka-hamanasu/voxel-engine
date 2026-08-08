@@ -99,13 +99,18 @@ const face_factor = [4]f32{ 1.0, 0.5, 0.8, 0.6 };
 const ao_factor = [4]f32{ 0.45, 0.65, 0.82, 1.0 };
 
 /// [palette][face][ao_level] -> shaded color; collapses all shading
-/// arithmetic into one L1-resident lookup.
-const shade_lut = blk: {
-    var lut: [world_mod.palette.len][4][4]u32 = undefined;
-    for (world_mod.palette, 0..) |cp, m| {
+/// arithmetic into one L1-resident lookup. Emissive materials bypass
+/// face/AO shading: every entry in their row is the full-bright color.
+/// Runtime-var so milestone 10's palette animation can rebuild it.
+var shade_lut: [world_mod.default_palette.len][4][4]u32 = buildShadeLut(world_mod.default_palette);
+
+fn buildShadeLut(palette: [world_mod.default_palette.len]world_mod.PaletteEntry) [world_mod.default_palette.len][4][4]u32 {
+    var lut: [world_mod.default_palette.len][4][4]u32 = undefined;
+    for (palette, 0..) |entry, m| {
+        const cp = entry.rgb;
         for (face_factor, 0..) |ff, fi| {
             for (ao_factor, 0..) |af, ai| {
-                const factor = ff * af;
+                const factor = if (entry.emissive != 0) 1.0 else ff * af;
                 const r: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 16) & 0xff)) * factor);
                 const g: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 8) & 0xff)) * factor);
                 const b: u32 = @intFromFloat(@as(f32, @floatFromInt(cp & 0xff)) * factor);
@@ -113,8 +118,14 @@ const shade_lut = blk: {
             }
         }
     }
-    break :blk lut;
-};
+    return lut;
+}
+
+/// Rebuild the shade LUT after a palette mutation (milestone 10 calls
+/// this per frame while animating).
+pub fn rebuildShadeLut() void {
+    shade_lut = buildShadeLut(world_mod.palette);
+}
 
 /// Minecraft per-vertex AO: both edge neighbors solid -> darkest (0),
 /// else 3 minus the count of solid occluders (corner included).

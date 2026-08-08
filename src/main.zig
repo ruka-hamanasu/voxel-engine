@@ -62,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     const world = &result.world;
     var cam = result.spawn;
     if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
+    render.rebuildShadeLut();
 
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
