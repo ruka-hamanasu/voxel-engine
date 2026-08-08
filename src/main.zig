@@ -137,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
 
     const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
     var last_counter = c.SDL_GetPerformanceCounter();
+    var time_s: f64 = 0;
     var fps: f64 = 0;
     var frame: u32 = 0;
     var running = true;
@@ -175,6 +176,7 @@ pub fn main(init: std.process.Init) !void {
         const now_counter = c.SDL_GetPerformanceCounter();
         const dt = @as(f64, @floatFromInt(now_counter - last_counter)) / freq;
         last_counter = now_counter;
+        time_s += dt;
         if (dt > 0) {
             const instant = 1.0 / dt;
             fps = if (frame == 0) instant else fps * 0.95 + instant * 0.05;
@@ -192,7 +194,7 @@ pub fn main(init: std.process.Init) !void {
         input.boost = keys[c.SDL_SCANCODE_LSHIFT] != 0;
         cam.update(input, @floatCast(dt), world.w, world.h, world.d);
 
-        render.render(&framebuffer, render_w, render_h, world, cam, .{});
+        render.render(&framebuffer, render_w, render_h, world, cam, .{ .time_s = time_s });
         render.transpose(&staging, &framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, &staging, render_w * 4) != 0) {
