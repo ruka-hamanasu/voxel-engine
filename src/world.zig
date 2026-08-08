@@ -146,6 +146,22 @@ pub const World = struct {
         return 0;
     }
 
+    /// Topmost solid y within [y_lo, y_hi], or null when the column has
+    /// no solid voxel in the interval. Pure interval-overlap scan over
+    /// the material runs; used as the renderer's per-cell reject and by
+    /// the sun shadow march (milestone 12).
+    pub fn firstSolidInColumn(self: *const World, ix: i32, iz: i32, y_lo: i32, y_hi: i32) ?i32 {
+        const col = self.columnAt(ix, iz) orelse return null;
+        var hi: i32 = @intCast(self.h - 1);
+        for (col.runs) |run| {
+            const lo = hi - @as(i32, run.count) + 1;
+            if (run.palette_id != 0 and lo <= y_hi and hi >= y_lo)
+                return @min(hi, y_hi);
+            hi = lo - 1;
+        }
+        return null;
+    }
+
     fn setRange(self: *World, col: *Column, d0: usize, d1: usize, mat: u8) !void {
         var out: std.ArrayList(MatRun) = .empty;
         errdefer out.deinit(self.allocator);
@@ -291,6 +307,20 @@ test "runs split at 255" {
     try world.set(0, 255, 0, 3);
     try std.testing.expectEqual(3, world.get(0, 255, 0));
     try expectCoverage(&world, 0, 0);
+}
+
+test "firstSolidInColumn finds interval overlap" {
+    var world = try World.init(std.testing.allocator, 2, 16, 2);
+    defer world.deinit();
+    try world.fillBox(1, 3, 1, 2, 7, 2, 5);
+    try std.testing.expectEqual(null, world.firstSolidInColumn(0, 0, 0, 15));
+    try std.testing.expectEqual(null, world.firstSolidInColumn(1, 1, 7, 15));
+    try std.testing.expectEqual(null, world.firstSolidInColumn(1, 1, 0, 2));
+    try std.testing.expectEqual(6, world.firstSolidInColumn(1, 1, 0, 15));
+    try std.testing.expectEqual(5, world.firstSolidInColumn(1, 1, 4, 5));
+    try std.testing.expectEqual(4, world.firstSolidInColumn(1, 1, 4, 4));
+    try std.testing.expectEqual(null, world.firstSolidInColumn(-3, 1, 0, 15));
+    try std.testing.expectEqual(null, world.firstSolidInColumn(1, 1, 8, 2));
 }
 
 test "run cursor peeks adjacent voxels" {

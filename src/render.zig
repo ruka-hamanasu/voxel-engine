@@ -21,6 +21,80 @@ pub const RenderParams = struct {
 };
 
 const Face = enum(u2) { top, bottom, x_side, z_side };
+
+/// 2D Amanatides-Woo XZ marcher. Extracted from renderColumn so the
+/// milestone-12 sun shadow march reuses the identical stepping math
+/// (elevation makes the shadow ray's height interval affine in t).
+pub const DdaIterator = struct {
+    max_t: f32,
+    ix: i32,
+    iz: i32,
+    step_x: i32,
+    step_z: i32,
+    t_delta_x: f32,
+    t_delta_z: f32,
+    t_max_x: f32,
+    t_max_z: f32,
+    t0: f32,
+    axis: Face,
+    px: i32,
+    pz: i32,
+    has_prev: bool,
+
+    pub fn init(x: f32, z: f32, dx: f32, dz: f32, max_t: f32) DdaIterator {
+        const inf = std.math.inf(f32);
+        return .{
+            .max_t = max_t,
+            .ix = @intFromFloat(@floor(x)),
+            .iz = @intFromFloat(@floor(z)),
+            .step_x = if (dx > 0) 1 else -1,
+            .step_z = if (dz > 0) 1 else -1,
+            .t_delta_x = if (dx != 0) @abs(1.0 / dx) else inf,
+            .t_delta_z = if (dz != 0) @abs(1.0 / dz) else inf,
+            .t_max_x = if (dx > 0)
+                (@floor(x) + 1.0 - x) / dx
+            else if (dx < 0)
+                (@floor(x) - x) / dx
+            else
+                inf,
+            .t_max_z = if (dz > 0)
+                (@floor(z) + 1.0 - z) / dz
+            else if (dz < 0)
+                (@floor(z) - z) / dz
+            else
+                inf,
+            .t0 = 0,
+            .axis = .x_side,
+            .px = 0,
+            .pz = 0,
+            .has_prev = false,
+        };
+    }
+
+    /// Cell-exit distance of the current cell.
+    pub fn t1(self: *const DdaIterator) f32 {
+        return @min(@min(self.t_max_x, self.t_max_z), self.max_t);
+    }
+
+    /// Step into the next cell; the current cell's coordinates become
+    /// the previous-cell record.
+    pub fn advance(self: *DdaIterator) void {
+        self.px = self.ix;
+        self.pz = self.iz;
+        self.has_prev = true;
+        if (self.t_max_x < self.t_max_z) {
+            self.t0 = self.t_max_x;
+            self.t_max_x += self.t_delta_x;
+            self.ix += self.step_x;
+            self.axis = .x_side;
+        } else {
+            self.t0 = self.t_max_z;
+            self.t_max_z += self.t_delta_z;
+            self.iz += self.step_z;
+            self.axis = .z_side;
+        }
+    }
+};
 const face_factor = [4]f32{ 1.0, 0.5, 0.8, 0.6 };
 const ao_factor = [4]f32{ 0.45, 0.65, 0.82, 1.0 };
 
@@ -246,49 +320,10 @@ pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: 
 fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
     var free = SpanList.initFull(@intCast(height));
 
-    var ix: i32 = @intFromFloat(@floor(cam.x));
-    var iz: i32 = @intFromFloat(@floor(cam.z));
-    const step_x: i32 = if (dx > 0) 1 else -1;
-    const step_z: i32 = if (dz > 0) 1 else -1;
-    const inf = std.math.inf(f32);
-    const t_delta_x: f32 = if (dx != 0) @abs(1.0 / dx) else inf;
-    const t_delta_z: f32 = if (dz != 0) @abs(1.0 / dz) else inf;
-    var t_max_x: f32 = if (dx > 0)
-        (@floor(cam.x) + 1.0 - cam.x) / dx
-    else if (dx < 0)
-        (@floor(cam.x) - cam.x) / dx
-    else
-        inf;
-    var t_max_z: f32 = if (dz > 0)
-        (@floor(cam.z) + 1.0 - cam.z) / dz
-    else if (dz < 0)
-        (@floor(cam.z) - cam.z) / dz
-    else
-        inf;
-
-    var t0: f32 = 0;
-    var axis: Face = .x_side;
-    var px: i32 = 0;
-    var pz: i32 = 0;
-    var has_prev = false;
-
-    while (t0 < max_dist and !free.isEmpty()) {
-        const t1 = @min(@min(t_max_x, t_max_z), max_dist);
-        processCell(fb, height, sx, world, ix, iz, px, pz, has_prev, cam.x, cam.y, cam.z, f, dx, dz, t0, t1, axis, &free, params);
-        px = ix;
-        pz = iz;
-        has_prev = true;
-        if (t_max_x < t_max_z) {
-            t0 = t_max_x;
-            t_max_x += t_delta_x;
-            ix += step_x;
-            axis = .x_side;
-        } else {
-            t0 = t_max_z;
-            t_max_z += t_delta_z;
-            iz += step_z;
-            axis = .z_side;
-        }
+    var dda = DdaIterator.init(cam.x, cam.z, dx, dz, max_dist);
+    while (dda.t0 < max_dist and !free.isEmpty()) {
+        processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cam.x, cam.y, cam.z, f, dx, dz, dda.t0, dda.t1(), dda.axis, &free, params);
+        dda.advance();
     }
 
     for (free.spans[0..free.len]) |s| {
