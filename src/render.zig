@@ -337,24 +337,84 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f
         dda.advance();
     }
 
-    for (free.spans[0..free.len]) |s| {
-        for (s.y0..s.y1) |row| {
-            fb[sx * height + row] = sky[row];
-        }
-    }
+    fillSpans(fb, height, sx, &free, 0, @floatFromInt(height), SkySrc{ .sky = sky });
 }
 
 fn rowAt(y: i32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
     return hf * 0.5 - (@as(f32, @floatFromInt(y)) - cam_y) * f / t;
 }
 
-fn claim(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, color: u32) void {
+const ConstSrc = struct {
+    c: u32,
+
+    fn seek(self: *ConstSrc, row: u16) void {
+        _ = self;
+        _ = row;
+    }
+
+    fn next(self: *ConstSrc, row: u16) u32 {
+        _ = row;
+        return self.c;
+    }
+};
+
+/// 16.16 fixed-point vertical lerp from c0 (at r0) to c1 (at r1). The
+/// gradient is parameterized over the unclipped row domain so
+/// span-clipped pieces sample the same ramp.
+const GradSrc = struct {
+    ch0: [3]i32,
+    step: [3]i32,
+    ra: i32,
+    acc: [3]i32,
+
+    fn init(ra: i32, rb: i32, c0: u32, c1: u32) GradSrc {
+        const n = rb - ra;
+        const ch0 = [3]i32{ @intCast((c0 >> 16) & 0xff), @intCast((c0 >> 8) & 0xff), @intCast(c0 & 0xff) };
+        const ch1 = [3]i32{ @intCast((c1 >> 16) & 0xff), @intCast((c1 >> 8) & 0xff), @intCast(c1 & 0xff) };
+        var step: [3]i32 = undefined;
+        for (0..3) |k| step[k] = @divTrunc((ch1[k] - ch0[k]) << 16, n);
+        return .{ .ch0 = ch0, .step = step, .ra = ra, .acc = undefined };
+    }
+
+    fn seek(self: *GradSrc, row: u16) void {
+        const off: i32 = @as(i32, row) - self.ra;
+        for (0..3) |k| self.acc[k] = (self.ch0[k] << 16) + off * self.step[k] + 0x8000;
+    }
+
+    fn next(self: *GradSrc, row: u16) u32 {
+        _ = row;
+        const cr: u32 = @intCast(std.math.clamp(self.acc[0] >> 16, 0, 255));
+        const cg: u32 = @intCast(std.math.clamp(self.acc[1] >> 16, 0, 255));
+        const cb: u32 = @intCast(std.math.clamp(self.acc[2] >> 16, 0, 255));
+        for (0..3) |k| self.acc[k] += self.step[k];
+        return 0xff000000 | (cr << 16) | (cg << 8) | cb;
+    }
+};
+
+const SkySrc = struct {
+    sky: []const u32,
+
+    fn seek(self: *SkySrc, row: u16) void {
+        _ = self;
+        _ = row;
+    }
+
+    fn next(self: *SkySrc, row: u16) u32 {
+        return self.sky[row];
+    }
+};
+
+/// The single pixel-write path: claim, gradient claim, and the sky
+/// fill all go through here, giving milestone 13's fog glow one
+/// injection point. src provides seek(row)/next(row) color taps.
+fn fillSpans(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, src: anytype) void {
     if (free.isEmpty() or !(r1 > r0)) return;
+    var s = src;
     var i: usize = 0;
     while (i < free.len) {
-        const s = free.spans[i];
-        const a = @max(r0, @as(f32, @floatFromInt(s.y0)));
-        const b = @min(r1, @as(f32, @floatFromInt(s.y1)));
+        const span = free.spans[i];
+        const a = @max(r0, @as(f32, @floatFromInt(span.y0)));
+        const b = @min(r1, @as(f32, @floatFromInt(span.y1)));
         if (!(b > a)) {
             i += 1;
             continue;
@@ -365,61 +425,30 @@ fn claim(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32,
             i += 1;
             continue;
         }
+        s.seek(ia);
         for (ia..ib) |row| {
-            fb[sx * height + row] = color;
+            fb[sx * height + row] = s.next(@intCast(row));
         }
         free.subtract(ia, ib);
         // A fully consumed span shifts the rest of the list down into
         // index i; only advance when span i survived (trimmed or split).
-        if (!(ia <= s.y0 and ib >= s.y1)) i += 1;
+        if (!(ia <= span.y0 and ib >= span.y1)) i += 1;
     }
 }
 
-/// Like claim, but fills a 16.16 fixed-point vertical lerp from c0 (at
-/// r0) to c1 (at r1). The gradient is parameterized over the unclipped
-/// row domain so span-clipped pieces sample the same ramp. Equal stops
-/// (including both-max AO) take the constant-fill fast path.
+fn claim(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, color: u32) void {
+    fillSpans(fb, height, sx, free, r0, r1, ConstSrc{ .c = color });
+}
+
+/// Equal stops (including both-max AO) take the constant-fill fast
+/// path.
 fn claimGrad(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, c0: u32, c1: u32) void {
     if (c0 == c1) return claim(fb, height, sx, free, r0, r1, c0);
     if (free.isEmpty() or !(r1 > r0)) return;
     const ra: i32 = @intFromFloat(@ceil(r0));
     const rb: i32 = @intFromFloat(@ceil(r1));
-    const n = rb - ra;
-    if (n <= 0) return;
-    const ch0 = [3]i32{ @intCast((c0 >> 16) & 0xff), @intCast((c0 >> 8) & 0xff), @intCast(c0 & 0xff) };
-    const ch1 = [3]i32{ @intCast((c1 >> 16) & 0xff), @intCast((c1 >> 8) & 0xff), @intCast(c1 & 0xff) };
-    var step: [3]i32 = undefined;
-    for (0..3) |k| step[k] = @divTrunc((ch1[k] - ch0[k]) << 16, n);
-    var i: usize = 0;
-    while (i < free.len) {
-        const s = free.spans[i];
-        const a = @max(r0, @as(f32, @floatFromInt(s.y0)));
-        const b = @min(r1, @as(f32, @floatFromInt(s.y1)));
-        if (!(b > a)) {
-            i += 1;
-            continue;
-        }
-        const ia: u16 = @intFromFloat(@ceil(a));
-        const ib: u16 = @intFromFloat(@ceil(b));
-        if (ib <= ia) {
-            i += 1;
-            continue;
-        }
-        var acc: [3]i32 = undefined;
-        const off: i32 = @as(i32, ia) - ra;
-        for (0..3) |k| acc[k] = (ch0[k] << 16) + off * step[k] + 0x8000;
-        for (ia..ib) |row| {
-            const cr: u32 = @intCast(std.math.clamp(acc[0] >> 16, 0, 255));
-            const cg: u32 = @intCast(std.math.clamp(acc[1] >> 16, 0, 255));
-            const cb: u32 = @intCast(std.math.clamp(acc[2] >> 16, 0, 255));
-            fb[sx * height + row] = 0xff000000 | (cr << 16) | (cg << 8) | cb;
-            for (0..3) |k| acc[k] += step[k];
-        }
-        free.subtract(ia, ib);
-        // A fully consumed span shifts the rest of the list down into
-        // index i; only advance when span i survived (trimmed or split).
-        if (!(ia <= s.y0 and ib >= s.y1)) i += 1;
-    }
+    if (rb - ra <= 0) return;
+    fillSpans(fb, height, sx, free, r0, r1, GradSrc.init(ra, rb, c0, c1));
 }
 
 /// Visible face fragment produced by segment generation; the single
