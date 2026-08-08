@@ -185,8 +185,16 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
    boost, noclip clamped to world bounds; headless render unchanged).
 5. COMPLETED - Procedural demo world (terrain, caves, arches). Modular
    generator facade (`--gen`, `--seed` args; `--cam` headless camera override).
-6. Colored flood-fill lighting + emissive voxels + incremental relight on edits.
-7. Sky light seeding/defaults + Model A shadows.
-8. Directional sun march (Model B) + animated sun.
-9. Per-vertex fake AO + distance fog + tuning pass (resolution, fog cutoff,
-   light radius).
+6. Per-vertex fake AO (3-neighbor, vertical 2-stop gradient per span;
+   implemented against the current simple shading loop, re-integrated into
+   the single-pass zipper in milestone 8). Verify: headless PPM showing
+   crevice/corner darkening.
+7. Distance fog (exponential + low-pass palette variant; fog glow deferred
+   to milestone 12 since it needs the light map).
+8. Colored flood-fill lighting + emissive voxels (full flood only).
+9. Incremental relight on edits (clear-then-reflood) + emissive palette
+   animation.
+10. Sky light seeding/defaults + Model A shadows.
+11. Directional sun march (Model B) + animated sun.
+12. Fog glow from light map + tuning pass (resolution, fog cutoff, light
+    radius).
