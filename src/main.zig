@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
     var generator: gen.Generator = .terrain;
     var cam_override: ?[4]f32 = null;
     var bench_frames: u32 = 0;
+    var fog_density: ?f32 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
@@ -53,6 +54,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingBenchValue;
             bench_frames = try std.fmt.parseInt(u32, std.mem.span(args[i]), 10);
+        } else if (std.mem.eql(u8, arg, "--fog")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFogValue;
+            fog_density = try std.fmt.parseFloat(f32, std.mem.span(args[i]));
         }
     }
 
@@ -63,11 +68,13 @@ pub fn main(init: std.process.Init) !void {
     var cam = result.spawn;
     if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
     render.rebuildShadeLut();
+    var rparams: render.RenderParams = .{};
+    if (fog_density) |d| rparams.fog_density = d;
 
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..bench_frames) |_| {
-            render.render(&framebuffer, render_w, render_h, world, cam, .{});
+            render.render(&framebuffer, render_w, render_h, world, cam, rparams);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -78,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
     if (headless_path) |path| {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
-        render.render(&framebuffer, render_w, render_h, world, cam, .{});
+        render.render(&framebuffer, render_w, render_h, world, cam, rparams);
         render.transpose(&staging, &framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, &staging, render_w, render_h);
         return;
@@ -194,7 +201,8 @@ pub fn main(init: std.process.Init) !void {
         input.boost = keys[c.SDL_SCANCODE_LSHIFT] != 0;
         cam.update(input, @floatCast(dt), world.w, world.h, world.d);
 
-        render.render(&framebuffer, render_w, render_h, world, cam, .{ .time_s = time_s });
+        rparams.time_s = time_s;
+        render.render(&framebuffer, render_w, render_h, world, cam, rparams);
         render.transpose(&staging, &framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, &staging, render_w * 4) != 0) {

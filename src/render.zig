@@ -9,11 +9,12 @@ pub const hfov: f32 = std.math.pi / 2.0;
 pub const max_dist: f32 = 48.0;
 
 /// Per-frame render configuration, threaded render -> renderColumn ->
-/// processCell. Fields become live in milestones 8-13; for now they
-/// carry defaults only.
+/// processCell. fog_* went live in milestone 8; sun/time/glow land in
+/// milestones 10-13.
 pub const RenderParams = struct {
-    fog_density: f32 = 0.0,
+    fog_density: f32 = 0.05,
     fog_cutoff: f32 = max_dist,
+    fog_color: u32 = 0x8ea6d2, // horizon-row sky color
     sun_azimuth: f32 = 0.0,
     sun_elevation: f32 = 0.0,
     time_s: f64 = 0.0,
@@ -125,6 +126,69 @@ fn buildShadeLut(palette: [world_mod.default_palette.len]world_mod.PaletteEntry)
 /// this per frame while animating).
 pub fn rebuildShadeLut() void {
     shade_lut = buildShadeLut(world_mod.palette);
+}
+
+/// Distance fog (milestone 8). fog_factor buckets a normalized
+/// exponential falloff over [0, fog_cutoff]; fog_dest is the low-pass
+/// variant: each material's color pre-collapses toward the shared fog
+/// color on a front-loaded curve, so distant hues die before the
+/// geometry fades, killing sub-pixel chromatic shimmer at 480x270.
+/// Emissive materials ride separate row rules: half density, fading
+/// toward a saturated version of their own color (volumetric neon
+/// haze; dormant until milestone 9 flips crystals 9-11).
+pub const fog_buckets = 64;
+
+var fog_factor: [fog_buckets]f32 = undefined;
+var fog_dest: [world_mod.default_palette.len][fog_buckets]u32 = undefined;
+
+fn lerpColor(a: u32, b: u32, f: f32) u32 {
+    var out: u32 = 0xff000000;
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const ca: f32 = @floatFromInt((a >> sh) & 0xff);
+        const cb: f32 = @floatFromInt((b >> sh) & 0xff);
+        const ch: u32 = @intFromFloat(ca + (cb - ca) * f);
+        out |= ch << sh;
+    }
+    return out;
+}
+
+/// Normalized exponential falloff: 0 at t=0, exactly 1 at the cutoff,
+/// so geometry at the march limit is indistinguishable from the fogged
+/// horizon.
+fn fogCurve(density: f32, t: f32, cutoff: f32) f32 {
+    return (1.0 - @exp(-density * t)) / (1.0 - @exp(-density * cutoff));
+}
+
+fn buildFogLuts(params: RenderParams) void {
+    const buckets_f: f32 = @floatFromInt(fog_buckets);
+    for (0..fog_buckets) |b| {
+        const t = (@as(f32, @floatFromInt(b)) + 0.5) * params.fog_cutoff / buckets_f;
+        fog_factor[b] = fogCurve(params.fog_density, t, params.fog_cutoff);
+    }
+    for (world_mod.palette, 0..) |entry, m| {
+        if (entry.emissive != 0) {
+            const maxc: f32 = @floatFromInt(@max((entry.rgb >> 16) & 0xff, @max((entry.rgb >> 8) & 0xff, entry.rgb & 0xff)));
+            const s = if (maxc > 0) 255.0 / maxc else 1.0;
+            var sat: u32 = 0xff000000;
+            inline for (0..3) |k| {
+                const sh: u5 = @intCast((2 - k) * 8);
+                const ch: f32 = @floatFromInt((entry.rgb >> sh) & 0xff);
+                const v: u32 = @intFromFloat(@min(ch * s, 255.0));
+                sat |= v << sh;
+            }
+            for (0..fog_buckets) |b| {
+                const t = (@as(f32, @floatFromInt(b)) + 0.5) * params.fog_cutoff / buckets_f;
+                fog_dest[m][b] = lerpColor(entry.rgb, sat, fogCurve(params.fog_density * 0.5, t, params.fog_cutoff));
+            }
+        } else {
+            for (0..fog_buckets) |b| {
+                const f = fog_factor[b];
+                const lp = 1.0 - (1.0 - f) * (1.0 - f);
+                fog_dest[m][b] = lerpColor(entry.rgb, params.fog_color, lp);
+            }
+        }
+    }
 }
 
 /// Minecraft per-vertex AO: both edge neighbors solid -> darkest (0),
@@ -311,9 +375,24 @@ fn skyColor(row: usize, height: usize) u32 {
 
 pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: Camera, params: RenderParams) void {
     std.debug.assert(height <= max_sky_height);
+    const fog_on = params.fog_density > 0;
+    if (fog_on) buildFogLuts(params);
+
     var sky_buf: [max_sky_height]u32 = undefined;
     const sky = sky_buf[0..height];
     for (sky, 0..) |*px, row| px.* = skyColor(row, height);
+    if (fog_on) {
+        // Blend the sky toward the fog color around the horizon row
+        // (always height/2: yaw-only camera) so geometry fogged out at
+        // the cutoff meets the backdrop seamlessly.
+        const hf: f32 = @floatFromInt(height);
+        const horizon = hf * 0.5;
+        const band = hf * 0.25;
+        for (sky, 0..) |*px, row| {
+            const w = 1.0 - @abs(@as(f32, @floatFromInt(row)) + 0.5 - horizon) / band;
+            if (w > 0) px.* = lerpColor(px.*, params.fog_color, w);
+        }
+    }
 
     const wf: f32 = @floatFromInt(width);
     const f = (wf * 0.5) / @tan(hfov * 0.5);
@@ -331,8 +410,12 @@ pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: 
 fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
     var free = SpanList.initFull(@intCast(height));
 
+    // March no farther than the fog cutoff: every later hit is fully
+    // fogged, so the remaining free spans might as well be sky (whose
+    // horizon row is the fog color).
+    const limit = @min(max_dist, params.fog_cutoff);
     var dda = DdaIterator.init(cam.x, cam.z, dx, dz, max_dist);
-    while (dda.t0 < max_dist and !free.isEmpty()) {
+    while (dda.t0 < limit and !free.isEmpty()) {
         processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cam.x, cam.y, cam.z, f, dx, dz, dda.t0, dda.t1(), dda.axis, &free, params);
         dda.advance();
     }
@@ -467,11 +550,22 @@ const Segment = struct {
 /// The single LUT/light/fog composition point; milestones 8-13 extend
 /// this function and nowhere else.
 fn segmentColor(seg: Segment, params: RenderParams) [2]u32 {
-    _ = params;
+    const c0 = shadeAt(seg.mat, seg.face, seg.ao[0]);
+    const c1 = shadeAt(seg.mat, seg.face, seg.ao[1]);
+    if (params.fog_density <= 0) return .{ c0, c1 };
     return .{
-        shadeAt(seg.mat, seg.face, seg.ao[0]),
-        shadeAt(seg.mat, seg.face, seg.ao[1]),
+        fogStop(seg.mat, seg.t[0], c0, params),
+        fogStop(seg.mat, seg.t[1], c1, params),
     };
+}
+
+/// Fog one shaded stop: bucket the distance, lerp toward the material's
+/// (pre-collapsed) fog destination. Per-stop so the gradient fill
+/// lerps between fogged endpoints.
+fn fogStop(mat: u8, t: f32, c: u32, params: RenderParams) u32 {
+    const scale = @as(f32, @floatFromInt(fog_buckets)) / params.fog_cutoff;
+    const b: usize = @intFromFloat(std.math.clamp(t * scale, 0.0, @as(f32, @floatFromInt(fog_buckets - 1))));
+    return lerpColor(c, fog_dest[mat][b], fog_factor[b]);
 }
 
 const SegmentSink = struct {
@@ -716,6 +810,67 @@ test "face ao darkens toward a taller neighbor" {
     try std.testing.expect(near[0] < 3);
     const diag = faceAoStops(&world, 1, 1, 5, 0.9, 0.9, 0.9, 0.9);
     try std.testing.expect(diag[0] < 3);
+}
+
+test "fog lut is monotonic and saturates at the cutoff" {
+    const params: RenderParams = .{};
+    buildFogLuts(params);
+    var prev: f32 = 0;
+    for (fog_factor) |f| {
+        try std.testing.expect(f >= prev);
+        prev = f;
+    }
+    try std.testing.expect(fog_factor[0] > 0);
+    try std.testing.expectApproxEqAbs(1.0, fog_factor[fog_buckets - 1], 0.01);
+    // Low-pass dest of a normal material converges to the fog color.
+    const dest = fog_dest[1][fog_buckets - 1];
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const got: i32 = @intCast((dest >> sh) & 0xff);
+        const want: i32 = @intCast((params.fog_color >> sh) & 0xff);
+        try std.testing.expect(@abs(got - want) <= 2);
+    }
+    // Near distances keep (almost) the material's own color.
+    const near = fog_dest[1][0];
+    try std.testing.expect(@abs(@as(i32, @intCast((near >> 16) & 0xff)) - 0x8c) <= 4);
+}
+
+test "fog disabled leaves segment colors untouched" {
+    const seg: Segment = .{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 2 } };
+    const c = segmentColor(seg, .{ .fog_density = 0 });
+    try std.testing.expectEqual(shadeAt(1, 0, 3), c[0]);
+    try std.testing.expectEqual(shadeAt(1, 0, 2), c[1]);
+}
+
+test "fogged segment converges to the fog color at the cutoff" {
+    const params: RenderParams = .{};
+    buildFogLuts(params);
+    const seg: Segment = .{ .mat = 1, .face = 2, .r0 = 0, .r1 = 10, .t = .{ params.fog_cutoff, params.fog_cutoff }, .ao = .{ 3, 3 } };
+    const c = segmentColor(seg, params);
+    try std.testing.expectEqual(c[0], c[1]);
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const got: i32 = @intCast((c[0] >> sh) & 0xff);
+        const want: i32 = @intCast((params.fog_color >> sh) & 0xff);
+        try std.testing.expect(@abs(got - want) <= 2);
+    }
+}
+
+test "emissive materials fade slower and toward their own color" {
+    const params: RenderParams = .{};
+    defer buildFogLuts(params);
+    const saved = world_mod.palette[9];
+    defer world_mod.palette[9] = saved;
+    world_mod.palette[9].emissive = 1;
+    buildFogLuts(params);
+    const mid = fog_buckets / 2;
+    // A normal material at the same distance is nearly all fog color...
+    const normal = fog_dest[1][mid];
+    try std.testing.expect(@abs(@as(i32, @intCast((normal >> 8) & 0xff)) - 0xa6) <= 8);
+    // ...while the emissive crystal keeps its saturated cyan hue.
+    const glow = fog_dest[9][mid];
+    try std.testing.expect((glow >> 8) & 0xff > 200);
+    try std.testing.expect(glow & 0xff > 200);
 }
 
 test "ao level truth table" {

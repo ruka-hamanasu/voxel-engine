@@ -265,9 +265,33 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
       (fixed-point lerp math unchanged).
    h. COMPLETED - `time_s: f64 += dt` in the main loop, carried in
       RenderParams (headless/bench pass time 0).
-8. Distance fog (exponential + low-pass palette variant; after 7b/7g it
-   lives entirely in `segmentColor` + the sky fill; fog glow deferred to
-   milestone 13 since it needs the light map).
+8. COMPLETED - Distance fog (exponential + low-pass palette variant; lives
+   entirely in `segmentColor` + the sky fill; fog glow deferred to
+   milestone 13 since it needs the light map). Verified: `--fog 0`
+   headless PPMs byte-identical to the milestone-7 base across the 37
+   camera views; default-fog views show distance-graded haze with a
+   seamless horizon; `--fog 0 --bench 1000` 1.58 ms (drift-level vs the
+   1.63 ms pre-change baseline), default fog 1.77 ms (+9%, the actual
+   fog work). Default density 0.05 (0.08 read as pea soup at vista
+   range; final tuning is milestone 13's pass).
+   - `RenderParams` gains `fog_density` (0 disables), `fog_color`
+     (horizon-row sky color 0x8ea6d2); `fog_cutoff` caps the DDA march
+     (`dda.t0 >= cutoff` => every later hit fully fogged => fall through
+     to the sky fill, whose horizon row IS the fog color).
+   - `buildFogLuts` per frame: `fog_factor[64]` buckets the normalized
+     exponential `(1-e^(-dt))/(1-e^(-d*cutoff))` (exactly 1 at the
+     cutoff, so no pop at the march limit); `fog_dest[mat][64]` is the
+     low-pass variant — palette color pre-collapses toward `fog_color`
+     on the front-loaded curve `1-(1-f)^2`, so distant hues die before
+     the geometry fades. Emissive rows (dormant until milestone 9):
+     half density, destination = own color rescaled to full saturation.
+   - `segmentColor` fogs each stop (`fogStop`: bucket t, lerpColor
+     toward `fog_dest[mat][bucket]`); `GradSrc` lerps between fogged
+     endpoints. Density 0 early-returns the raw `shadeAt` pair.
+   - Sky LUT blends toward `fog_color` in a band (height/4) around the
+     horizon row (always height/2 with a yaw-only camera).
+   - `--fog <density>` CLI override; 0 reproduces pre-milestone-8
+     output exactly.
 9. Colored flood-fill lighting + emissive voxels (full flood only). New
    `src/lighting.zig`; renderer merges material+light streams in the
    single-pass zipper inside segment shading.
