@@ -225,12 +225,61 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
       Deferred (profiling-gated): baked per-column side-exposure nibble
       mask (4 bits/voxel, recompute the 5 affected columns on edit) if
       neighbor-cursor culling still shows up hot.
-7. Distance fog (exponential + low-pass palette variant; fog glow deferred
-   to milestone 12 since it needs the light map).
-8. Colored flood-fill lighting + emissive voxels (full flood only).
-9. Incremental relight on edits (clear-then-reflood) + emissive palette
-   animation.
-10. Sky light seeding/defaults + Model A shadows.
-11. Directional sun march (Model B) + animated sun.
-12. Fog glow from light map + tuning pass (resolution, fog cutoff, light
-    radius).
+7. Pre-fog refactor pass — structural groundwork for milestones 8-13. No
+   behavior change (verify: headless PPMs byte-identical across the 37
+   camera views; `--bench` shows no regression — investigate >~5%).
+   Order: a-c reshape render.zig, d-f reshape world.zig data, g-h are
+   small cleanups that ride along.
+   a. `RenderParams` struct (fog density/cutoff, sun az/el, time,
+      fog-glow light-map slot) threaded `render -> renderColumn ->
+      processCell`; update the 3 call sites in main.zig (bench,
+      headless, interactive).
+   b. Split `processCell` (render.zig:367, 138 lines, 20 params — the
+      god function every remaining milestone lands in) into: segment
+      generation (geometry/visibility -> segment records
+      `{mat, face, t, r0, r1, ao_stops}`), `segmentColor(seg, params)`
+      (the single LUT/light/fog composition point for 8-13), and
+      `claimGrad`.
+   c. Extract the XZ DDA stepper from `renderColumn` (render.zig:237-280,
+      pure ray math written inline) into a reusable
+      `DdaIterator{init, next()}` plus a pure
+      `firstSolidInColumn(world, ix, iz, y_lo, y_hi)` interval helper;
+      `renderColumn` consumes both. Milestone 12's sun march reuses them
+      verbatim (elevation => height interval affine in t).
+   d. Palette becomes runtime-mutable: entries `{rgb: u32, emissive: u8}`
+      (0 = not emissive; crystals 9-11 become emissive); `shade_lut`
+      moves from comptime to runtime, rebuilt on palette change (per
+      frame during animation); emissive materials bypass face/AO
+      shading (unshaded LUT path). Required by 9-10.
+   e. Column light stream storage (no behavior yet): lazy
+      `?[]LightRun{count: u8, color_id: u8, intensity: u8}` + `base_y`
+      per the Storage table above; alloc/free in `init`/`deinit`/
+      `setColumnRuns`; `LightCursor` mirroring `RunCursor` (or a cursor
+      generic over both run types); `topSolidY(col)` helper for 11's sky
+      defaults. Extend the `expectCoverage`/`worldsEqual` test
+      invariants to cover light runs.
+   f. Edit API reports dirty extents: `set`/`fillBox` return (or record
+      in `World`) the touched columns + y-ranges, consumed by 10's
+      incremental relight. Also make OOB handling consistent — `set`
+      silently no-ops while `fillBox` clamps; clamp both.
+   g. Unify the three pixel-write sites (`claim`, `claimGrad`, sky fill)
+      behind one span-fill helper so 13's fog glow has a single
+      injection point.
+   h. Accumulated time (`time_s: f64 += dt`) in the main loop, carried
+      in `RenderParams` — drives 10's palette animation and 12's
+      animated sun.
+8. Distance fog (exponential + low-pass palette variant; after 7b/7g it
+   lives entirely in `segmentColor` + the sky fill; fog glow deferred to
+   milestone 13 since it needs the light map).
+9. Colored flood-fill lighting + emissive voxels (full flood only). New
+   `src/lighting.zig`; renderer merges material+light streams in the
+   single-pass zipper inside segment shading.
+10. Incremental relight on edits (clear-then-reflood, consuming 7f's
+    dirty extents) + emissive palette animation (7d's runtime palette +
+    7h's accumulated time).
+11. Sky light seeding/defaults + Model A shadows (uses 7e's light
+    storage + `topSolidY`).
+12. Directional sun march (Model B; reuses 7c's `DdaIterator` +
+    `firstSolidInColumn`) + animated sun.
+13. Fog glow from light map (single injection point from 7g) + tuning
+    pass (resolution, fog cutoff, light radius).
