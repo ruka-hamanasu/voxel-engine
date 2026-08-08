@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..bench_frames) |_| {
-            render.render(&framebuffer, render_w, render_h, world, cam);
+            render.render(&framebuffer, render_w, render_h, world, cam, .{});
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
     if (headless_path) |path| {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
-        render.render(&framebuffer, render_w, render_h, world, cam);
+        render.render(&framebuffer, render_w, render_h, world, cam, .{});
         render.transpose(&staging, &framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, &staging, render_w, render_h);
         return;
@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
         input.boost = keys[c.SDL_SCANCODE_LSHIFT] != 0;
         cam.update(input, @floatCast(dt), world.w, world.h, world.d);
 
-        render.render(&framebuffer, render_w, render_h, world, cam);
+        render.render(&framebuffer, render_w, render_h, world, cam, .{});
         render.transpose(&staging, &framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, &staging, render_w * 4) != 0) {

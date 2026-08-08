@@ -8,6 +8,18 @@ const Camera = camera_mod.Camera;
 pub const hfov: f32 = std.math.pi / 2.0;
 pub const max_dist: f32 = 48.0;
 
+/// Per-frame render configuration, threaded render -> renderColumn ->
+/// processCell. Fields become live in milestones 8-13; for now they
+/// carry defaults only.
+pub const RenderParams = struct {
+    fog_density: f32 = 0.0,
+    fog_cutoff: f32 = max_dist,
+    sun_azimuth: f32 = 0.0,
+    sun_elevation: f32 = 0.0,
+    time_s: f64 = 0.0,
+    glow_map: ?*const anyopaque = null,
+};
+
 const Face = enum(u2) { top, bottom, x_side, z_side };
 const face_factor = [4]f32{ 1.0, 0.5, 0.8, 0.6 };
 const ao_factor = [4]f32{ 0.45, 0.65, 0.82, 1.0 };
@@ -212,7 +224,7 @@ fn skyColor(row: usize, height: usize) u32 {
     return 0xff000000 | (r << 16) | (g << 8) | b;
 }
 
-pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: Camera) void {
+pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: Camera, params: RenderParams) void {
     std.debug.assert(height <= max_sky_height);
     var sky_buf: [max_sky_height]u32 = undefined;
     const sky = sky_buf[0..height];
@@ -227,11 +239,11 @@ pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: 
         const hx = (@as(f32, @floatFromInt(sx)) + 0.5 - wf * 0.5) / f;
         const dx = fwd[0] + rgt[0] * hx;
         const dz = fwd[1] + rgt[1] * hx;
-        renderColumn(fb, height, world, cam, f, sx, dx, dz, sky);
+        renderColumn(fb, height, world, cam, f, sx, dx, dz, sky, params);
     }
 }
 
-fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f32, sx: usize, dx: f32, dz: f32, sky: []const u32) void {
+fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
     var free = SpanList.initFull(@intCast(height));
 
     var ix: i32 = @intFromFloat(@floor(cam.x));
@@ -262,7 +274,7 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f
 
     while (t0 < max_dist and !free.isEmpty()) {
         const t1 = @min(@min(t_max_x, t_max_z), max_dist);
-        processCell(fb, height, sx, world, ix, iz, px, pz, has_prev, cam.x, cam.y, cam.z, f, dx, dz, t0, t1, axis, &free);
+        processCell(fb, height, sx, world, ix, iz, px, pz, has_prev, cam.x, cam.y, cam.z, f, dx, dz, t0, t1, axis, &free, params);
         px = ix;
         pz = iz;
         has_prev = true;
@@ -364,7 +376,8 @@ fn claimGrad(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: 
     }
 }
 
-fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList) void {
+fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList, params: RenderParams) void {
+    _ = params;
     if (free.isEmpty()) return;
     const t0 = @max(t0_in, 1e-4);
     const hf: f32 = @floatFromInt(height);
