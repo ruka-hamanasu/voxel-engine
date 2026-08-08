@@ -27,6 +27,41 @@ pub const RenderParams = struct {
 
 const Face = enum(u2) { top, bottom, x_side, z_side };
 
+/// Face with the outward normal's sign: the four shade classes split
+/// by direction for the milestone-9b directional light weight. Value
+/// order matches lighting.Dir, so the opposite normal is `f ^ 1`.
+const OFace = enum(u3) { px, nx, py, ny, pz, nz };
+
+fn faceClass(of: OFace) Face {
+    return switch (of) {
+        .py => .top,
+        .ny => .bottom,
+        .px, .nx => .x_side,
+        .pz, .nz => .z_side,
+    };
+}
+
+/// Arrival-direction weight (milestone 9b): how much of the sampled
+/// air cell's light a face shows, by alignment of the face normal with
+/// the direction the flood flowed into that cell. Flow heading
+/// straight into the face = full, perpendicular (grazing, e.g. light
+/// bending around a 45-degree corner) = half, opposing = none
+/// (geometrically unreachable for solid-backed faces; kept for LUT
+/// completeness). The none row is identity, so the pre-milestone-11
+/// default sample is unaffected. Entries are tunable.
+const dir_weight = buildDirWeight();
+
+fn buildDirWeight() [7][6]u8 {
+    const none = @intFromEnum(lighting.Dir.none);
+    var lut: [7][6]u8 = undefined;
+    for (0..7) |d| {
+        for (0..6) |f| {
+            lut[d][f] = if (d == none) 255 else if (d == (f ^ 1)) 255 else if (d == f) 0 else 128;
+        }
+    }
+    return lut;
+}
+
 /// 2D Amanatides-Woo XZ marcher. Extracted from renderColumn so the
 /// milestone-12 sun shadow march reuses the identical stepping math
 /// (elevation makes the shadow ray's height interval affine in t).
@@ -553,10 +588,11 @@ fn claimGrad(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: 
 /// (side faces: the previous DDA cell's column; top/bottom faces: one
 /// voxel above/below in the face's own column), uniform per segment —
 /// the zipper splits segments at light-run boundaries. intensity 0 =
-/// no colored light.
+/// no colored light. segmentColor scales intensity by the alignment of
+/// the sample's arrival direction with the (oriented) face normal.
 const Segment = struct {
     mat: u8,
-    face: u8,
+    face: OFace,
     r0: f32,
     r1: f32,
     t: [2]f32,
@@ -584,13 +620,18 @@ fn applyLight(c: u32, light: lighting.LightSample) u32 {
 /// The single LUT/light/fog composition point; milestones 8-13 extend
 /// this function and nowhere else.
 fn segmentColor(seg: Segment, params: RenderParams) [2]u32 {
-    var c0 = shadeAt(seg.mat, seg.face, seg.ao[0]);
-    var c1 = shadeAt(seg.mat, seg.face, seg.ao[1]);
+    const class = @intFromEnum(faceClass(seg.face));
+    var c0 = shadeAt(seg.mat, class, seg.ao[0]);
+    var c1 = shadeAt(seg.mat, class, seg.ao[1]);
     // Emissive materials stay full-bright (shade LUT bypass), so their
     // own seed light is not reapplied on top.
     if (seg.light.intensity != 0 and world_mod.palette[seg.mat].emissive == 0) {
-        c0 = applyLight(c0, seg.light);
-        c1 = applyLight(c1, seg.light);
+        var light = seg.light;
+        light.intensity = @intCast(@as(u16, light.intensity) * dir_weight[@intFromEnum(light.dir)][@intFromEnum(seg.face)] / 255);
+        if (light.intensity != 0) {
+            c0 = applyLight(c0, light);
+            c1 = applyLight(c1, light);
+        }
     }
     if (params.fog_density <= 0) return .{ c0, c1 };
     return .{
@@ -638,7 +679,9 @@ const CellCtx = struct {
     ub: f32,
     vb: f32,
     side_u: f32,
-    side_face: u8,
+    /// Oriented outward normal of side faces in this cell: the DDA
+    /// axis plus the sign pointing back along the march direction.
+    side_face: OFace,
     y_lo: i32,
     y_hi: i32,
     wh: i32,
@@ -690,7 +733,7 @@ fn queryLightRuns(oc: *?world_mod.LightCursor, lo: i32, hi: i32, fallback_hi: i3
     if (y < lo) return .{ .sample = .{}, .hi = lo - 1 };
     while (y > lc.hi) lc.up();
     const run = lc.runs[lc.idx];
-    return .{ .sample = .{ .color_id = run.color_id, .intensity = run.intensity }, .hi = lc.hi };
+    return .{ .sample = .{ .color_id = run.color_id, .intensity = run.intensity, .dir = @enumFromInt(run.dir) }, .hi = lc.hi };
 }
 
 const LightQuery = struct {
@@ -736,7 +779,7 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         .ub = ub,
         .vb = vb,
         .side_u = side_u,
-        .side_face = @intFromEnum(axis),
+        .side_face = if (axis == .x_side) (if (dx > 0) OFace.nx else OFace.px) else (if (dz > 0) OFace.nz else OFace.pz),
         .y_lo = y_lo,
         .y_hi = y_hi,
         .wh = wh,
@@ -809,8 +852,8 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
 /// light runs compile them away entirely.
 fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
     const free = sink.free;
-    const top_face: u8 = @intFromEnum(Face.top);
-    const bottom_face: u8 = @intFromEnum(Face.bottom);
+    const top_face: OFace = .py;
+    const bottom_face: OFace = .ny;
 
     var y = ctx.y_lo;
     var cur = world_mod.RunCursor.init(ctx.col.runs, ctx.wh, ctx.y_lo);
@@ -985,19 +1028,19 @@ test "fog lut is monotonic and saturates at the cutoff" {
 }
 
 test "fog disabled leaves segment colors untouched" {
-    const seg: Segment = .{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 2 } };
+    const seg: Segment = .{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 2 } };
     const c = segmentColor(seg, .{ .fog_density = 0 });
     try std.testing.expectEqual(shadeAt(1, 0, 3), c[0]);
     try std.testing.expectEqual(shadeAt(1, 0, 2), c[1]);
 }
 
 test "light tints shaded stops; zero intensity is identity" {
-    const plain = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 } }, .{ .fog_density = 0 });
-    const zero = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 0 } }, .{ .fog_density = 0 });
+    const plain = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 } }, .{ .fog_density = 0 });
+    const zero = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 0 } }, .{ .fog_density = 0 });
     try std.testing.expectEqual(plain, zero);
 
     // Full-intensity cyan scales each channel by the crystal's rgb.
-    const lit = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 255 } }, .{ .fog_density = 0 });
+    const lit = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 255 } }, .{ .fog_density = 0 });
     const shaded = shadeAt(1, 0, 3);
     const want = [3]u32{ ((shaded >> 16) & 0xff) * 0x46 / 255, ((shaded >> 8) & 0xff) * 0xe6 / 255, (shaded & 0xff) * 0xe6 / 255 };
     inline for (0..3) |k| {
@@ -1007,15 +1050,33 @@ test "light tints shaded stops; zero intensity is identity" {
     }
 
     // Half intensity tints halfway from white.
-    const half = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 128 } }, .{ .fog_density = 0 });
+    const half = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 128 } }, .{ .fog_density = 0 });
     const full_r: i32 = @intCast((lit[0] >> 16) & 0xff);
     const plain_r: i32 = @intCast((plain[0] >> 16) & 0xff);
     const half_r: i32 = @intCast((half[0] >> 16) & 0xff);
     try std.testing.expect(@abs(half_r - @divTrunc(full_r + plain_r, 2)) <= 2);
 }
 
+test "directional weight dims grazing faces and nulls opposed faces" {
+    // Flow heading straight into the top face: full light, identical
+    // to a direction-less sample.
+    const aligned = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 200, .dir = .ny } }, .{ .fog_density = 0 });
+    const plain = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 200 } }, .{ .fog_density = 0 });
+    try std.testing.expectEqual(plain, aligned);
+
+    // Grazing flow: half intensity, matching a pre-weighted sample.
+    const grazing = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 200, .dir = .px } }, .{ .fog_density = 0 });
+    const half = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 200 * 128 / 255 } }, .{ .fog_density = 0 });
+    try std.testing.expectEqual(half, grazing);
+
+    // Opposed flow: the face shows no light.
+    const opposed = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 200, .dir = .py } }, .{ .fog_density = 0 });
+    const unlit = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 } }, .{ .fog_density = 0 });
+    try std.testing.expectEqual(unlit, opposed);
+}
+
 test "emissive materials bypass the light tint" {
-    const seg: Segment = .{ .mat = 9, .face = 2, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 10, .intensity = 255 } };
+    const seg: Segment = .{ .mat = 9, .face = .px, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 10, .intensity = 255 } };
     const c = segmentColor(seg, .{ .fog_density = 0 });
     try std.testing.expectEqual(shadeAt(9, 2, 3), c[0]);
 }
@@ -1023,7 +1084,7 @@ test "emissive materials bypass the light tint" {
 test "fogged segment converges to the fog color at the cutoff" {
     const params: RenderParams = .{};
     buildFogLuts(params);
-    const seg: Segment = .{ .mat = 1, .face = 2, .r0 = 0, .r1 = 10, .t = .{ params.fog_cutoff, params.fog_cutoff }, .ao = .{ 3, 3 } };
+    const seg: Segment = .{ .mat = 1, .face = .px, .r0 = 0, .r1 = 10, .t = .{ params.fog_cutoff, params.fog_cutoff }, .ao = .{ 3, 3 } };
     const c = segmentColor(seg, params);
     try std.testing.expectEqual(c[0], c[1]);
     inline for (0..3) |k| {

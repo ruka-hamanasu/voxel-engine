@@ -13,6 +13,12 @@ const LightRun = world_mod.LightRun;
 /// are encoded into the columns' lazy light runs; cells the flood never
 /// reached keep the material-derived default, which until milestone
 /// 11's sky seeding means "no colored light" (identity tint).
+///
+/// Directional faces (milestone 9b): every cell also records the Dir
+/// the brightest wave flowed in from, so the renderer can weight a
+/// face's light by how its normal aligns with the local flow — a face
+/// perpendicular to the flow (e.g. light bending around a 45-degree
+/// corner) shows half the air cell's light instead of all of it.
 pub const Params = struct {
     attenuation: u8 = 8,
     seed_intensity: u8 = 255,
@@ -23,11 +29,18 @@ pub const Stats = struct {
     runs: usize = 0,
 };
 
+/// Direction the brightest flood wave traveled when it entered a cell
+/// (offset from predecessor into the cell). The opposite direction is
+/// `dir ^ 1`. none = seed cells, unreached cells, and (until milestone
+/// 11 gives it a real direction) the material-derived default.
+pub const Dir = enum(u8) { px, nx, py, ny, pz, nz, none };
+
 /// Light sample at one voxel; intensity 0 = no colored light (identity
 /// tint in the renderer).
 pub const LightSample = struct {
     color_id: u8 = 0,
     intensity: u8 = 0,
+    dir: Dir = .none,
 };
 
 /// color_id is the seeding material's palette id for now; this helper
@@ -44,7 +57,7 @@ pub fn sampleLight(col: *const Column, y: i32) LightSample {
     var hi: i32 = col.light_base_y;
     for (runs) |run| {
         const lo = hi - @as(i32, run.count) + 1;
-        if (y <= hi and y >= lo) return .{ .color_id = run.color_id, .intensity = run.intensity };
+        if (y <= hi and y >= lo) return .{ .color_id = run.color_id, .intensity = run.intensity, .dir = @enumFromInt(run.dir) };
         hi = lo - 1;
     }
     return .{};
@@ -61,6 +74,9 @@ pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !St
     const color = try allocator.alloc(u8, n);
     defer allocator.free(color);
     @memset(color, 0);
+    const dirs = try allocator.alloc(u8, n);
+    defer allocator.free(dirs);
+    @memset(dirs, @intFromEnum(Dir.none));
 
     var queue: std.ArrayList(u32) = .empty;
     defer queue.deinit(allocator);
@@ -101,7 +117,7 @@ pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !St
         const cxz = uv / h;
         const x: i32 = @intCast(cxz / d);
         const z: i32 = @intCast(cxz % d);
-        inline for (.{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } }) |off| {
+        inline for (.{ .{ 1, 0, 0, Dir.px }, .{ -1, 0, 0, Dir.nx }, .{ 0, 1, 0, Dir.py }, .{ 0, -1, 0, Dir.ny }, .{ 0, 0, 1, Dir.pz }, .{ 0, 0, -1, Dir.nz } }) |off| {
             const nx = x + off[0];
             const ny = y + off[1];
             const nz = z + off[2];
@@ -113,6 +129,7 @@ pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !St
                     if (cand > 0 and cand > intensity[nvi]) {
                         intensity[nvi] = cand;
                         color[nvi] = cid;
+                        dirs[nvi] = @intFromEnum(off[3]);
                         try queue.append(allocator, @intCast(nvi));
                     }
                 }
@@ -123,8 +140,10 @@ pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !St
 
     // Encode per column: light runs cover [lowest lit y, highest lit y]
     // (interior unlit voxels become explicit intensity-0 runs); columns
-    // with no light keep light = null. Reflooding replaces and frees
-    // any previous runs, so a full reflood never leaves stale light.
+    // with no light keep light = null. Runs split when the arrival
+    // direction changes, not just the value. Reflooding replaces and
+    // frees any previous runs, so a full reflood never leaves stale
+    // light.
     var stats: Stats = .{};
     for (0..w) |x| {
         for (0..d) |z| {
@@ -150,12 +169,12 @@ pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !St
                 const vi = base + y;
                 if (runs.items.len > 0) {
                     const last = &runs.items[runs.items.len - 1];
-                    if (last.color_id == color[vi] and last.intensity == intensity[vi] and last.count < 255) {
+                    if (last.color_id == color[vi] and last.intensity == intensity[vi] and last.dir == dirs[vi] and last.count < 255) {
                         last.count += 1;
                         continue;
                     }
                 }
-                try runs.append(allocator, .{ .count = 1, .color_id = color[vi], .intensity = intensity[vi] });
+                try runs.append(allocator, .{ .count = 1, .color_id = color[vi], .intensity = intensity[vi], .dir = dirs[vi] });
             }
             const owned = try runs.toOwnedSlice(allocator);
             col.light = owned;
@@ -175,21 +194,28 @@ test "flood falloff is symmetric and attenuates per step" {
     try std.testing.expect(stats.lit_columns > 0);
 
     const col = world.columnAt(4, 4).?;
+    // The seed itself has no arrival direction; its neighbors record
+    // the direction the wave flowed in from.
     try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 255 }, sampleLight(col, 4));
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247 }, sampleLight(col, 5));
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247 }, sampleLight(col, 3));
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239 }, sampleLight(col, 6));
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239 }, sampleLight(col, 2));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247, .dir = .py }, sampleLight(col, 5));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247, .dir = .ny }, sampleLight(col, 3));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239, .dir = .py }, sampleLight(col, 6));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239, .dir = .ny }, sampleLight(col, 2));
     try std.testing.expectEqual(@as(i32, 8), col.light_base_y);
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 223 }, sampleLight(col, 8));
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 223 }, sampleLight(col, 0));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 223, .dir = .py }, sampleLight(col, 8));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 223, .dir = .ny }, sampleLight(col, 0));
     try std.testing.expectEqual(LightSample{}, sampleLight(col, 9));
 
     const diag = world.columnAt(5, 4).?;
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247 }, sampleLight(diag, 4));
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239 }, sampleLight(diag, 5));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247, .dir = .px }, sampleLight(diag, 4));
+    // Tie between the +x and +y paths: the +x neighbor is visited
+    // first (offset order), so the flow reads as arriving from below.
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239, .dir = .py }, sampleLight(diag, 5));
     const far = world.columnAt(8, 8).?;
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 191 }, sampleLight(far, 4));
+    const far_sample = sampleLight(far, 4);
+    try std.testing.expectEqual(@as(u8, 9), far_sample.color_id);
+    try std.testing.expectEqual(@as(u8, 191), far_sample.intensity);
+    try std.testing.expect(far_sample.dir == .px or far_sample.dir == .pz);
 }
 
 test "wall blocks the flood; solids store nothing" {
@@ -199,7 +225,7 @@ test "wall blocks the flood; solids store nothing" {
     try world.fillBox(2, 0, 0, 3, 3, 3, 1);
     _ = try floodAll(&world, std.testing.allocator, .{});
 
-    try std.testing.expectEqual(LightSample{ .color_id = 10, .intensity = 247 }, sampleLight(world.columnAt(1, 1).?, 1));
+    try std.testing.expectEqual(LightSample{ .color_id = 10, .intensity = 247, .dir = .px }, sampleLight(world.columnAt(1, 1).?, 1));
     // The solid wall stores no light, and nothing crosses it.
     try std.testing.expect(world.columnAt(2, 1).?.light == null);
     try std.testing.expect(world.columnAt(3, 1).?.light == null);
@@ -213,10 +239,10 @@ test "brighter flood wins; ties go to the earlier seed" {
     try world.set(4, 1, 1, 10);
     _ = try floodAll(&world, std.testing.allocator, .{});
 
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247 }, sampleLight(world.columnAt(1, 1).?, 1));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 247, .dir = .px }, sampleLight(world.columnAt(1, 1).?, 1));
     // Equidistant midpoint: both arrive at 239, cyan (x=0) wins the tie.
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239 }, sampleLight(world.columnAt(2, 1).?, 1));
-    try std.testing.expectEqual(LightSample{ .color_id = 10, .intensity = 247 }, sampleLight(world.columnAt(3, 1).?, 1));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239, .dir = .px }, sampleLight(world.columnAt(2, 1).?, 1));
+    try std.testing.expectEqual(LightSample{ .color_id = 10, .intensity = 247, .dir = .nx }, sampleLight(world.columnAt(3, 1).?, 1));
 }
 
 test "interior unlit voxels encode as zero runs inside coverage" {
@@ -230,8 +256,8 @@ test "interior unlit voxels encode as zero runs inside coverage" {
     const col = world.columnAt(0, 0).?;
     try std.testing.expectEqual(@as(i32, 9), col.light_base_y);
     try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 255 }, sampleLight(col, 9));
-    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239 }, sampleLight(col, 7));
-    try std.testing.expectEqual(LightSample{ .color_id = 10, .intensity = 239 }, sampleLight(col, 2));
+    try std.testing.expectEqual(LightSample{ .color_id = 9, .intensity = 239, .dir = .ny }, sampleLight(col, 7));
+    try std.testing.expectEqual(LightSample{ .color_id = 10, .intensity = 239, .dir = .py }, sampleLight(col, 2));
     // The solid blocker y=3..6 stores nothing, but coverage spans it.
     for (3..7) |y| {
         try std.testing.expectEqual(LightSample{}, sampleLight(col, @intCast(y)));
@@ -254,15 +280,36 @@ test "uniform floods split runs at 255" {
 
     const col = world.columnAt(0, 0).?;
     const runs = col.light.?;
-    try std.testing.expectEqual(@as(usize, 3), runs.len);
+    // Above the seed the flow is +y (299 cells: 255 + 44), the seed is
+    // dir-less, below it -y (300 cells: 255 + 45): runs split at both
+    // the 255 cap and the direction changes.
+    try std.testing.expectEqual(@as(usize, 5), runs.len);
     try std.testing.expectEqual(@as(u8, 255), runs[0].count);
-    try std.testing.expectEqual(@as(u8, 255), runs[1].count);
-    try std.testing.expectEqual(@as(u8, 90), runs[2].count);
+    try std.testing.expectEqual(@as(u8, 44), runs[1].count);
+    try std.testing.expectEqual(@as(u8, 1), runs[2].count);
+    try std.testing.expectEqual(@as(u8, 255), runs[3].count);
+    try std.testing.expectEqual(@as(u8, 45), runs[4].count);
     for (runs) |run| {
         try std.testing.expectEqual(@as(u8, 9), run.color_id);
         try std.testing.expectEqual(@as(u8, 255), run.intensity);
     }
+    try std.testing.expectEqual(@as(u8, @intFromEnum(Dir.py)), runs[0].dir);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(Dir.none)), runs[2].dir);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(Dir.ny)), runs[4].dir);
     try std.testing.expectEqual(@as(i32, 599), col.light_base_y);
+}
+
+test "arrival direction splits runs at direction changes" {
+    var world = try World.init(std.testing.allocator, 1, 10, 1);
+    defer world.deinit();
+    try world.set(0, 5, 0, 9);
+    _ = try floodAll(&world, std.testing.allocator, .{ .attenuation = 0 });
+
+    const runs = world.columnAt(0, 0).?.light.?;
+    try std.testing.expectEqual(@as(usize, 3), runs.len);
+    try std.testing.expectEqual(LightRun{ .count = 4, .color_id = 9, .intensity = 255, .dir = @intFromEnum(Dir.py) }, runs[0]);
+    try std.testing.expectEqual(LightRun{ .count = 1, .color_id = 9, .intensity = 255, .dir = @intFromEnum(Dir.none) }, runs[1]);
+    try std.testing.expectEqual(LightRun{ .count = 5, .color_id = 9, .intensity = 255, .dir = @intFromEnum(Dir.ny) }, runs[2]);
 }
 
 test "world without emissive materials keeps null light" {

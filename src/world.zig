@@ -35,6 +35,10 @@ pub const LightRun = struct {
     count: u8,
     color_id: u8,
     intensity: u8,
+    /// lighting.Dir of the brightest flood wave's arrival (direction
+    /// the light flowed into the cell); u8 to keep the struct
+    /// independent of lighting.zig. Runs split when it changes.
+    dir: u8,
 };
 
 pub const Column = struct {
@@ -451,8 +455,8 @@ test "light stream storage lifecycle" {
 
     const col = &world.columns[1 * 2 + 1];
     const runs = try allocator.alloc(LightRun, 2);
-    runs[0] = .{ .count = 4, .color_id = 1, .intensity = 200 };
-    runs[1] = .{ .count = 3, .color_id = 1, .intensity = 120 };
+    runs[0] = .{ .count = 4, .color_id = 1, .intensity = 200, .dir = 6 };
+    runs[1] = .{ .count = 3, .color_id = 1, .intensity = 120, .dir = 6 };
     col.light = runs;
     col.light_base_y = 9;
     try expectCoverage(&world, 1, 1);

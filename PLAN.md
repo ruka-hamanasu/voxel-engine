@@ -33,7 +33,7 @@ edit never touches other columns' memory:
 | Data | Representation | Purpose |
 |------|----------------|---------|
 | Material runs | Array of `{count: u8, palette_id: u8}` runs (2 B), top-to-bottom | Geometry; interval-overlap scan answers "solid voxels in height interval [a,b]?" — used by renderer, shadow rays, and sky-light defaults |
-| Light runs | Lazy `?[]` of `{count: u8, color_id: u8, intensity: u8}` runs (3 B) + `base_y`, top-to-bottom | Null = default derived from the material runs (full sky light above the topmost solid run, dark below); allocated/grown where values deviate, freed when empty |
+| Light runs | Lazy `?[]` of `{count: u8, color_id: u8, intensity: u8, dir: u8}` runs (4 B) + `base_y`, top-to-bottom | Null = default derived from the material runs (full sky light above the topmost solid run, dark below); allocated/grown where values deviate, freed when empty. `dir` is the flood's arrival direction (lighting.Dir), used to weight face light by normal alignment (milestone 9b) |
 
 Runs longer than 255 voxels are split into consecutive identical runs — a
 full-height 512-voxel column is 2–3 runs either way, and `u8` counts keep
@@ -117,6 +117,20 @@ indexes a small light-color palette (neon pink, amber, sky blue, ...).
 
 **Emissive seeds:** emissive voxels (rendered full-bright) seed the flood
 with their palette color at full intensity.
+
+**Arrival direction (milestone 9b):** each lit cell also stores the
+direction the brightest flood wave flowed in from (`lighting.Dir`;
+runs split when it changes). Render-time face light is the adjacent
+air cell's sample scaled by the `dir_weight` LUT: flow heading into
+the face = full, perpendicular (grazing, e.g. light bending around a
+45-degree stair-step corner) = half, opposed = none. This is the fix
+for faces showing light from a source they face away from; the
+alternative of storing per-face light on the solid voxels was
+considered and rejected (breaks column-local flood writes and the
+sky-default derivation; fog glow needs the air field anyway). Deferred
+lever if corner-bend leaks still read too bright: a bend penalty —
+extra attenuation when the propagation direction changes between
+predecessor and cell.
 
 **Emissive animation:** palette indirection makes whole-scene animation
 free — blink/cycle emissive materials by rewriting palette entries once per
@@ -256,6 +270,30 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
    loop, accepted; the comptime specialization in genSegments recovered
    the initial +20%), 2.46-2.55 ms light on (lit cave entrances visible
    from spawn); crystal cave view 0.54 -> 0.58 ms (+7%).
+   KNOWN BUG (fixed in 9b): faces show their adjacent air cell's full
+   light even when facing away from the source at a 45-degree angle.
+9b. COMPLETED - Directional flood light. The flood records per cell the
+   direction the brightest wave flowed in from (`lighting.Dir`;
+   `LightRun` 3 -> 4 B; runs split on direction changes), and
+   `segmentColor` scales each face's light intensity by the
+   `dir_weight` LUT indexed [arrival dir][oriented face]: into the
+   face = full, perpendicular = half, opposed = none (unreachable for
+   solid-backed faces). Segments carry an oriented face (`OFace`, the
+   four shade classes split by normal sign; `shadeAt` maps back via
+   `faceClass`). Storing per-face light on solid voxels was considered
+   and rejected (see the Lighting section). Verified: `zig build test`
+   green (dir expectations added to the flood tests, a run-split test,
+   and a directional-weight renderer test); `--light 0 --fog 0` headless
+   PPMs byte-identical across the 37 camera views; spawn light-on
+   byte-identical (no lit columns visible); crystal-cave views show
+   grazing faces at half light with downstream faces and emissive cores
+   unchanged. Flood runs 73462 -> 74233 (+1%, direction splits), flood
+   time flat. Bench (ReleaseFast): spawn `--fog 0 --light 0` 2.25 ->
+   2.23 ms, spawn light-on 2.56 -> 2.51 ms, crystal cave 0.89 -> 0.87
+   ms (all noise-level). Deferred: the bend penalty (extra attenuation
+   when propagation changes direction) for corner-bend leaks whose flow
+   still arrives face-on after bending — evaluate from renders whether
+   it is needed.
 10. Incremental relight on edits (clear-then-reflood, consuming 7f's
     dirty extents) + emissive palette animation (7d's runtime palette +
     7h's accumulated time).

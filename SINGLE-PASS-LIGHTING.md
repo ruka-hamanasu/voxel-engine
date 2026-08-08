@@ -153,6 +153,10 @@ PLAN.md now adopts this algorithm directly:
    light above the topmost solid run, dark below).
 3. **Sampling:** the plan's air-cell light sampling is removed; light applies
    to the column's own voxels, exactly as in the zipper loop above.
+   (Superseded: milestone 9 re-adopted air-cell sampling — a face reads
+   the air cell in front of it so light never leaks through geometry —
+   and milestone 9b added a per-cell arrival direction so faces are
+   weighted by how their normal aligns with the local flow.)
 4. **Light format:** single colored light channel per the discussion. The run
    carries a `color_id` (small light-color palette) plus a `u8` intensity —
    kept wider than the discussion's 4-bit example because the plan's 3–6 m
@@ -163,7 +167,8 @@ with a free downward fast-path, incremental clear-then-reflood edits, the
 Model B directional sun march (interval-tested against material runs), fake
 AO, and distance fog. Runs use `u8` counts as in the discussion — runs
 longer than 255 voxels are split into consecutive identical runs — and all
-run fields are `u8`, so the structs (2 B material, 3 B light) have alignment
+run fields are `u8`, so the structs (2 B material, 4 B light since
+milestone 9b added the arrival-direction byte) have alignment
 1, zero padding, and maximum cache density.
 
 Note: the pseudocode above writes the inner blit strided (`dest += pitch`).
