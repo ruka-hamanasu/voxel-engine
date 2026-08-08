@@ -188,120 +188,74 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
 6. COMPLETED - Fake AO, split into two passes:
    a. COMPLETED - Inner-loop optimizations (verified: headless PPMs
       byte-identical to pre-change output across 37 camera views; ~2.6-3.4x
-      faster via `--bench`):
-      - Sky color LUT: one `height`-entry `u32` table per frame, replacing
-        per-sky-pixel float lerps.
-      - Shade LUT: comptime `[mat][face] -> u32` table, collapsing shading
-        arithmetic to one lookup (extended to `[mat][face][ao]` in 6b).
-      - NOTE: per-cell reciprocal strength reduction of `proj()` was tried
-        and REVERTED — the distributed form `c - y*k` rounds differently
-        than `(y - cam_y) * f / t` and flips tie-break rows when the camera
-        sits at an exact integer height. Projection keeps the original op
-        sequence; the claim-count reduction below makes it cheap.
-      - Run-coalesced claims: side spans claimed per run segment (zippered
-        against the previous cell's runs), top/bottom claimed only at run
-        boundaries where the adjacent voxel is air — interior planes are
-        provably never visible (a ray reaching them would already have been
-        claimed by the occluding voxel at a strictly nearer distance).
-      - Exact face culling: a side face is skipped where the same-y voxel in
-        the previous DDA cell is solid, via a lockstep `RunCursor` on the
-        previous column (amortized O(1) per segment, no per-query run scans).
-        6b's AO neighbor queries reuse the same occupancy walk.
-      - `--bench N` flag: N headless renders, prints ms/frame.
-   b. COMPLETED - Per-vertex fake AO: Minecraft 3-neighbor (side1, side2,
-      corner), factors {0.45, 0.65, 0.82, 1.0}; 2-stop vertical gradient
-      per span, stops sampled at the ray's hit u. Stops are fractional
-      AO levels (lerpLevel/bilerpLevel); shadeAt lerps between adjacent
-      shade-LUT entries — rounding stops to the 4 discrete levels bands
-      adjacent screen columns. Fixed-point lerp fill with a
-      constant-fill fast path when both stops are max. See doc
-      comments in render.zig (aoLevel, sideAoStops, faceAoStops,
+      faster via `--bench`): sky color LUT, comptime shade LUT (extended
+      to [mat][face][ao] in 6b), run-coalesced claims, exact face culling
+      via a lockstep RunCursor on the previous column; `--bench N` flag.
+      A reciprocal strength reduction of the projection was tried and
+      REVERTED — rationale lives in rowAt's comment.
+   b. COMPLETED - Per-vertex fake AO: Minecraft 3-neighbor model,
+      fractional stops lerped between shade-LUT entries. Mechanism
+      documented in render.zig (aoLevel, sideAoStops, faceAoStops,
       shadeAt, claimGrad, spanOverlap) and world.zig (RunCursor.peek).
       Verify: headless PPMs show darkening localized to
       edges/crevices/corners, sky and open faces byte-identical; frame
-      time 1.08 -> 1.65 ms at the spawn view. Key perf note:
-      the band/free-span overlap pre-check must gate all AO neighbor
-      queries (without it AO costs 3.8x; with it +40%).
+      time 1.08 -> 1.65 ms at the spawn view.
       Deferred (profiling-gated): baked per-column side-exposure nibble
       mask (4 bits/voxel, recompute the 5 affected columns on edit) if
       neighbor-cursor culling still shows up hot.
 7. COMPLETED - Pre-fog refactor pass — structural groundwork for milestones
-   8-13. Verified: headless PPMs byte-identical across the 37 camera views
-   after every sub-part; `--bench 1000` flat (1.55 -> 1.64 ms, within
-   machine drift; A/B stash checks showed no regression from any part).
-   a. COMPLETED - `RenderParams` struct (fog density/cutoff, sun az/el,
-      time, fog-glow light-map slot) threaded `render -> renderColumn ->
-      processCell`; 3 call sites in main.zig updated.
-   b. COMPLETED - `processCell` split: `CellCtx` + `genSegments` emits
-      `Segment{mat, face, r0, r1, t, ao}` records to a `SegmentSink`;
-      `segmentColor(seg, params)` is the single LUT composition point;
-      claims go through `claimGrad`.
-   c. COMPLETED - `DdaIterator` (init/t1()/advance() over public fields)
-      + `world.firstSolidInColumn` interval helper. NOTE 1: an iterator
-      `next() ?DdaCell` returning a cell record by value cost ~7%
-      (state spilled to memory each cell); the field-access + advance()
-      shape is free and is the final form. NOTE 2: calling
-      firstSolidInColumn as a per-cell fast reject in processCell cost
-      ~5% (double run scan); the renderer does not call it — it exists
-      for milestone 12's sun march.
-   d. COMPLETED - Runtime palette: `PaletteEntry{rgb, emissive}`,
-      `world_mod.palette` is now a var; `shade_lut` is a runtime var
-      with `rebuildShadeLut()`; emissive entries get an unshaded LUT
-      row. AMENDMENT: crystals 9-11 stay emissive=0 until milestone 9
-      (flipping them here would have broken the byte-identical-PPM
-      requirement).
-   e. COMPLETED - Column light storage: `?[]LightRun{count, color_id,
-      intensity}` + `light_base_y` (runs cover
-      `(base_y - total, base_y]`; default applies outside); freed in
-      deinit/setColumnRuns; `RunCursor` generalized to `CursorFor(R)`
-      with `LightCursor` alias (mat()/peek() compile-error on
-      non-material cursors); `topSolidY(col, h)`; expectCoverage/
-      worldsEqual cover light runs.
-   f. COMPLETED - `World.dirty: ?Region` merged bounding box of
-      set/fillBox touches + `takeDirty()`; `set` now clamps OOB coords
-      like fillBox instead of no-op.
-   g. COMPLETED - `fillSpans` is the single pixel-write path; claim/
-      claimGrad/sky fill are ConstSrc/GradSrc/SkySrc color taps over it
-      (fixed-point lerp math unchanged).
-   h. COMPLETED - `time_s: f64 += dt` in the main loop, carried in
-      RenderParams (headless/bench pass time 0).
+   8-13: RenderParams threaded render -> renderColumn -> processCell;
+   processCell split into CellCtx + genSegments/SegmentSink with
+   segmentColor as the single composition point; DdaIterator +
+   firstSolidInColumn; runtime palette + rebuildShadeLut; column
+   light-run storage (CursorFor/LightCursor, topSolidY); World.dirty
+   edit extents; fillSpans as the single pixel-write path; accumulated
+   time in RenderParams. Details live in the respective types' doc
+   comments. Verified: headless PPMs byte-identical across the 37 camera
+   views after every sub-part; `--bench 1000` flat (1.55 -> 1.64 ms,
+   within machine drift; A/B stash checks showed no regression from any
+   part).
 8. COMPLETED - Distance fog (exponential + low-pass palette variant; lives
    entirely in `segmentColor` + the sky fill; fog glow deferred to
-   milestone 13 since it needs the light map). Verified: `--fog 0`
-   headless PPMs byte-identical to the milestone-7 base across the 37
-   camera views; default-fog views show distance-graded haze with a
-   seamless horizon; `--fog 0 --bench 1000` 1.58 ms (drift-level vs the
-   1.63 ms pre-change baseline), default fog 1.77 ms (+9%, the actual
-   fog work). Draw distance doubled after tuning feedback: `max_dist`
-   48 -> 96 with default density 0.025 (0.05 at cutoff 48 read as
-   claustrophobic; 0.08 was pea soup). At 96 the fog hides the cutoff
-   completely while terrain reads to ~60 units; spawn view 2.20 ms,
-   `--fog 0` 2.07 ms (the extra march draws real geometry). NOTE: the
-   max_dist bump invalidates the m7-base byte-identical comparison —
-   geometry in (48, 96] now renders where sky used to be; that's the
-   intended change, and the `--fog 0` regression check now only covers
-   the fog code path itself. Final tuning is milestone 13's pass.
-   - `RenderParams` gains `fog_density` (0 disables), `fog_color`
-     (horizon-row sky color 0x8ea6d2); `fog_cutoff` caps the DDA march
-     (`dda.t0 >= cutoff` => every later hit fully fogged => fall through
-     to the sky fill, whose horizon row IS the fog color).
-   - `buildFogLuts` per frame: `fog_factor[64]` buckets the normalized
-     exponential `(1-e^(-dt))/(1-e^(-d*cutoff))` (exactly 1 at the
-     cutoff, so no pop at the march limit); `fog_dest[mat][64]` is the
-     low-pass variant — palette color pre-collapses toward `fog_color`
-     on the front-loaded curve `1-(1-f)^2`, so distant hues die before
-     the geometry fades. Emissive rows (dormant until milestone 9):
-     half density, destination = own color rescaled to full saturation.
-   - `segmentColor` fogs each stop (`fogStop`: bucket t, lerpColor
-     toward `fog_dest[mat][bucket]`); `GradSrc` lerps between fogged
-     endpoints. Density 0 early-returns the raw `shadeAt` pair.
-   - Sky LUT blends toward `fog_color` in a band (height/4) around the
-     horizon row (always height/2 with a yaw-only camera).
-   - `--fog <density>` CLI override; 0 reproduces pre-milestone-8
-     output exactly.
-9. Colored flood-fill lighting + emissive voxels (full flood only). New
-   `src/lighting.zig`; renderer merges material+light streams in the
-   single-pass zipper inside segment shading.
+   milestone 13 since it needs the light map). Mechanism documented in
+   buildFogLuts, fogCurve, fogStop, and the sky fill. `--fog <density>`
+   CLI override; 0 disables. Verified: `--fog 0` headless PPMs
+   byte-identical to the milestone-7 base across the 37 camera views;
+   default-fog views show distance-graded haze with a seamless horizon;
+   `--fog 0 --bench 1000` 1.58 ms (drift-level vs the 1.63 ms pre-change
+   baseline), default fog 1.77 ms (+9%, the actual fog work). Draw
+   distance doubled after tuning feedback: `max_dist` 48 -> 96 with
+   default density 0.025 (0.05 at cutoff 48 read as claustrophobic; 0.08
+   was pea soup). At 96 the fog hides the cutoff completely while terrain
+   reads to ~60 units; spawn view 2.20 ms, `--fog 0` 2.07 ms (the extra
+   march draws real geometry). NOTE: the max_dist bump invalidates the
+   m7-base byte-identical comparison — geometry in (48, 96] now renders
+   where sky used to be; that's the intended change, and the `--fog 0`
+   regression check now only covers the fog code path itself. Final
+   tuning is milestone 13's pass.
+9. COMPLETED - Colored flood-fill lighting + emissive voxels (full flood
+   only; new `src/lighting.zig`). Crystals 9-11 flipped to `emissive =
+   255`. Face light is sampled from the air cell in front of the face
+   (solids store nothing) so light never leaks through geometry.
+   Mechanism documented in lighting.zig (floodAll, lightColor,
+   sampleLight) and render.zig (applyLight, segmentColor,
+   CellCtx.lightAt/nLightAt, genSegments); the 32 KB light LUT stays
+   deferred (profiling-gated). `--light <0|1>` CLI flag; 0 skips the flood so the
+   renderer takes the identity path (regression-check escape hatch).
+   Default world flood: 17535 lit columns, 99279 runs, ~400 ms in a
+   Debug build (one-time, at load). Verified: `--light 0 --fog 0`
+   headless PPMs byte-identical across the 37 camera views against a
+   RE-BASELINED m8-final set (the stored m8/nofog baselines were
+   pre-tuning max_dist=48 renders — HEAD draws terrain in (48, 96] where
+   they had sky — so m9 re-baselined at HEAD before any changes); spawn
+   view with light ON also byte-identical to base (no lit columns
+   visible). Cave views at crystals show full-bright emissive cores with
+   colored pooling on cave walls fading over ~31 voxels and
+   brighter-wins two-color regions. Bench (ReleaseFast): spawn `--fog 0`
+   2.05 -> 2.15-2.20 ms at `--light 0` (+5% code-shape cost in the AO
+   loop, accepted; the comptime specialization in genSegments recovered
+   the initial +20%), 2.46-2.55 ms light on (lit cave entrances visible
+   from spawn); crystal cave view 0.54 -> 0.58 ms (+7%).
 10. Incremental relight on edits (clear-then-reflood, consuming 7f's
     dirty extents) + emissive palette animation (7d's runtime palette +
     7h's accumulated time).

@@ -1,8 +1,7 @@
 const std = @import("std");
 
 /// emissive: 0 = normal shaded material; nonzero = emissive intensity
-/// (rendered full-bright, seeds the light flood in milestone 9).
-/// Crystals 9-11 flip to emissive in milestone 9, not here.
+/// (rendered full-bright, seeds the milestone-9 light flood).
 pub const PaletteEntry = struct {
     rgb: u32,
     emissive: u8,
@@ -18,9 +17,9 @@ pub const default_palette = [_]PaletteEntry{
     .{ .rgb = 0xdcdcd7, .emissive = 0 }, // 6: marble
     .{ .rgb = 0x7d5a38, .emissive = 0 }, // 7: dirt
     .{ .rgb = 0x4a4a52, .emissive = 0 }, // 8: dark stone
-    .{ .rgb = 0x46e6e6, .emissive = 0 }, // 9: crystal cyan
-    .{ .rgb = 0xe646c8, .emissive = 0 }, // 10: crystal magenta
-    .{ .rgb = 0xf0a53c, .emissive = 0 }, // 11: crystal amber
+    .{ .rgb = 0x46e6e6, .emissive = 255 }, // 9: crystal cyan
+    .{ .rgb = 0xe646c8, .emissive = 255 }, // 10: crystal magenta
+    .{ .rgb = 0xf0a53c, .emissive = 255 }, // 11: crystal amber
 };
 
 /// Runtime-mutable (milestone 10 animates entries); call
@@ -237,8 +236,9 @@ pub const World = struct {
 
     /// Topmost solid y within [y_lo, y_hi], or null when the column has
     /// no solid voxel in the interval. Pure interval-overlap scan over
-    /// the material runs; used as the renderer's per-cell reject and by
-    /// the sun shadow march (milestone 12).
+    /// the material runs; exists for the sun shadow march (milestone
+    /// 12). The renderer deliberately does NOT call it as a per-cell
+    /// fast reject — that cost ~5% in double run scans.
     pub fn firstSolidInColumn(self: *const World, ix: i32, iz: i32, y_lo: i32, y_hi: i32) ?i32 {
         const col = self.columnAt(ix, iz) orelse return null;
         var hi: i32 = @intCast(self.h - 1);

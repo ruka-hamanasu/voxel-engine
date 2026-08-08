@@ -8,6 +8,7 @@ const c = @cImport({
 const Input = @import("camera.zig").Input;
 const render = @import("render.zig");
 const gen = @import("gen.zig");
+const lighting = @import("lighting.zig");
 
 const render_w = 480;
 const render_h = 270;
@@ -25,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
     var cam_override: ?[4]f32 = null;
     var bench_frames: u32 = 0;
     var fog_density: ?f32 = null;
+    var light_enabled = true;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
@@ -58,6 +60,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingFogValue;
             fog_density = try std.fmt.parseFloat(f32, std.mem.span(args[i]));
+        } else if (std.mem.eql(u8, arg, "--light")) {
+            i += 1;
+            if (i >= args.len) return error.MissingLightValue;
+            light_enabled = (try std.fmt.parseInt(u8, std.mem.span(args[i]), 10)) != 0;
         }
     }
 
@@ -70,6 +76,14 @@ pub fn main(init: std.process.Init) !void {
     render.rebuildShadeLut();
     var rparams: render.RenderParams = .{};
     if (fog_density) |d| rparams.fog_density = d;
+
+    var flood_stats: lighting.Stats = .{};
+    var flood_ms: f64 = 0;
+    if (light_enabled) {
+        const fstart = std.Io.Clock.Timestamp.now(init.io, .awake);
+        flood_stats = try lighting.floodAll(world, allocator, .{});
+        flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+    }
 
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
@@ -85,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
     if (headless_path) |path| {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
+        std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
         render.render(&framebuffer, render_w, render_h, world, cam, rparams);
         render.transpose(&staging, &framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, &staging, render_w, render_h);
@@ -164,6 +179,9 @@ pub fn main(init: std.process.Init) !void {
                         } else {
                             running = false;
                         }
+                    } else if (event.key.keysym.sym == c.SDLK_l) {
+                        rparams.light = !rparams.light;
+                        std.log.info("light {s}", .{if (rparams.light) "on" else "off"});
                     }
                 },
                 c.SDL_MOUSEMOTION => {
@@ -238,6 +256,7 @@ fn drawFpsOverlay(ctx: ?*c.nk_context, fps: f64) void {
 test {
     _ = render;
     _ = gen;
+    _ = lighting;
     _ = @import("world.zig");
     _ = @import("camera.zig");
 }

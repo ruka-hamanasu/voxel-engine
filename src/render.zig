@@ -1,6 +1,7 @@
 const std = @import("std");
 const world_mod = @import("world.zig");
 const camera_mod = @import("camera.zig");
+const lighting = @import("lighting.zig");
 
 const World = world_mod.World;
 const Camera = camera_mod.Camera;
@@ -9,12 +10,15 @@ pub const hfov: f32 = std.math.pi / 2.0;
 pub const max_dist: f32 = 96.0;
 
 /// Per-frame render configuration, threaded render -> renderColumn ->
-/// processCell. fog_* went live in milestone 8; sun/time/glow land in
-/// milestones 10-13.
+/// processCell. fog_* went live in milestone 8, light in milestone 9;
+/// sun/time/glow land in milestones 10-13.
 pub const RenderParams = struct {
     fog_density: f32 = 0.025,
     fog_cutoff: f32 = max_dist,
     fog_color: u32 = 0x8ea6d2, // horizon-row sky color
+    /// false = treat every column as unlit (identity tint), ignoring
+    /// the flood-filled light runs; runtime toggle for the L hotkey.
+    light: bool = true,
     sun_azimuth: f32 = 0.0,
     sun_elevation: f32 = 0.0,
     time_s: f64 = 0.0,
@@ -26,6 +30,9 @@ const Face = enum(u2) { top, bottom, x_side, z_side };
 /// 2D Amanatides-Woo XZ marcher. Extracted from renderColumn so the
 /// milestone-12 sun shadow march reuses the identical stepping math
 /// (elevation makes the shadow ray's height interval affine in t).
+/// The field-access + advance() shape is deliberate: an iterator
+/// next() ?DdaCell returning a cell record by value cost ~7% (state
+/// spilled to memory each cell); this form is free.
 pub const DdaIterator = struct {
     max_t: f32,
     ix: i32,
@@ -424,6 +431,11 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f
 }
 
 fn rowAt(y: i32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
+    // Per-cell reciprocal strength reduction (c - y*k, hoisting the
+    // divide) was tried and REVERTED: the distributed form rounds
+    // differently than (y - cam_y) * f / t and flips tie-break rows
+    // when the camera sits at an exact integer height. Keep the
+    // original op sequence.
     return hf * 0.5 - (@as(f32, @floatFromInt(y)) - cam_y) * f / t;
 }
 
@@ -537,21 +549,49 @@ fn claimGrad(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: 
 /// Visible face fragment produced by segment generation; the single
 /// record type crossing from geometry/visibility into shading. r0/r1
 /// are the unclipped row range, t/ao the distance and AO stops at those
-/// endpoints.
+/// endpoints. light is sampled at the air cell the face is exposed to
+/// (side faces: the previous DDA cell's column; top/bottom faces: one
+/// voxel above/below in the face's own column), uniform per segment —
+/// the zipper splits segments at light-run boundaries. intensity 0 =
+/// no colored light.
 const Segment = struct {
     mat: u8,
-    face: usize,
+    face: u8,
     r0: f32,
     r1: f32,
     t: [2]f32,
     ao: [2]f32,
+    light: lighting.LightSample = .{},
 };
+
+/// Lerp-to-white glow tint (the Gemini doc's BlendWithGlow): intensity
+/// scales tint strength, so intensity 0 is identity and the flood edge
+/// fades continuously into unlit geometry instead of clipping to black.
+fn applyLight(c: u32, light: lighting.LightSample) u32 {
+    const f = @as(f32, @floatFromInt(light.intensity)) * (1.0 / 255.0);
+    const lc = lighting.lightColor(light.color_id);
+    var out: u32 = 0xff000000;
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const ch: f32 = @floatFromInt((c >> sh) & 0xff);
+        const lch: f32 = @floatFromInt((lc >> sh) & 0xff);
+        const v: u32 = @intFromFloat(ch * (255.0 + (lch - 255.0) * f) * (1.0 / 255.0));
+        out |= v << sh;
+    }
+    return out;
+}
 
 /// The single LUT/light/fog composition point; milestones 8-13 extend
 /// this function and nowhere else.
 fn segmentColor(seg: Segment, params: RenderParams) [2]u32 {
-    const c0 = shadeAt(seg.mat, seg.face, seg.ao[0]);
-    const c1 = shadeAt(seg.mat, seg.face, seg.ao[1]);
+    var c0 = shadeAt(seg.mat, seg.face, seg.ao[0]);
+    var c1 = shadeAt(seg.mat, seg.face, seg.ao[1]);
+    // Emissive materials stay full-bright (shade LUT bypass), so their
+    // own seed light is not reapplied on top.
+    if (seg.light.intensity != 0 and world_mod.palette[seg.mat].emissive == 0) {
+        c0 = applyLight(c0, seg.light);
+        c1 = applyLight(c1, seg.light);
+    }
     if (params.fog_density <= 0) return .{ c0, c1 };
     return .{
         fogStop(seg.mat, seg.t[0], c0, params),
@@ -585,7 +625,7 @@ const SegmentSink = struct {
 /// neighbor cursors mutate as they walk y in lockstep.
 const CellCtx = struct {
     world: *const World,
-    runs: []const world_mod.MatRun,
+    col: *const world_mod.Column,
     ix: i32,
     iz: i32,
     cam_y: f32,
@@ -598,17 +638,64 @@ const CellCtx = struct {
     ub: f32,
     vb: f32,
     side_u: f32,
-    side_face: usize,
+    side_face: u8,
     y_lo: i32,
     y_hi: i32,
     wh: i32,
     ncur: ?world_mod.RunCursor,
     lacur: ?world_mod.RunCursor,
     lbcur: ?world_mod.RunCursor,
+    /// Light zipper state (milestone 9): cursors over the current and
+    /// neighbor (previous DDA cell) columns' light runs plus their
+    /// coverages (lo, hi]. Face light is sampled from the air cell in
+    /// front of the face — side faces read the NEIGHBOR column, so a
+    /// wall lit on its far side never glows through to its near side.
+    lcur: ?world_mod.LightCursor,
+    light_lo: i32,
+    light_hi: i32,
+    nlcur: ?world_mod.LightCursor,
+    nlight_lo: i32,
+    nlight_hi: i32,
 
     fn row(self: *const CellCtx, y: i32, t: f32) f32 {
         return rowAt(y, self.cam_y, self.f, t, self.hf);
     }
+
+    /// Light of the current column at y (camera-cell side faces only;
+    /// top/bottom faces use sampleLight scans). comptime lit = false
+    /// folds every query to the default, letting genSegments' unlit
+    /// specialization compile to the pre-lighting code shape.
+    fn lightAt(self: *CellCtx, comptime lit: bool, y: i32) LightQuery {
+        if (!lit) return .{ .sample = .{}, .hi = self.y_hi };
+        return queryLightRuns(&self.lcur, self.light_lo, self.light_hi, self.y_hi, y);
+    }
+
+    /// Light of the air cell in front of the side face at y (the
+    /// previous DDA cell's column), advancing the lockstep cursor.
+    fn nLightAt(self: *CellCtx, comptime lit: bool, y: i32) LightQuery {
+        if (!lit) return .{ .sample = .{}, .hi = self.y_hi };
+        return queryLightRuns(&self.nlcur, self.nlight_lo, self.nlight_hi, self.y_hi, y);
+    }
+};
+
+/// Light sample at y plus the top of its uniform run; queries must be
+/// non-decreasing in y. Outside the runs' coverage the identity
+/// default applies, with .hi set to the next coverage boundary so
+/// callers can span whole default-lit ranges in one segment. A null
+/// cursor yields the default everywhere.
+fn queryLightRuns(oc: *?world_mod.LightCursor, lo: i32, hi: i32, fallback_hi: i32, y: i32) LightQuery {
+    if (oc.* == null) return .{ .sample = .{}, .hi = fallback_hi };
+    const lc = &oc.*.?;
+    if (y > hi) return .{ .sample = .{}, .hi = fallback_hi };
+    if (y < lo) return .{ .sample = .{}, .hi = lo - 1 };
+    while (y > lc.hi) lc.up();
+    const run = lc.runs[lc.idx];
+    return .{ .sample = .{ .color_id = run.color_id, .intensity = run.intensity }, .hi = lc.hi };
+}
+
+const LightQuery = struct {
+    sample: lighting.LightSample,
+    hi: i32,
 };
 
 fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList, params: RenderParams) void {
@@ -636,7 +723,7 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
 
     var ctx: CellCtx = .{
         .world = world,
-        .runs = col.runs,
+        .col = col,
         .ix = ix,
         .iz = iz,
         .cam_y = cam_y,
@@ -656,6 +743,12 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         .ncur = null,
         .lacur = null,
         .lbcur = null,
+        .lcur = null,
+        .light_lo = 0,
+        .light_hi = -1,
+        .nlcur = null,
+        .nlight_lo = 0,
+        .nlight_hi = -1,
     };
 
     // Neighbor occupancy for face culling + side-face AO: ncur covers
@@ -675,19 +768,52 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         }
     }
 
+    // Light zipper cursors over the current column (camera-cell side
+    // faces) and the previous DDA cell's column (the air in front of
+    // side faces). Both walk y upward in lockstep with the segment
+    // loop, initialized clamped into coverage so out-of-coverage bands
+    // query as defaults. The params.light toggle treats every column
+    // as unlit.
+    if (params.light) {
+        if (col.light) |lruns| {
+            var total: i32 = 0;
+            for (lruns) |r| total += r.count;
+            ctx.light_hi = col.light_base_y;
+            ctx.light_lo = ctx.light_hi - total + 1;
+            ctx.lcur = world_mod.LightCursor.init(lruns, ctx.light_hi + 1, std.math.clamp(y_lo, ctx.light_lo, ctx.light_hi));
+        }
+        if (has_prev) {
+            if (world.columnAt(px, pz)) |pcol| {
+                if (pcol.light) |nruns| {
+                    var total: i32 = 0;
+                    for (nruns) |r| total += r.count;
+                    ctx.nlight_hi = pcol.light_base_y;
+                    ctx.nlight_lo = ctx.nlight_hi - total + 1;
+                    ctx.nlcur = world_mod.LightCursor.init(nruns, ctx.nlight_hi + 1, std.math.clamp(y_lo, ctx.nlight_lo, ctx.nlight_hi));
+                }
+            }
+        }
+    }
+
     var sink: SegmentSink = .{ .fb = fb, .height = height, .sx = sx, .free = free, .params = params };
-    genSegments(&ctx, &sink);
+    if (ctx.lcur != null or ctx.nlcur != null) {
+        genSegments(&ctx, &sink, true);
+    } else {
+        genSegments(&ctx, &sink, false);
+    }
 }
 
 /// Segment generation: geometry/visibility only, emitting Segment
 /// records front-to-back. All shading decisions live in segmentColor.
-fn genSegments(ctx: *CellCtx, sink: *SegmentSink) void {
+/// comptime lit selects the light-zipper code paths; columns without
+/// light runs compile them away entirely.
+fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
     const free = sink.free;
-    const top_face: usize = @intFromEnum(Face.top);
-    const bottom_face: usize = @intFromEnum(Face.bottom);
+    const top_face: u8 = @intFromEnum(Face.top);
+    const bottom_face: u8 = @intFromEnum(Face.bottom);
 
     var y = ctx.y_lo;
-    var cur = world_mod.RunCursor.init(ctx.runs, ctx.wh, ctx.y_lo);
+    var cur = world_mod.RunCursor.init(ctx.col.runs, ctx.wh, ctx.y_lo);
     while (y <= ctx.y_hi) {
         const seg_lo = y;
         const seg_hi = @min(cur.hi, ctx.y_hi);
@@ -705,8 +831,12 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink) void {
                         // and the above-voxel's bottom corner sample
                         // different air-side voxels), but runs of max-AO
                         // voxels accumulate in [pend, yy) and flush as
-                        // one constant segment.
+                        // one constant segment; a light-run boundary in
+                        // the air-side column breaks the accumulation
+                        // the same way, so every emitted segment has
+                        // uniform light.
                         var pend = sy;
+                        var pend_light = ctx.nLightAt(lit, sy).sample;
                         var yy = sy;
                         while (yy <= e) : (yy += 1) {
                             if (ctx.lacur) |*la| {
@@ -716,27 +846,43 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink) void {
                                 while (yy > lb.hi) lb.up();
                             }
                             const stops = sideAoStops(n, optCursor(&ctx.lacur), optCursor(&ctx.lbcur), yy, ctx.side_u);
-                            if (stops[0] == 3 and stops[1] == 3) continue;
+                            const lq = ctx.nLightAt(lit, yy);
+                            if (stops[0] == 3 and stops[1] == 3 and (!lit or std.meta.eql(lq.sample, pend_light))) continue;
                             if (pend < yy) {
-                                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 } });
+                                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light });
                             }
-                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops });
+                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = lq.sample });
                             pend = yy + 1;
+                            pend_light = if (lit and pend <= e) ctx.nLightAt(lit, pend).sample else .{};
                         }
                         if (pend <= e) {
-                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e + 1, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 } });
+                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e + 1, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light });
                         }
                         if (free.isEmpty()) return;
                     }
                     sy = e + 1;
                 }
-            } else {
+            } else if (!lit) {
                 sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(seg_hi + 1, ctx.t0), .r1 = ctx.row(seg_lo, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 } });
+                if (free.isEmpty()) return;
+            } else {
+                // Zipper: split the span at light-run boundaries so each
+                // emitted segment carries a uniform light sample. With
+                // no light runs this is a single iteration emitting the
+                // same constant segment as before lighting.
+                var yy = seg_lo;
+                while (yy <= seg_hi) {
+                    const lq = ctx.lightAt(lit, yy);
+                    const e2 = @min(seg_hi, lq.hi);
+                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e2 + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = lq.sample });
+                    yy = e2 + 1;
+                }
                 if (free.isEmpty()) return;
             }
             // Bottom face visible only at a run's lower boundary where
             // the voxel below is air; interior planes are provably
-            // occluded by the nearer voxel.
+            // occluded by the nearer voxel. Light comes from the air
+            // cell below the face.
             const below_air = seg_lo == cur.lo and
                 (cur.idx + 1 >= cur.runs.len or cur.runs[cur.idx + 1].palette_id == 0);
             if (below_air) {
@@ -744,7 +890,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink) void {
                 const r_far = ctx.row(seg_lo, ctx.t1);
                 if (spanOverlap(free, r_near, r_far)) {
                     const stops = faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_lo - 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
-                    sink.emit(.{ .mat = mat, .face = bottom_face, .r0 = r_near, .r1 = r_far, .t = .{ ctx.t0, ctx.t1 }, .ao = stops });
+                    sink.emit(.{ .mat = mat, .face = bottom_face, .r0 = r_near, .r1 = r_far, .t = .{ ctx.t0, ctx.t1 }, .ao = stops, .light = if (lit) lighting.sampleLight(ctx.col, seg_lo - 1) else .{} });
                     if (free.isEmpty()) return;
                 }
             }
@@ -754,12 +900,15 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink) void {
     }
 
     y = ctx.y_hi;
-    cur = world_mod.RunCursor.init(ctx.runs, ctx.wh, ctx.y_hi);
+    cur = world_mod.RunCursor.init(ctx.col.runs, ctx.wh, ctx.y_hi);
     while (y >= ctx.y_lo) {
         const seg_hi = y;
         const seg_lo = @max(cur.lo, ctx.y_lo);
         if (cur.mat() != 0) {
-            // Top face visible only at a run's upper boundary.
+            // Top face visible only at a run's upper boundary. Light
+            // comes from the air cell above the face, via a plain scan
+            // (boundary-only, rare) rather than the zipper cursor,
+            // which walks upward.
             const above_air = seg_hi == cur.hi and
                 (cur.idx == 0 or cur.runs[cur.idx - 1].palette_id == 0);
             if (above_air) {
@@ -767,7 +916,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink) void {
                 const r_near = ctx.row(seg_hi + 1, ctx.t0);
                 if (spanOverlap(free, r_far, r_near)) {
                     const stops = faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_hi + 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
-                    sink.emit(.{ .mat = cur.mat(), .face = top_face, .r0 = r_far, .r1 = r_near, .t = .{ ctx.t1, ctx.t0 }, .ao = .{ stops[1], stops[0] } });
+                    sink.emit(.{ .mat = cur.mat(), .face = top_face, .r0 = r_far, .r1 = r_near, .t = .{ ctx.t1, ctx.t0 }, .ao = .{ stops[1], stops[0] }, .light = if (lit) lighting.sampleLight(ctx.col, seg_hi + 1) else .{} });
                     if (free.isEmpty()) return;
                 }
             }
@@ -840,6 +989,35 @@ test "fog disabled leaves segment colors untouched" {
     const c = segmentColor(seg, .{ .fog_density = 0 });
     try std.testing.expectEqual(shadeAt(1, 0, 3), c[0]);
     try std.testing.expectEqual(shadeAt(1, 0, 2), c[1]);
+}
+
+test "light tints shaded stops; zero intensity is identity" {
+    const plain = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 } }, .{ .fog_density = 0 });
+    const zero = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 0 } }, .{ .fog_density = 0 });
+    try std.testing.expectEqual(plain, zero);
+
+    // Full-intensity cyan scales each channel by the crystal's rgb.
+    const lit = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 255 } }, .{ .fog_density = 0 });
+    const shaded = shadeAt(1, 0, 3);
+    const want = [3]u32{ ((shaded >> 16) & 0xff) * 0x46 / 255, ((shaded >> 8) & 0xff) * 0xe6 / 255, (shaded & 0xff) * 0xe6 / 255 };
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const got: i32 = @intCast((lit[0] >> sh) & 0xff);
+        try std.testing.expect(@abs(got - @as(i32, @intCast(want[k]))) <= 1);
+    }
+
+    // Half intensity tints halfway from white.
+    const half = segmentColor(.{ .mat = 1, .face = 0, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 128 } }, .{ .fog_density = 0 });
+    const full_r: i32 = @intCast((lit[0] >> 16) & 0xff);
+    const plain_r: i32 = @intCast((plain[0] >> 16) & 0xff);
+    const half_r: i32 = @intCast((half[0] >> 16) & 0xff);
+    try std.testing.expect(@abs(half_r - @divTrunc(full_r + plain_r, 2)) <= 2);
+}
+
+test "emissive materials bypass the light tint" {
+    const seg: Segment = .{ .mat = 9, .face = 2, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 10, .intensity = 255 } };
+    const c = segmentColor(seg, .{ .fog_density = 0 });
+    try std.testing.expectEqual(shadeAt(9, 2, 3), c[0]);
 }
 
 test "fogged segment converges to the fog color at the cutoff" {
