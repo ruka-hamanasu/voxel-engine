@@ -10,19 +10,140 @@ pub const max_dist: f32 = 48.0;
 
 const Face = enum(u2) { top, bottom, x_side, z_side };
 const face_factor = [4]f32{ 1.0, 0.5, 0.8, 0.6 };
+const ao_factor = [4]f32{ 0.45, 0.65, 0.82, 1.0 };
 
+/// [palette][face][ao_level] -> shaded color; collapses all shading
+/// arithmetic into one L1-resident lookup.
 const shade_lut = blk: {
-    var lut: [world_mod.palette.len][4]u32 = undefined;
+    var lut: [world_mod.palette.len][4][4]u32 = undefined;
     for (world_mod.palette, 0..) |cp, m| {
-        for (face_factor, 0..) |factor, fi| {
-            const r: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 16) & 0xff)) * factor);
-            const g: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 8) & 0xff)) * factor);
-            const b: u32 = @intFromFloat(@as(f32, @floatFromInt(cp & 0xff)) * factor);
-            lut[m][fi] = 0xff000000 | (r << 16) | (g << 8) | b;
+        for (face_factor, 0..) |ff, fi| {
+            for (ao_factor, 0..) |af, ai| {
+                const factor = ff * af;
+                const r: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 16) & 0xff)) * factor);
+                const g: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 8) & 0xff)) * factor);
+                const b: u32 = @intFromFloat(@as(f32, @floatFromInt(cp & 0xff)) * factor);
+                lut[m][fi][ai] = 0xff000000 | (r << 16) | (g << 8) | b;
+            }
         }
     }
     break :blk lut;
 };
+
+/// Minecraft per-vertex AO: both edge neighbors solid -> darkest (0),
+/// else 3 minus the count of solid occluders (corner included).
+fn aoLevel(side1: bool, side2: bool, corner: bool) u2 {
+    if (side1 and side2) return 0;
+    return 3 - @as(u2, @intFromBool(side1)) - @as(u2, @intFromBool(side2)) - @as(u2, @intFromBool(corner));
+}
+
+fn frac01(x: f32) f32 {
+    return std.math.clamp(x, 0.0, 1.0);
+}
+
+/// AO level at fractional face position u between corners a and b.
+/// Kept fractional: rounding to discrete levels here makes the stop
+/// jump a whole level when the sample point crosses a rounding
+/// boundary, which bands adjacent screen columns.
+fn lerpLevel(a: u2, b: u2, u: f32) f32 {
+    const fa: f32 = @floatFromInt(a);
+    const fb: f32 = @floatFromInt(b);
+    return fa + (fb - fa) * u;
+}
+
+/// AO level at (u, v) on a horizontal face, bilinear between the four
+/// corner levels (m/p = -/+ along x then z).
+fn bilerpLevel(mm: u2, pm: u2, mp: u2, pp: u2, u: f32, v: f32) f32 {
+    const fmm: f32 = @floatFromInt(mm);
+    const fpm: f32 = @floatFromInt(pm);
+    const fmp: f32 = @floatFromInt(mp);
+    const fpp: f32 = @floatFromInt(pp);
+    const lo = fmm + (fpm - fmm) * u;
+    const hi = fmp + (fpp - fmp) * u;
+    return lo + (hi - lo) * v;
+}
+
+/// Shaded color at a fractional AO level: lerps between the two
+/// adjacent LUT entries so gradients stay smooth instead of snapping
+/// to the four discrete levels.
+fn shadeAt(mat: u8, face: usize, level: f32) u32 {
+    const l = std.math.clamp(level, 0.0, 3.0);
+    const lo: usize = @intFromFloat(l);
+    const hi: usize = @min(lo + 1, 3);
+    const frac = l - @as(f32, @floatFromInt(lo));
+    const c0 = shade_lut[mat][face][lo];
+    const c1 = shade_lut[mat][face][hi];
+    var out: u32 = 0xff000000;
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const a: f32 = @floatFromInt((c0 >> sh) & 0xff);
+        const b: f32 = @floatFromInt((c1 >> sh) & 0xff);
+        const c: u32 = @intFromFloat(a + (b - a) * frac);
+        out |= c << sh;
+    }
+    return out;
+}
+
+/// Borrows the cursor out of an optional (null = column outside the
+/// world, treated as air).
+fn optCursor(oc: *?world_mod.RunCursor) ?*const world_mod.RunCursor {
+    if (oc.*) |*c| return c;
+    return null;
+}
+
+fn peekSolid(oc: ?*const world_mod.RunCursor, y: i32) bool {
+    const c = oc orelse return false;
+    return c.peek(y) != 0;
+}
+
+/// {top, bottom} AO stops for the side face of voxel y, sampled at
+/// lateral face position u. n is the air-side (previous DDA cell)
+/// column; la/lb are the diagonal columns on either side of it. Corner
+/// queries are skipped only when both edge neighbors are solid, where
+/// the corner cannot affect the level.
+fn sideAoStops(n: *const world_mod.RunCursor, la: ?*const world_mod.RunCursor, lb: ?*const world_mod.RunCursor, y: i32, u: f32) [2]f32 {
+    const up = n.peek(y + 1) != 0;
+    const dn = n.peek(y - 1) != 0;
+    const sa = peekSolid(la, y);
+    const sb = peekSolid(lb, y);
+    const top_a = aoLevel(up, sa, if (up and sa) false else peekSolid(la, y + 1));
+    const top_b = aoLevel(up, sb, if (up and sb) false else peekSolid(lb, y + 1));
+    const bot_a = aoLevel(dn, sa, if (dn and sa) false else peekSolid(la, y - 1));
+    const bot_b = aoLevel(dn, sb, if (dn and sb) false else peekSolid(lb, y - 1));
+    return .{ lerpLevel(top_a, top_b, u), lerpLevel(bot_a, bot_b, u) };
+}
+
+fn solidW(world: *const World, x: i32, y: i32, z: i32) bool {
+    return world.get(x, y, z) != 0;
+}
+
+/// {near, far} AO stops for a horizontal face of column (ix, iz),
+/// sampled at hit positions (ua, va) and (ub, vb). yf is the height of
+/// the air block in front of the face (above for top, below for
+/// bottom). Rare enough (run boundaries only) that direct World.get
+/// queries beat maintaining eight lockstep cursors.
+fn faceAoStops(world: *const World, ix: i32, iz: i32, yf: i32, ua: f32, va: f32, ub: f32, vb: f32) [2]f32 {
+    const xm = solidW(world, ix - 1, yf, iz);
+    const xp = solidW(world, ix + 1, yf, iz);
+    const zm = solidW(world, ix, yf, iz - 1);
+    const zp = solidW(world, ix, yf, iz + 1);
+    const l_mm = aoLevel(xm, zm, if (xm and zm) false else solidW(world, ix - 1, yf, iz - 1));
+    const l_pm = aoLevel(xp, zm, if (xp and zm) false else solidW(world, ix + 1, yf, iz - 1));
+    const l_mp = aoLevel(xm, zp, if (xm and zp) false else solidW(world, ix - 1, yf, iz + 1));
+    const l_pp = aoLevel(xp, zp, if (xp and zp) false else solidW(world, ix + 1, yf, iz + 1));
+    return .{ bilerpLevel(l_mm, l_pm, l_mp, l_pp, ua, va), bilerpLevel(l_mm, l_pm, l_mp, l_pp, ub, vb) };
+}
+
+/// True if any free span intersects rows [r0, r1). Must gate every AO
+/// computation: without this occlusion early-out, neighbor queries run
+/// for faces that write no pixels and AO costs ~3x the base render.
+fn spanOverlap(free: *const SpanList, r0: f32, r1: f32) bool {
+    if (!(r1 > r0)) return false;
+    for (free.spans[0..free.len]) |s| {
+        if (@min(r1, @as(f32, @floatFromInt(s.y1))) > @max(r0, @as(f32, @floatFromInt(s.y0)))) return true;
+    }
+    return false;
+}
 
 const Span = struct { y0: u16, y1: u16 };
 
@@ -141,7 +262,7 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f
 
     while (t0 < max_dist and !free.isEmpty()) {
         const t1 = @min(@min(t_max_x, t_max_z), max_dist);
-        processCell(fb, height, sx, world, ix, iz, px, pz, has_prev, cam.y, f, t0, t1, axis, &free);
+        processCell(fb, height, sx, world, ix, iz, px, pz, has_prev, cam.x, cam.y, cam.z, f, dx, dz, t0, t1, axis, &free);
         px = ix;
         pz = iz;
         has_prev = true;
@@ -172,22 +293,78 @@ fn rowAt(y: i32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
 fn claim(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, color: u32) void {
     if (free.isEmpty() or !(r1 > r0)) return;
     var i: usize = 0;
-    while (i < free.len) : (i += 1) {
+    while (i < free.len) {
         const s = free.spans[i];
         const a = @max(r0, @as(f32, @floatFromInt(s.y0)));
         const b = @min(r1, @as(f32, @floatFromInt(s.y1)));
-        if (!(b > a)) continue;
+        if (!(b > a)) {
+            i += 1;
+            continue;
+        }
         const ia: u16 = @intFromFloat(@ceil(a));
         const ib: u16 = @intFromFloat(@ceil(b));
-        if (ib <= ia) continue;
+        if (ib <= ia) {
+            i += 1;
+            continue;
+        }
         for (ia..ib) |row| {
             fb[sx * height + row] = color;
         }
         free.subtract(ia, ib);
+        // A fully consumed span shifts the rest of the list down into
+        // index i; only advance when span i survived (trimmed or split).
+        if (!(ia <= s.y0 and ib >= s.y1)) i += 1;
     }
 }
 
-fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_y: f32, f: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList) void {
+/// Like claim, but fills a 16.16 fixed-point vertical lerp from c0 (at
+/// r0) to c1 (at r1). The gradient is parameterized over the unclipped
+/// row domain so span-clipped pieces sample the same ramp. Equal stops
+/// (including both-max AO) take the constant-fill fast path.
+fn claimGrad(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, c0: u32, c1: u32) void {
+    if (c0 == c1) return claim(fb, height, sx, free, r0, r1, c0);
+    if (free.isEmpty() or !(r1 > r0)) return;
+    const ra: i32 = @intFromFloat(@ceil(r0));
+    const rb: i32 = @intFromFloat(@ceil(r1));
+    const n = rb - ra;
+    if (n <= 0) return;
+    const ch0 = [3]i32{ @intCast((c0 >> 16) & 0xff), @intCast((c0 >> 8) & 0xff), @intCast(c0 & 0xff) };
+    const ch1 = [3]i32{ @intCast((c1 >> 16) & 0xff), @intCast((c1 >> 8) & 0xff), @intCast(c1 & 0xff) };
+    var step: [3]i32 = undefined;
+    for (0..3) |k| step[k] = @divTrunc((ch1[k] - ch0[k]) << 16, n);
+    var i: usize = 0;
+    while (i < free.len) {
+        const s = free.spans[i];
+        const a = @max(r0, @as(f32, @floatFromInt(s.y0)));
+        const b = @min(r1, @as(f32, @floatFromInt(s.y1)));
+        if (!(b > a)) {
+            i += 1;
+            continue;
+        }
+        const ia: u16 = @intFromFloat(@ceil(a));
+        const ib: u16 = @intFromFloat(@ceil(b));
+        if (ib <= ia) {
+            i += 1;
+            continue;
+        }
+        var acc: [3]i32 = undefined;
+        const off: i32 = @as(i32, ia) - ra;
+        for (0..3) |k| acc[k] = (ch0[k] << 16) + off * step[k] + 0x8000;
+        for (ia..ib) |row| {
+            const cr: u32 = @intCast(std.math.clamp(acc[0] >> 16, 0, 255));
+            const cg: u32 = @intCast(std.math.clamp(acc[1] >> 16, 0, 255));
+            const cb: u32 = @intCast(std.math.clamp(acc[2] >> 16, 0, 255));
+            fb[sx * height + row] = 0xff000000 | (cr << 16) | (cg << 8) | cb;
+            for (0..3) |k| acc[k] += step[k];
+        }
+        free.subtract(ia, ib);
+        // A fully consumed span shifts the rest of the list down into
+        // index i; only advance when span i survived (trimmed or split).
+        if (!(ia <= s.y0 and ib >= s.y1)) i += 1;
+    }
+}
+
+fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList) void {
     if (free.isEmpty()) return;
     const t0 = @max(t0_in, 1e-4);
     const hf: f32 = @floatFromInt(height);
@@ -200,14 +377,39 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     const col = world.columnAt(ix, iz) orelse return;
     const wh: i32 = @intCast(world.h);
 
+    // Ray position within the cell at entry (a) and exit (b), clamped
+    // against float error at boundaries; AO stop sample points.
+    const ixf: f32 = @floatFromInt(ix);
+    const izf: f32 = @floatFromInt(iz);
+    const ua = frac01(cam_x + dx * t0 - ixf);
+    const va = frac01(cam_z + dz * t0 - izf);
+    const ub = frac01(cam_x + dx * t1 - ixf);
+    const vb = frac01(cam_z + dz * t1 - izf);
+    const side_u = if (axis == .x_side) va else ua;
+
+    // Neighbor occupancy for face culling + side-face AO: ncur covers
+    // the previous DDA cell (the air side of side faces); lacur/lbcur
+    // cover the diagonal columns flanking it. All three walk y upward in
+    // lockstep with the segment loop, amortized O(1) per voxel.
     var ncur: ?world_mod.RunCursor = null;
+    var lacur: ?world_mod.RunCursor = null;
+    var lbcur: ?world_mod.RunCursor = null;
     if (has_prev) {
         if (world.columnAt(px, pz)) |pcol| {
             ncur = world_mod.RunCursor.init(pcol.runs, wh, y_lo);
+            if (axis == .x_side) {
+                if (world.columnAt(px, pz - 1)) |c| lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px, pz + 1)) |c| lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+            } else {
+                if (world.columnAt(px - 1, pz)) |c| lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px + 1, pz)) |c| lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+            }
         }
     }
 
     const side_face: usize = @intFromEnum(axis);
+    const top_face: usize = @intFromEnum(Face.top);
+    const bottom_face: usize = @intFromEnum(Face.bottom);
 
     var y = y_lo;
     var cur = world_mod.RunCursor.init(col.runs, wh, y_lo);
@@ -215,27 +417,62 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         const seg_lo = y;
         const seg_hi = @min(cur.hi, y_hi);
         if (cur.mat() != 0) {
-            const side = shade_lut[cur.mat()][side_face];
+            const mat = cur.mat();
+            const side_max = shade_lut[mat][side_face][3];
             if (ncur) |*n| {
                 var sy = seg_lo;
                 while (sy <= seg_hi) {
                     while (sy > n.hi) n.up();
                     const e = @min(seg_hi, n.hi);
-                    if (n.mat() == 0) {
-                        claim(fb, height, sx, free, rowAt(e + 1, cam_y, f, t0, hf), rowAt(sy, cam_y, f, t0, hf), side);
+                    if (n.mat() == 0 and spanOverlap(free, rowAt(e + 1, cam_y, f, t0, hf), rowAt(sy, cam_y, f, t0, hf))) {
+                        // Air-backed sub-segment: claim per voxel with
+                        // AO stops. Stops are not shareable between
+                        // adjacent voxels (the below-voxel's top corner
+                        // and the above-voxel's bottom corner sample
+                        // different air-side voxels), but runs of max-AO
+                        // voxels accumulate in [pend, yy) and flush as
+                        // one constant claim.
+                        var pend = sy;
+                        var yy = sy;
+                        while (yy <= e) : (yy += 1) {
+                            if (lacur) |*la| {
+                                while (yy > la.hi) la.up();
+                            }
+                            if (lbcur) |*lb| {
+                                while (yy > lb.hi) lb.up();
+                            }
+                            const stops = sideAoStops(n, optCursor(&lacur), optCursor(&lbcur), yy, side_u);
+                            if (stops[0] == 3 and stops[1] == 3) continue;
+                            if (pend < yy) {
+                                claim(fb, height, sx, free, rowAt(yy, cam_y, f, t0, hf), rowAt(pend, cam_y, f, t0, hf), side_max);
+                            }
+                            claimGrad(fb, height, sx, free, rowAt(yy + 1, cam_y, f, t0, hf), rowAt(yy, cam_y, f, t0, hf), shadeAt(mat, side_face, stops[0]), shadeAt(mat, side_face, stops[1]));
+                            pend = yy + 1;
+                        }
+                        if (pend <= e) {
+                            claim(fb, height, sx, free, rowAt(e + 1, cam_y, f, t0, hf), rowAt(pend, cam_y, f, t0, hf), side_max);
+                        }
                         if (free.isEmpty()) return;
                     }
                     sy = e + 1;
                 }
             } else {
-                claim(fb, height, sx, free, rowAt(seg_hi + 1, cam_y, f, t0, hf), rowAt(seg_lo, cam_y, f, t0, hf), side);
+                claim(fb, height, sx, free, rowAt(seg_hi + 1, cam_y, f, t0, hf), rowAt(seg_lo, cam_y, f, t0, hf), side_max);
                 if (free.isEmpty()) return;
             }
+            // Bottom face visible only at a run's lower boundary where
+            // the voxel below is air; interior planes are provably
+            // occluded by the nearer voxel.
             const below_air = seg_lo == cur.lo and
                 (cur.idx + 1 >= cur.runs.len or cur.runs[cur.idx + 1].palette_id == 0);
             if (below_air) {
-                claim(fb, height, sx, free, rowAt(seg_lo, cam_y, f, t0, hf), rowAt(seg_lo, cam_y, f, t1, hf), shade_lut[cur.mat()][@intFromEnum(Face.bottom)]);
-                if (free.isEmpty()) return;
+                const r_near = rowAt(seg_lo, cam_y, f, t0, hf);
+                const r_far = rowAt(seg_lo, cam_y, f, t1, hf);
+                if (spanOverlap(free, r_near, r_far)) {
+                    const stops = faceAoStops(world, ix, iz, seg_lo - 1, ua, va, ub, vb);
+                    claimGrad(fb, height, sx, free, r_near, r_far, shadeAt(mat, bottom_face, stops[0]), shadeAt(mat, bottom_face, stops[1]));
+                    if (free.isEmpty()) return;
+                }
             }
         }
         y = seg_hi + 1;
@@ -248,11 +485,17 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         const seg_hi = y;
         const seg_lo = @max(cur.lo, y_lo);
         if (cur.mat() != 0) {
+            // Top face visible only at a run's upper boundary.
             const above_air = seg_hi == cur.hi and
                 (cur.idx == 0 or cur.runs[cur.idx - 1].palette_id == 0);
             if (above_air) {
-                claim(fb, height, sx, free, rowAt(seg_hi + 1, cam_y, f, t1, hf), rowAt(seg_hi + 1, cam_y, f, t0, hf), shade_lut[cur.mat()][@intFromEnum(Face.top)]);
-                if (free.isEmpty()) return;
+                const r_far = rowAt(seg_hi + 1, cam_y, f, t1, hf);
+                const r_near = rowAt(seg_hi + 1, cam_y, f, t0, hf);
+                if (spanOverlap(free, r_far, r_near)) {
+                    const stops = faceAoStops(world, ix, iz, seg_hi + 1, ua, va, ub, vb);
+                    claimGrad(fb, height, sx, free, r_far, r_near, shadeAt(cur.mat(), top_face, stops[1]), shadeAt(cur.mat(), top_face, stops[0]));
+                    if (free.isEmpty()) return;
+                }
             }
         }
         y = seg_lo - 1;
@@ -280,6 +523,53 @@ pub fn writePpm(io: std.Io, allocator: std.mem.Allocator, path: []const u8, pixe
         body[header.len + i * 3 + 2] = @truncate(p);
     }
     try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = body });
+}
+
+test "face ao darkens toward a taller neighbor" {
+    var world = try World.init(std.testing.allocator, 4, 16, 4);
+    defer world.deinit();
+    try world.fillBox(1, 0, 1, 2, 5, 2, 7);
+    try world.fillBox(2, 0, 1, 3, 6, 2, 7);
+    const open = faceAoStops(&world, 1, 1, 5, 0.1, 0.5, 0.1, 0.5);
+    try std.testing.expectApproxEqAbs(2.9, open[0], 1e-6);
+    const near = faceAoStops(&world, 1, 1, 5, 0.9, 0.5, 0.9, 0.5);
+    try std.testing.expect(near[0] < 3);
+    const diag = faceAoStops(&world, 1, 1, 5, 0.9, 0.9, 0.9, 0.9);
+    try std.testing.expect(diag[0] < 3);
+}
+
+test "ao level truth table" {
+    try std.testing.expectEqual(0, aoLevel(true, true, false));
+    try std.testing.expectEqual(0, aoLevel(true, true, true));
+    try std.testing.expectEqual(1, aoLevel(true, false, true));
+    try std.testing.expectEqual(2, aoLevel(true, false, false));
+    try std.testing.expectEqual(2, aoLevel(false, false, true));
+    try std.testing.expectEqual(3, aoLevel(false, false, false));
+}
+
+test "gradient claim fills a clipped lerp" {
+    var fb: [8]u32 = @splat(0xdeadbeef);
+    var free = SpanList.initFull(8);
+    claimGrad(&fb, 8, 0, &free, 2.0, 6.0, 0xff000000, 0xffffffff);
+    try std.testing.expectEqual(2, free.len);
+    try std.testing.expectEqual(Span{ .y0 = 0, .y1 = 2 }, free.spans[0]);
+    try std.testing.expectEqual(Span{ .y0 = 6, .y1 = 8 }, free.spans[1]);
+    try std.testing.expectEqual(0xdeadbeef, fb[1]);
+    try std.testing.expectEqual(0xdeadbeef, fb[6]);
+    try std.testing.expectEqual(0xff000000, fb[2]);
+    var prev: u32 = 0;
+    for (fb[2..6]) |px| {
+        const r = px & 0xff;
+        try std.testing.expect(r >= prev);
+        try std.testing.expect(r == (px >> 16 & 0xff) and r == (px >> 8 & 0xff));
+        prev = r;
+    }
+    try std.testing.expect(prev > 0);
+
+    claimGrad(&fb, 8, 0, &free, 0.0, 8.0, 0xff102030, 0xff102030);
+    try std.testing.expectEqual(0xff102030, fb[0]);
+    try std.testing.expectEqual(0xff102030, fb[7]);
+    try std.testing.expect(free.isEmpty());
 }
 
 test "span subtract splits and trims" {

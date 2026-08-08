@@ -34,19 +34,19 @@ fn heightSpan(heights: []const u16, d: usize, x0: usize, z0: usize, wx: usize, w
     return .{ .min = lo, .max = hi };
 }
 
-fn box(world: *World, a0: usize, y0: usize, b0: usize, a1: usize, y1: usize, b1: usize, along_x: bool, m: u8) !void {
+fn archBox(world: *World, x0: usize, z0: usize, l0: usize, l1: usize, y0: usize, y1: usize, along_x: bool, m: u8) !void {
     if (along_x) {
-        try world.fillBox(a0, y0, b0, a1, y1, b1, m);
+        try world.fillBox(x0 + l0, y0, z0, x0 + l1, y1, z0 + 2, m);
     } else {
-        try world.fillBox(b0, y0, a0, b1, y1, a1, m);
+        try world.fillBox(x0, y0, z0 + l0, x0 + 2, y1, z0 + l1, m);
     }
 }
 
-fn buildArch(world: *World, a0: usize, y0: usize, b0: usize, along_x: bool) !void {
-    try box(world, a0, y0 - 1, b0, a0 + 9, y0 + 10, b0 + 2, along_x, mat.arch);
-    try box(world, a0 + 2, y0, b0, a0 + 7, y0 + 6, b0 + 2, along_x, 0);
-    try box(world, a0 + 3, y0 + 6, b0, a0 + 6, y0 + 8, b0 + 2, along_x, 0);
-    try box(world, a0 + 4, y0 + 8, b0, a0 + 5, y0 + 9, b0 + 2, along_x, 0);
+fn buildArch(world: *World, x0: usize, y0: usize, z0: usize, along_x: bool) !void {
+    try archBox(world, x0, z0, 0, 9, y0 - 1, y0 + 10, along_x, mat.arch);
+    try archBox(world, x0, z0, 2, 7, y0, y0 + 6, along_x, 0);
+    try archBox(world, x0, z0, 3, 6, y0 + 6, y0 + 8, along_x, 0);
+    try archBox(world, x0, z0, 4, 5, y0 + 8, y0 + 9, along_x, 0);
 }
 
 fn farFromLandmarks(landmarks: []const gen.Landmark, x: usize, z: usize, min_dist: i32) bool {
@@ -204,7 +204,10 @@ fn expectCoverage(world: *const World, x: i32, z: i32) !void {
 fn worldsEqual(a: *const World, b: *const World) bool {
     if (a.w != b.w or a.h != b.h or a.d != b.d) return false;
     for (a.columns, b.columns) |ca, cb| {
-        if (!std.mem.eql(world_mod.MatRun, ca.runs, cb.runs)) return false;
+        if (ca.runs.len != cb.runs.len) return false;
+        for (ca.runs, cb.runs) |ra, rb| {
+            if (ra.count != rb.count or ra.palette_id != rb.palette_id) return false;
+        }
     }
     return true;
 }
@@ -253,13 +256,12 @@ test "caves and arches exist" {
     try std.testing.expect(r.landmarks.len > 0);
     for (r.landmarks) |lm| {
         try std.testing.expectEqual(mat.arch, r.world.get(lm.x, lm.y, lm.z));
-        const along_x = r.world.get(lm.x + 4, lm.y + 4, lm.z) == 0;
-        const along_z = r.world.get(lm.x, lm.y + 4, lm.z + 4) == 0;
-        try std.testing.expect(along_x != along_z);
-        const lintel = if (along_x)
-            r.world.get(lm.x + 4, lm.y + 9, lm.z)
-        else
-            r.world.get(lm.x, lm.y + 9, lm.z + 4);
-        try std.testing.expectEqual(mat.arch, lintel);
+        // Orientation shows in the lintel (top beam, always arch): exactly
+        // one of the +x / +z mid-beam probes is arch material. Probing the
+        // opening instead is unreliable — terrain beside the arch can be
+        // legitimately lower than the opening.
+        const x_beam = r.world.get(lm.x + 4, lm.y + 9, lm.z) == mat.arch;
+        const z_beam = r.world.get(lm.x, lm.y + 9, lm.z + 4) == mat.arch;
+        try std.testing.expect(x_beam != z_beam);
     }
 }

@@ -223,3 +223,10 @@ fn drawFpsOverlay(ctx: ?*c.nk_context, fps: f64) void {
     }
     c.nk_end(ctx);
 }
+
+test {
+    _ = render;
+    _ = gen;
+    _ = @import("world.zig");
+    _ = @import("camera.zig");
+}

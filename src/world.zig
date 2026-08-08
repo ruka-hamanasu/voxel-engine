@@ -46,6 +46,21 @@ pub const RunCursor = struct {
         return self.runs[self.idx].palette_id;
     }
 
+    /// Material at y without moving the cursor; y must be within one
+    /// voxel of the current run ([lo-1, hi+1], i.e. y +/- 1 queries land
+    /// on adjacent runs, which is all AO neighbor sampling needs).
+    /// Out-of-world heights read as air, matching World.get.
+    pub fn peek(self: *const RunCursor, y: i32) u8 {
+        std.debug.assert(y >= self.lo - 1 and y <= self.hi + 1);
+        if (y >= self.lo and y <= self.hi) return self.runs[self.idx].palette_id;
+        if (y > self.hi) {
+            if (self.idx == 0) return 0;
+            return self.runs[self.idx - 1].palette_id;
+        }
+        if (self.idx + 1 >= self.runs.len) return 0;
+        return self.runs[self.idx + 1].palette_id;
+    }
+
     pub fn up(self: *RunCursor) void {
         self.idx -= 1;
         self.lo = self.hi + 1;
@@ -276,6 +291,28 @@ test "runs split at 255" {
     try world.set(0, 255, 0, 3);
     try std.testing.expectEqual(3, world.get(0, 255, 0));
     try expectCoverage(&world, 0, 0);
+}
+
+test "run cursor peeks adjacent voxels" {
+    var world = try World.init(std.testing.allocator, 1, 16, 1);
+    defer world.deinit();
+    try world.fillBox(0, 3, 0, 1, 7, 1, 5);
+    const col = &world.columns[0];
+
+    const cur = RunCursor.init(col.runs, 16, 5);
+    try std.testing.expectEqual(5, cur.peek(5));
+    try std.testing.expectEqual(5, cur.peek(6));
+    try std.testing.expectEqual(0, cur.peek(7));
+    try std.testing.expectEqual(5, cur.peek(4));
+    try std.testing.expectEqual(0, cur.peek(2));
+
+    const top = RunCursor.init(col.runs, 16, 15);
+    try std.testing.expectEqual(0, top.peek(16));
+    try std.testing.expectEqual(0, top.peek(15));
+
+    const bottom = RunCursor.init(col.runs, 16, 0);
+    try std.testing.expectEqual(0, bottom.peek(0));
+    try std.testing.expectEqual(0, bottom.peek(-1));
 }
 
 test "run cursor walks both directions" {
