@@ -123,12 +123,45 @@ pub fn CursorFor(comptime R: type) type {
 pub const RunCursor = CursorFor(MatRun);
 pub const LightCursor = CursorFor(LightRun);
 
+pub const Region = struct {
+    x0: usize,
+    y0: usize,
+    z0: usize,
+    x1: usize,
+    y1: usize,
+    z1: usize,
+};
+
 pub const World = struct {
     w: usize,
     h: usize,
     d: usize,
     columns: []Column,
     allocator: std.mem.Allocator,
+    /// Bounding box (half-open) of everything touched by set/fillBox
+    /// since the last takeDirty; consumed by milestone 10's relight.
+    dirty: ?Region = null,
+
+    fn markDirty(self: *World, r: Region) void {
+        if (self.dirty) |*cur| {
+            cur.* = .{
+                .x0 = @min(cur.x0, r.x0),
+                .y0 = @min(cur.y0, r.y0),
+                .z0 = @min(cur.z0, r.z0),
+                .x1 = @max(cur.x1, r.x1),
+                .y1 = @max(cur.y1, r.y1),
+                .z1 = @max(cur.z1, r.z1),
+            };
+        } else {
+            self.dirty = r;
+        }
+    }
+
+    pub fn takeDirty(self: *World) ?Region {
+        const r = self.dirty;
+        self.dirty = null;
+        return r;
+    }
 
     pub fn init(allocator: std.mem.Allocator, w: usize, h: usize, d: usize) !World {
         var world: World = .{
@@ -256,9 +289,12 @@ pub const World = struct {
     }
 
     pub fn set(self: *World, x: usize, y: usize, z: usize, mat: u8) !void {
-        if (x >= self.w or y >= self.h or z >= self.d) return;
-        const depth = self.h - 1 - y;
-        try self.setRange(&self.columns[x * self.d + z], depth, depth + 1, mat);
+        const xc = @min(x, self.w - 1);
+        const yc = @min(y, self.h - 1);
+        const zc = @min(z, self.d - 1);
+        const depth = self.h - 1 - yc;
+        try self.setRange(&self.columns[xc * self.d + zc], depth, depth + 1, mat);
+        self.markDirty(.{ .x0 = xc, .y0 = yc, .z0 = zc, .x1 = xc + 1, .y1 = yc + 1, .z1 = zc + 1 });
     }
 
     pub fn fillBox(self: *World, x0: usize, y0: usize, z0: usize, x1: usize, y1: usize, z1: usize, mat: u8) !void {
@@ -274,6 +310,7 @@ pub const World = struct {
                 try self.setRange(&self.columns[x * self.d + z], self.h - yb, self.h - ya, mat);
             }
         }
+        self.markDirty(.{ .x0 = xa, .y0 = ya, .z0 = za, .x1 = xb, .y1 = yb, .z1 = zb });
     }
 
     pub fn buildDemoRoom(allocator: std.mem.Allocator) !World {
@@ -375,6 +412,24 @@ test "runs split at 255" {
     try world.set(0, 255, 0, 3);
     try std.testing.expectEqual(3, world.get(0, 255, 0));
     try expectCoverage(&world, 0, 0);
+}
+
+test "set clamps out-of-bounds and edits record dirty extents" {
+    var world = try World.init(std.testing.allocator, 8, 8, 8);
+    defer world.deinit();
+    try std.testing.expectEqual(null, world.dirty);
+
+    try world.set(20, 20, 20, 5);
+    try std.testing.expectEqual(5, world.get(7, 7, 7));
+    try std.testing.expectEqual(Region{ .x0 = 7, .y0 = 7, .z0 = 7, .x1 = 8, .y1 = 8, .z1 = 8 }, world.dirty.?);
+
+    try world.fillBox(1, 2, 3, 4, 5, 6, 7);
+    try std.testing.expectEqual(Region{ .x0 = 1, .y0 = 2, .z0 = 3, .x1 = 8, .y1 = 8, .z1 = 8 }, world.dirty.?);
+
+    const r = world.takeDirty().?;
+    try std.testing.expectEqual(@as(usize, 1), r.x0);
+    try std.testing.expectEqual(null, world.dirty);
+    try std.testing.expectEqual(null, world.takeDirty());
 }
 
 test "topSolidY finds the topmost solid voxel" {
