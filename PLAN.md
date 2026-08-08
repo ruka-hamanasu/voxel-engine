@@ -181,7 +181,10 @@ build.zig            # link system SDL2 via pkg-config
 src/main.zig         # SDL init, fixed-timestep loop, --headless mode
 src/world.zig        # columns, material + light RLE streams, edit API, palette
 src/lighting.zig     # colored flood-fill BFS, incremental updates, sky defaults
-src/render.zig       # column DDA rasterizer, single-pass stream merge, AO, fog, shadow march
+src/render.zig       # march core: render/renderColumn, DdaIterator, CellCtx/genSegments/processCell, segmentColor
+src/render/spans.zig # free-span list + fillSpans/claim/claimGrad, the single pixel-write path
+src/render/ao.zig    # fake-AO math: aoLevel, side/face stops, neighbor-cursor helpers
+src/render/shade.zig # shading tables: shade LUT, fog LUTs, dir_weight, applyLight/fogStop, sky
 src/camera.zig       # yaw-only camera, WASD + mouse input
 src/gen.zig          # generator facade: Options/Result/Landmark, Generator enum dispatch
 src/gen/noise.zig    # seeded value noise + fBm (shared by generators)
@@ -294,6 +297,17 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
    when propagation changes direction) for corner-bend leaks whose flow
    still arrives face-on after bending — evaluate from renders whether
    it is needed.
+7.5. COMPLETED - render.zig split (1176 -> ~640 lines core) ahead of the
+    milestone 10-13 growth: pure code motion into src/render/spans.zig
+    (span list + pixel-write path), src/render/ao.zig (AO level math),
+    and src/render/shade.zig (all color/LUT tables; imports render.zig
+    for RenderParams — Zig tolerates the cycle). render.rebuildShadeLut
+    re-exported so main.zig is untouched. Verified: `zig build test`
+    green; headless PPMs byte-identical across the 37 camera views in
+    both flag modes (`--light 0 --fog 0` and default light+fog, 78
+    renders) plus a light-tint-visible crystal view; bench (ReleaseFast,
+    spawn, light on) 2.58-2.65 ms base vs 2.59-2.60 ms new (drift-level,
+    A/B against a git-archive HEAD build).
 10. Incremental relight on edits (clear-then-reflood, consuming 7f's
     dirty extents) + emissive palette animation (7d's runtime palette +
     7h's accumulated time).
