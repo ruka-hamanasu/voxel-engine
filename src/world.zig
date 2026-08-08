@@ -51,10 +51,15 @@ pub const Column = struct {
     /// holds no deviations.
     light: ?[]LightRun = null,
     light_base_y: u16 = 0,
+    /// Cached topmost solid y (no_solid when fully air), maintained by
+    /// setRange/setColumnRuns so the renderer's analytic sky light
+    /// (milestone 11) never rescans runs per cell.
+    top_solid_y: u16 = no_solid,
 };
 
-/// Topmost solid voxel y in the column, or null when fully air. Backs
-/// milestone 11's sky-light defaults.
+pub const no_solid = std.math.maxInt(u16);
+
+/// Topmost solid voxel y in the column, or null when fully air.
 pub fn topSolidY(col: *const Column, h: i32) ?i32 {
     var hi: i32 = h - 1;
     for (col.runs) |run| {
@@ -223,6 +228,7 @@ pub const World = struct {
         self.allocator.free(col.runs);
         if (col.light) |l| self.allocator.free(l);
         col.* = .{ .runs = runs };
+        col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
     }
 
     pub fn get(self: *const World, x: i32, y: i32, z: i32) u8 {
@@ -255,6 +261,22 @@ pub const World = struct {
         return null;
     }
 
+    /// Bottommost solid y within [y_lo, y_hi], or null. Counterpart to
+    /// firstSolidInColumn for upward pick rays (milestone 10): an
+    /// ascending ray meets the interval's lowest solid first.
+    pub fn lastSolidInColumn(self: *const World, ix: i32, iz: i32, y_lo: i32, y_hi: i32) ?i32 {
+        const col = self.columnAt(ix, iz) orelse return null;
+        var result: ?i32 = null;
+        var hi: i32 = @intCast(self.h - 1);
+        for (col.runs) |run| {
+            const lo = hi - @as(i32, run.count) + 1;
+            if (run.palette_id != 0 and lo <= y_hi and hi >= y_lo)
+                result = @max(lo, y_lo);
+            hi = lo - 1;
+        }
+        return result;
+    }
+
     fn setRange(self: *World, col: *Column, d0: usize, d1: usize, mat: u8) !void {
         var out: std.ArrayList(MatRun) = .empty;
         errdefer out.deinit(self.allocator);
@@ -272,6 +294,7 @@ pub const World = struct {
         const new_runs = try out.toOwnedSlice(self.allocator);
         self.allocator.free(col.runs);
         col.runs = new_runs;
+        col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
     }
 
     fn appendRun(out: *std.ArrayList(MatRun), allocator: std.mem.Allocator, mat: u8, count: usize) !void {
@@ -436,15 +459,22 @@ test "set clamps out-of-bounds and edits record dirty extents" {
     try std.testing.expectEqual(null, world.takeDirty());
 }
 
-test "topSolidY finds the topmost solid voxel" {
+test "topSolidY finds the topmost solid voxel and the cache tracks edits" {
     var world = try World.init(std.testing.allocator, 1, 16, 1);
     defer world.deinit();
     const col = &world.columns[0];
     try std.testing.expectEqual(null, topSolidY(col, 16));
+    try std.testing.expectEqual(no_solid, col.top_solid_y);
     try world.fillBox(0, 3, 0, 1, 7, 1, 5);
     try std.testing.expectEqual(6, topSolidY(col, 16));
+    try std.testing.expectEqual(6, col.top_solid_y);
     try world.set(0, 12, 0, 4);
     try std.testing.expectEqual(12, topSolidY(col, 16));
+    try std.testing.expectEqual(12, col.top_solid_y);
+    try world.set(0, 12, 0, 0);
+    try std.testing.expectEqual(6, col.top_solid_y);
+    try world.fillBox(0, 0, 0, 1, 16, 1, 0);
+    try std.testing.expectEqual(no_solid, col.top_solid_y);
 }
 
 test "light stream storage lifecycle" {

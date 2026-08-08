@@ -180,6 +180,9 @@ fn rowAt(y: i32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
 /// the zipper splits segments at light-run boundaries. intensity 0 =
 /// no colored light. segmentColor scales intensity by the alignment of
 /// the sample's arrival direction with the (oriented) face normal.
+/// sky is the milestone-11 analytic bit (1 = the face's air cell is
+/// above its column's topmost solid); segments split at the sky
+/// boundary plane, so it is uniform per segment too.
 const Segment = struct {
     mat: u8,
     face: OFace,
@@ -188,22 +191,23 @@ const Segment = struct {
     t: [2]f32,
     ao: [2]f32,
     light: lighting.LightSample = .{},
+    sky: u1 = 1,
 };
 
 /// The single LUT/light/fog composition point; milestones 8-13 extend
 /// this function and nowhere else.
 fn segmentColor(seg: Segment, params: RenderParams) [2]u32 {
     const class = @intFromEnum(shade.faceClass(seg.face));
-    var c0 = shade.shadeAt(seg.mat, class, seg.ao[0]);
-    var c1 = shade.shadeAt(seg.mat, class, seg.ao[1]);
+    var c0 = shade.shadeAt(seg.mat, class, seg.ao[0], seg.sky);
+    var c1 = shade.shadeAt(seg.mat, class, seg.ao[1], seg.sky);
     // Emissive materials stay full-bright (shade LUT bypass), so their
     // own seed light is not reapplied on top.
     if (seg.light.intensity != 0 and world_mod.palette[seg.mat].emissive == 0) {
         var light = seg.light;
         light.intensity = @intCast(@as(u16, light.intensity) * shade.dir_weight[@intFromEnum(light.dir)][@intFromEnum(seg.face)] / 255);
         if (light.intensity != 0) {
-            c0 = shade.applyLight(c0, light);
-            c1 = shade.applyLight(c1, light);
+            c0 = shade.applyGlow(c0, light);
+            c1 = shade.applyGlow(c1, light);
         }
     }
     if (params.fog_density <= 0) return .{ c0, c1 };
@@ -263,6 +267,16 @@ const CellCtx = struct {
     nlcur: ?world_mod.LightCursor,
     nlight_lo: i32,
     nlight_hi: i32,
+    /// Analytic sky (milestone 11): sky_on gates the whole path
+    /// (params.light); sky_y is this column's cached topmost solid
+    /// (-1 when fully air), nsky_y the previous DDA cell's. An air
+    /// cell at y is sky-lit iff y > its column's sky_y — side faces
+    /// sample the NEIGHBOR column (the air in front of the face, so a
+    /// hillside above the adjacent terrain is lit), top/bottom faces
+    /// their own column one voxel out.
+    sky_on: bool,
+    sky_y: i32,
+    nsky_y: i32,
 
     fn row(self: *const CellCtx, y: i32, t: f32) f32 {
         return rowAt(y, self.cam_y, self.f, t, self.hf);
@@ -304,6 +318,13 @@ const LightQuery = struct {
     sample: lighting.LightSample,
     hi: i32,
 };
+
+/// Analytic sky stop for the air cell at y: lit (1) above the column's
+/// topmost solid, dark (0) at or below it. sky_on = false (the
+/// --light 0 identity path) keeps everything lit.
+fn skyStop(sky_on: bool, sky_y: i32, y: i32) u1 {
+    return if (!sky_on or y > sky_y) 1 else 0;
+}
 
 fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList, params: RenderParams) void {
     if (free.isEmpty()) return;
@@ -356,6 +377,9 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         .nlcur = null,
         .nlight_lo = 0,
         .nlight_hi = -1,
+        .sky_on = params.light,
+        .sky_y = if (col.top_solid_y == world_mod.no_solid) -1 else col.top_solid_y,
+        .nsky_y = -1,
     };
 
     // Neighbor occupancy for face culling + side-face AO: ncur covers
@@ -364,6 +388,7 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     // lockstep with the segment loop, amortized O(1) per voxel.
     if (has_prev) {
         if (world.columnAt(px, pz)) |pcol| {
+            ctx.nsky_y = if (pcol.top_solid_y == world_mod.no_solid) -1 else pcol.top_solid_y;
             ctx.ncur = world_mod.RunCursor.init(pcol.runs, wh, y_lo);
             if (axis == .x_side) {
                 if (world.columnAt(px, pz - 1)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
@@ -438,12 +463,13 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                         // and the above-voxel's bottom corner sample
                         // different air-side voxels), but runs of max-AO
                         // voxels accumulate in [pend, yy) and flush as
-                        // one constant segment; a light-run boundary in
-                        // the air-side column breaks the accumulation
-                        // the same way, so every emitted segment has
-                        // uniform light.
+                        // one constant segment; a light-run boundary or
+                        // the sky boundary in the air-side column breaks
+                        // the accumulation the same way, so every
+                        // emitted segment has uniform light and sky.
                         var pend = sy;
                         var pend_light = ctx.nLightAt(lit, sy).sample;
+                        var pend_sky = skyStop(ctx.sky_on, ctx.nsky_y, sy);
                         var yy = sy;
                         while (yy <= e) : (yy += 1) {
                             if (ctx.lacur) |*la| {
@@ -454,34 +480,46 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                             }
                             const stops = ao.sideAoStops(n, ao.optCursor(&ctx.lacur), ao.optCursor(&ctx.lbcur), yy, ctx.side_u);
                             const lq = ctx.nLightAt(lit, yy);
-                            if (stops[0] == 3 and stops[1] == 3 and (!lit or std.meta.eql(lq.sample, pend_light))) continue;
+                            const sky = skyStop(ctx.sky_on, ctx.nsky_y, yy);
+                            if (stops[0] == 3 and stops[1] == 3 and (!lit or std.meta.eql(lq.sample, pend_light)) and sky == pend_sky) continue;
                             if (pend < yy) {
-                                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light });
+                                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light, .sky = pend_sky });
                             }
-                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = lq.sample });
+                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = lq.sample, .sky = sky });
                             pend = yy + 1;
                             pend_light = if (lit and pend <= e) ctx.nLightAt(lit, pend).sample else .{};
+                            pend_sky = skyStop(ctx.sky_on, ctx.nsky_y, pend);
                         }
                         if (pend <= e) {
-                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e + 1, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light });
+                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e + 1, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light, .sky = pend_sky });
                         }
                         if (free.isEmpty()) return;
                     }
                     sy = e + 1;
                 }
             } else if (!lit) {
-                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(seg_hi + 1, ctx.t0), .r1 = ctx.row(seg_lo, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 } });
+                // Sky is binary per segment: split the whole-run fill
+                // once when the boundary plane crosses it.
+                if (ctx.sky_on and seg_lo <= ctx.sky_y and seg_hi > ctx.sky_y) {
+                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(ctx.sky_y + 1, ctx.t0), .r1 = ctx.row(seg_lo, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .sky = 0 });
+                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(seg_hi + 1, ctx.t0), .r1 = ctx.row(ctx.sky_y + 1, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .sky = 1 });
+                } else {
+                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(seg_hi + 1, ctx.t0), .r1 = ctx.row(seg_lo, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .sky = skyStop(ctx.sky_on, ctx.sky_y, seg_lo) });
+                }
                 if (free.isEmpty()) return;
             } else {
                 // Zipper: split the span at light-run boundaries so each
-                // emitted segment carries a uniform light sample. With
-                // no light runs this is a single iteration emitting the
-                // same constant segment as before lighting.
+                // emitted segment carries a uniform light sample, and
+                // at the sky boundary plane so its sky bit is uniform
+                // too. With no light runs this is a single iteration
+                // emitting the same constant segment as before lighting.
                 var yy = seg_lo;
                 while (yy <= seg_hi) {
                     const lq = ctx.lightAt(lit, yy);
-                    const e2 = @min(seg_hi, lq.hi);
-                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e2 + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = lq.sample });
+                    var e2 = @min(seg_hi, lq.hi);
+                    const sky = skyStop(ctx.sky_on, ctx.sky_y, yy);
+                    if (sky == 0) e2 = @min(e2, ctx.sky_y);
+                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e2 + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = lq.sample, .sky = sky });
                     yy = e2 + 1;
                 }
                 if (free.isEmpty()) return;
@@ -497,7 +535,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                 const r_far = ctx.row(seg_lo, ctx.t1);
                 if (spans.spanOverlap(free, r_near, r_far)) {
                     const stops = ao.faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_lo - 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
-                    sink.emit(.{ .mat = mat, .face = bottom_face, .r0 = r_near, .r1 = r_far, .t = .{ ctx.t0, ctx.t1 }, .ao = stops, .light = if (lit) lighting.sampleLight(ctx.col, seg_lo - 1) else .{} });
+                    sink.emit(.{ .mat = mat, .face = bottom_face, .r0 = r_near, .r1 = r_far, .t = .{ ctx.t0, ctx.t1 }, .ao = stops, .light = if (lit) lighting.sampleLight(ctx.col, seg_lo - 1) else .{}, .sky = skyStop(ctx.sky_on, ctx.sky_y, seg_lo - 1) });
                     if (free.isEmpty()) return;
                 }
             }
@@ -523,7 +561,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                 const r_near = ctx.row(seg_hi + 1, ctx.t0);
                 if (spans.spanOverlap(free, r_far, r_near)) {
                     const stops = ao.faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_hi + 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
-                    sink.emit(.{ .mat = cur.mat(), .face = top_face, .r0 = r_far, .r1 = r_near, .t = .{ ctx.t1, ctx.t0 }, .ao = .{ stops[1], stops[0] }, .light = if (lit) lighting.sampleLight(ctx.col, seg_hi + 1) else .{} });
+                    sink.emit(.{ .mat = cur.mat(), .face = top_face, .r0 = r_far, .r1 = r_near, .t = .{ ctx.t1, ctx.t0 }, .ao = .{ stops[1], stops[0] }, .light = if (lit) lighting.sampleLight(ctx.col, seg_hi + 1) else .{}, .sky = skyStop(ctx.sky_on, ctx.sky_y, seg_hi + 1) });
                     if (free.isEmpty()) return;
                 }
             }
@@ -564,31 +602,56 @@ test {
 test "fog disabled leaves segment colors untouched" {
     const seg: Segment = .{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 2 } };
     const c = segmentColor(seg, .{ .fog_density = 0 });
-    try std.testing.expectEqual(shade.shadeAt(1, 0, 3), c[0]);
-    try std.testing.expectEqual(shade.shadeAt(1, 0, 2), c[1]);
+    try std.testing.expectEqual(shade.shadeAt(1, 0, 3, 1), c[0]);
+    try std.testing.expectEqual(shade.shadeAt(1, 0, 2, 1), c[1]);
 }
 
-test "light tints shaded stops; zero intensity is identity" {
+test "dark-sky segments scale by the ambient floor; emissive bypasses" {
+    const lit = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .sky = 1 }, .{ .fog_density = 0 });
+    const dark = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .sky = 0 }, .{ .fog_density = 0 });
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const cl: i32 = @intCast((lit[0] >> sh) & 0xff);
+        const cd: i32 = @intCast((dark[0] >> sh) & 0xff);
+        try std.testing.expect(@abs(cd - @as(i32, @intFromFloat(@as(f32, @floatFromInt(cl)) * shade.sky_ambient))) <= 1);
+    }
+    // Emissive stays full-bright under a dark sky.
+    const em_lit = segmentColor(.{ .mat = 9, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .sky = 1 }, .{ .fog_density = 0 });
+    const em_dark = segmentColor(.{ .mat = 9, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .sky = 0 }, .{ .fog_density = 0 });
+    try std.testing.expectEqual(em_lit, em_dark);
+}
+
+test "glow brightens and tints but never dims" {
     const plain = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 } }, .{ .fog_density = 0 });
     const zero = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 0 } }, .{ .fog_density = 0 });
     try std.testing.expectEqual(plain, zero);
 
-    // Full-intensity cyan scales each channel by the crystal's rgb.
+    // Full-intensity cyan: each channel lifted by lch * gain,
+    // clamped at 255 — brighter than plain in every channel.
     const lit = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 255 } }, .{ .fog_density = 0 });
-    const shaded = shade.shadeAt(1, 0, 3);
-    const want = [3]u32{ ((shaded >> 16) & 0xff) * 0x46 / 255, ((shaded >> 8) & 0xff) * 0xe6 / 255, (shaded & 0xff) * 0xe6 / 255 };
+    const shaded = shade.shadeAt(1, 0, 3, 1);
+    const lc = [3]u32{ 0x46, 0xe6, 0xe6 };
     inline for (0..3) |k| {
         const sh: u5 = @intCast((2 - k) * 8);
+        const ch: f32 = @floatFromInt((shaded >> sh) & 0xff);
+        const want: i32 = @intFromFloat(@min(ch + @as(f32, @floatFromInt(lc[k])) * shade.glow_gain, 255.0));
         const got: i32 = @intCast((lit[0] >> sh) & 0xff);
-        try std.testing.expect(@abs(got - @as(i32, @intCast(want[k]))) <= 1);
+        try std.testing.expect(@abs(got - want) <= 1);
+        try std.testing.expect(got >= @as(i32, @intCast((shaded >> sh) & 0xff)));
     }
 
-    // Half intensity tints halfway from white.
-    const half = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 128 } }, .{ .fog_density = 0 });
-    const full_r: i32 = @intCast((lit[0] >> 16) & 0xff);
-    const plain_r: i32 = @intCast((plain[0] >> 16) & 0xff);
-    const half_r: i32 = @intCast((half[0] >> 16) & 0xff);
-    try std.testing.expect(@abs(half_r - @divTrunc(full_r + plain_r, 2)) <= 2);
+    // Weak light is a strictly weaker version of the same lift —
+    // crucially the green channel is NOT dimmed below plain even
+    // though cyan's green is below white.
+    const weak = segmentColor(.{ .mat = 1, .face = .py, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 9, .intensity = 8 } }, .{ .fog_density = 0 });
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const pw: i32 = @intCast((plain[0] >> sh) & 0xff);
+        const wk: i32 = @intCast((weak[0] >> sh) & 0xff);
+        const fl: i32 = @intCast((lit[0] >> sh) & 0xff);
+        try std.testing.expect(wk >= pw - 1);
+        try std.testing.expect(wk <= fl + 1);
+    }
 }
 
 test "directional weight dims grazing faces and nulls opposed faces" {
@@ -612,7 +675,7 @@ test "directional weight dims grazing faces and nulls opposed faces" {
 test "emissive materials bypass the light tint" {
     const seg: Segment = .{ .mat = 9, .face = .px, .r0 = 0, .r1 = 10, .t = .{ 20, 24 }, .ao = .{ 3, 3 }, .light = .{ .color_id = 10, .intensity = 255 } };
     const c = segmentColor(seg, .{ .fog_density = 0 });
-    try std.testing.expectEqual(shade.shadeAt(9, 2, 3), c[0]);
+    try std.testing.expectEqual(shade.shadeAt(9, 2, 3, 1), c[0]);
 }
 
 test "fogged segment converges to the fog color at the cutoff" {

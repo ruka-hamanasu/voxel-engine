@@ -45,23 +45,34 @@ fn buildDirWeight() [7][6]u8 {
 const face_factor = [4]f32{ 1.0, 0.5, 0.8, 0.6 };
 const ao_factor = [4]f32{ 0.45, 0.65, 0.82, 1.0 };
 
-/// [palette][face][ao_level] -> shaded color; collapses all shading
-/// arithmetic into one L1-resident lookup. Emissive materials bypass
-/// face/AO shading: every entry in their row is the full-bright color.
-/// Runtime-var so milestone 10's palette animation can rebuild it.
-var shade_lut: [world_mod.default_palette.len][4][4]u32 = buildShadeLut(world_mod.default_palette);
+/// Brightness of air below a column's topmost solid (milestone 11
+/// analytic sky): caves/overhangs read dark but not black, and AO
+/// still darkens further on top. Sky-lit air is factor 1.0.
+pub const sky_ambient: f32 = 0.25;
 
-fn buildShadeLut(palette: [world_mod.default_palette.len]world_mod.PaletteEntry) [world_mod.default_palette.len][4][4]u32 {
-    var lut: [world_mod.default_palette.len][4][4]u32 = undefined;
+/// [palette][face][ao_level][sky] -> shaded color; collapses all
+/// shading arithmetic into one L1-resident lookup. sky is the milestone
+/// 11 analytic bit: 1 = the face's air cell is above its column's
+/// topmost solid, 0 = below (scaled by sky_ambient). Emissive materials
+/// bypass face/AO/sky shading: every entry in their row is the
+/// full-bright color. Runtime-var so milestone 10's palette animation
+/// can rebuild it.
+var shade_lut: [world_mod.default_palette.len][4][4][2]u32 = buildShadeLut(world_mod.default_palette);
+
+fn buildShadeLut(palette: [world_mod.default_palette.len]world_mod.PaletteEntry) [world_mod.default_palette.len][4][4][2]u32 {
+    var lut: [world_mod.default_palette.len][4][4][2]u32 = undefined;
     for (palette, 0..) |entry, m| {
         const cp = entry.rgb;
         for (face_factor, 0..) |ff, fi| {
             for (ao_factor, 0..) |af, ai| {
-                const factor = if (entry.emissive != 0) 1.0 else ff * af;
-                const r: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 16) & 0xff)) * factor);
-                const g: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 8) & 0xff)) * factor);
-                const b: u32 = @intFromFloat(@as(f32, @floatFromInt(cp & 0xff)) * factor);
-                lut[m][fi][ai] = 0xff000000 | (r << 16) | (g << 8) | b;
+                for (0..2) |sky| {
+                    const sky_f: f32 = if (sky == 1) 1.0 else sky_ambient;
+                    const factor = if (entry.emissive != 0) 1.0 else ff * af * sky_f;
+                    const r: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 16) & 0xff)) * factor);
+                    const g: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 8) & 0xff)) * factor);
+                    const b: u32 = @intFromFloat(@as(f32, @floatFromInt(cp & 0xff)) * factor);
+                    lut[m][fi][ai][sky] = 0xff000000 | (r << 16) | (g << 8) | b;
+                }
             }
         }
     }
@@ -139,14 +150,14 @@ pub fn buildFogLuts(params: RenderParams) void {
 
 /// Shaded color at a fractional AO level: lerps between the two
 /// adjacent LUT entries so gradients stay smooth instead of snapping
-/// to the four discrete levels.
-pub fn shadeAt(mat: u8, face: usize, level: f32) u32 {
+/// to the four discrete levels. sky is the analytic sky bit (1 = lit).
+pub fn shadeAt(mat: u8, face: usize, level: f32, sky: u1) u32 {
     const l = std.math.clamp(level, 0.0, 3.0);
     const lo: usize = @intFromFloat(l);
     const hi: usize = @min(lo + 1, 3);
     const frac = l - @as(f32, @floatFromInt(lo));
-    const c0 = shade_lut[mat][face][lo];
-    const c1 = shade_lut[mat][face][hi];
+    const c0 = shade_lut[mat][face][lo][sky];
+    const c1 = shade_lut[mat][face][hi][sky];
     var out: u32 = 0xff000000;
     inline for (0..3) |k| {
         const sh: u5 = @intCast((2 - k) * 8);
@@ -158,18 +169,26 @@ pub fn shadeAt(mat: u8, face: usize, level: f32) u32 {
     return out;
 }
 
-/// Lerp-to-white glow tint (the Gemini doc's BlendWithGlow): intensity
-/// scales tint strength, so intensity 0 is identity and the flood edge
-/// fades continuously into unlit geometry instead of clipping to black.
-pub fn applyLight(c: u32, light: lighting.LightSample) u32 {
-    const f = @as(f32, @floatFromInt(light.intensity)) * (1.0 / 255.0);
+pub const glow_gain: f32 = 0.5;
+
+/// Additive glow tint (milestone 11): light ADDS its color on top of
+/// the shaded base, so it can brighten and shift hue but never dim —
+/// the milestone-9 multiplicative lerp-to-white it replaces scaled any
+/// channel whose light color was below white below the unlit base,
+/// making weakly lit surfaces DARKER than unlit ones. The additive
+/// form reads in both regimes: over the dark cave ambient the added
+/// term dominates (neon pooling), over sky-lit surfaces it is a
+/// bounded tint that saturates only near the source. intensity 0 is
+/// identity, so the flood edge still fades continuously.
+pub fn applyGlow(c: u32, light: lighting.LightSample) u32 {
+    const f = @as(f32, @floatFromInt(light.intensity)) * (1.0 / 255.0) * glow_gain;
     const lc = lighting.lightColor(light.color_id);
     var out: u32 = 0xff000000;
     inline for (0..3) |k| {
         const sh: u5 = @intCast((2 - k) * 8);
         const ch: f32 = @floatFromInt((c >> sh) & 0xff);
         const lch: f32 = @floatFromInt((lc >> sh) & 0xff);
-        const v: u32 = @intFromFloat(ch * (255.0 + (lch - 255.0) * f) * (1.0 / 255.0));
+        const v: u32 = @intFromFloat(@min(ch + lch * f, 255.0));
         out |= v << sh;
     }
     return out;

@@ -6,9 +6,12 @@ const c = @cImport({
     @cInclude("nuklear_sdl_renderer.h");
 });
 const Input = @import("camera.zig").Input;
+const World = @import("world.zig").World;
+const Camera = @import("camera.zig").Camera;
 const render = @import("render.zig");
 const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
+const anim = @import("anim.zig");
 
 const render_w = 480;
 const render_h = 270;
@@ -27,6 +30,8 @@ pub fn main(init: std.process.Init) !void {
     var bench_frames: u32 = 0;
     var fog_density: ?f32 = null;
     var light_enabled = true;
+    var anim_enabled = true;
+    var time_s: f64 = 0;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
@@ -64,6 +69,14 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingLightValue;
             light_enabled = (try std.fmt.parseInt(u8, std.mem.span(args[i]), 10)) != 0;
+        } else if (std.mem.eql(u8, arg, "--anim")) {
+            i += 1;
+            if (i >= args.len) return error.MissingAnimValue;
+            anim_enabled = (try std.fmt.parseInt(u8, std.mem.span(args[i]), 10)) != 0;
+        } else if (std.mem.eql(u8, arg, "--time")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTimeValue;
+            time_s = try std.fmt.parseFloat(f64, std.mem.span(args[i]));
         }
     }
 
@@ -75,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
     if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
     render.rebuildShadeLut();
     var rparams: render.RenderParams = .{};
+    rparams.light = light_enabled;
     if (fog_density) |d| rparams.fog_density = d;
 
     var flood_stats: lighting.Stats = .{};
@@ -83,6 +97,13 @@ pub fn main(init: std.process.Init) !void {
         const fstart = std.Io.Clock.Timestamp.now(init.io, .awake);
         flood_stats = try lighting.floodAll(world, allocator, .{});
         flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+    }
+    // Generation's dirty extents are fully covered by the initial flood.
+    _ = world.takeDirty();
+
+    if (anim_enabled) {
+        anim.updatePalette(time_s);
+        render.rebuildShadeLut();
     }
 
     if (bench_frames > 0) {
@@ -156,10 +177,11 @@ pub fn main(init: std.process.Init) !void {
     _ = c.SDL_SetRelativeMouseMode(c.SDL_TRUE);
     var mouse_captured = true;
     var mouse_dx: f32 = 0;
+    var place_mat: u8 = 9;
+    const pick_dist: f32 = 16.0;
 
     const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
     var last_counter = c.SDL_GetPerformanceCounter();
-    var time_s: f64 = 0;
     var fps: f64 = 0;
     var frame: u32 = 0;
     var running = true;
@@ -182,15 +204,40 @@ pub fn main(init: std.process.Init) !void {
                     } else if (event.key.keysym.sym == c.SDLK_l) {
                         rparams.light = !rparams.light;
                         std.log.info("light {s}", .{if (rparams.light) "on" else "off"});
+                    } else if (event.key.keysym.sym == c.SDLK_TAB) {
+                        mouse_captured = !mouse_captured;
+                        _ = c.SDL_SetRelativeMouseMode(if (mouse_captured) c.SDL_TRUE else c.SDL_FALSE);
                     }
                 },
                 c.SDL_MOUSEMOTION => {
                     if (mouse_captured) mouse_dx += @floatFromInt(event.motion.xrel);
                 },
                 c.SDL_MOUSEBUTTONDOWN => {
-                    if (!mouse_captured) {
-                        _ = c.SDL_SetRelativeMouseMode(c.SDL_TRUE);
-                        mouse_captured = true;
+                    // Captured: pick through the screen-center
+                    // crosshair. Uncaptured: pick through the cursor
+                    // pixel (window coords scaled to render resolution)
+                    // — clicking never re-captures; Tab toggles that.
+                    const left = event.button.button == c.SDL_BUTTON_LEFT;
+                    const right = event.button.button == c.SDL_BUTTON_RIGHT;
+                    if (left or right) {
+                        var sx: f32 = @floatFromInt(render_w / 2);
+                        var sy: f32 = @floatFromInt(render_h / 2);
+                        if (!mouse_captured) {
+                            sx = @as(f32, @floatFromInt(event.button.x)) * render_w / window_w;
+                            sy = @as(f32, @floatFromInt(event.button.y)) * render_h / window_h;
+                        }
+                        if (pickPixel(world, cam, sx, sy, render_w, render_h, pick_dist)) |pick| {
+                            if (left) {
+                                try world.set(pick.hit[0], pick.hit[1], pick.hit[2], 0);
+                            } else if (pick.place) |p| {
+                                const cam_ix: usize = @intFromFloat(@floor(cam.x));
+                                const cam_iz: usize = @intFromFloat(@floor(cam.z));
+                                if (p[0] != cam_ix or p[2] != cam_iz) {
+                                    try world.set(p[0], p[1], p[2], place_mat);
+                                    place_mat = if (place_mat == 11) 9 else place_mat + 1;
+                                }
+                            }
+                        }
                     }
                 },
                 else => {},
@@ -219,6 +266,19 @@ pub fn main(init: std.process.Init) !void {
         input.boost = keys[c.SDL_SCANCODE_LSHIFT] != 0;
         cam.update(input, @floatCast(dt), world.w, world.h, world.d);
 
+        if (world.takeDirty()) |r| {
+            if (light_enabled) {
+                const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
+                const rstats = try lighting.relight(world, allocator, r, .{});
+                const rms = @as(f64, @floatFromInt(rstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+                std.log.info("relight: {} columns, {} runs, {d:.2} ms", .{ rstats.lit_columns, rstats.runs, rms });
+            }
+        }
+        if (anim_enabled) {
+            anim.updatePalette(time_s);
+            render.rebuildShadeLut();
+        }
+
         rparams.time_s = time_s;
         render.render(&framebuffer, render_w, render_h, world, cam, rparams);
         render.transpose(&staging, &framebuffer, render_w, render_h);
@@ -233,9 +293,89 @@ pub fn main(init: std.process.Init) !void {
         drawFpsOverlay(ctx, fps);
         c.nk_sdl_render(c.NK_ANTI_ALIASING_ON);
 
+        if (mouse_captured) drawCrosshair(renderer);
+
         c.SDL_RenderPresent(renderer);
         frame +%= 1;
     }
+}
+
+const PickResult = struct { hit: [3]usize, place: ?[3]usize };
+
+/// Pixel-accurate voxel picking (milestone 10): with a yaw-only camera
+/// every screen pixel maps to a ray with a fixed vertical slope (rowAt
+/// inverted: y = cam_y + (h/2 - row) * t / f), so the march reuses the
+/// renderer's XZ DDA and tests each cell's height interval with
+/// first/lastSolidInColumn — anything visible is clickable, including
+/// ground below the horizon and ceilings above. Placement prefers the
+/// previous XZ cell at the boundary height for side-face entries and
+/// the voxel above/below the hit for top/bottom-face entries (ray
+/// crosses the face plane inside the hit column); only air cells are
+/// offered.
+fn pickPixel(world: *const World, cam: Camera, sx: f32, sy: f32, width: usize, height: usize, max_t: f32) ?PickResult {
+    const wf: f32 = @floatFromInt(width);
+    const hf: f32 = @floatFromInt(height);
+    const f = (wf * 0.5) / @tan(render.hfov * 0.5);
+    const hx = (sx - wf * 0.5) / f;
+    const fwd = cam.forward();
+    const rgt = cam.right();
+    const dx = fwd[0] + rgt[0] * hx;
+    const dz = fwd[1] + rgt[1] * hx;
+    const slope = (hf * 0.5 - sy) / f; // world y per unit XZ distance
+    const wh: i32 = @intCast(world.h);
+    const whf: f32 = @floatFromInt(wh);
+
+    var dda = render.DdaIterator.init(cam.x, cam.z, dx, dz, max_t);
+    while (dda.t0 < max_t) {
+        const ya = cam.y + slope * dda.t0;
+        const yb = cam.y + slope * dda.t1();
+        // Ray receding outside the world's height: nothing more to hit.
+        if ((slope >= 0 and @min(ya, yb) >= whf) or (slope <= 0 and @max(ya, yb) < 0)) break;
+        const y_lo: i32 = @max(@as(i32, @intFromFloat(@floor(@min(ya, yb)))), 0);
+        const y_hi: i32 = @min(@as(i32, @intFromFloat(@floor(@max(ya, yb)))), wh - 1);
+        if (y_lo <= y_hi) {
+            const hy: ?i32 = if (slope > 0)
+                world.lastSolidInColumn(dda.ix, dda.iz, y_lo, y_hi)
+            else
+                world.firstSolidInColumn(dda.ix, dda.iz, y_lo, y_hi);
+            if (hy) |hit_y| {
+                var side: ?[3]usize = null;
+                if (dda.has_prev) {
+                    const piy: i32 = @intFromFloat(@floor(ya));
+                    if (piy >= 0 and piy < wh and world.get(dda.px, piy, dda.pz) == 0)
+                        side = .{ @intCast(dda.px), @intCast(piy), @intCast(dda.pz) };
+                }
+                var vert: ?[3]usize = null;
+                if (slope != 0) {
+                    const vy: i32 = if (slope < 0) hit_y + 1 else hit_y - 1;
+                    if (vy >= 0 and vy < wh and world.get(dda.ix, vy, dda.iz) == 0)
+                        vert = .{ @intCast(dda.ix), @intCast(vy), @intCast(dda.iz) };
+                }
+                var place: ?[3]usize = null;
+                if (slope != 0) {
+                    const plane_y: f32 = if (slope < 0) @floatFromInt(hit_y + 1) else @floatFromInt(hit_y);
+                    const t_plane = (plane_y - cam.y) / slope;
+                    place = if (t_plane <= dda.t0) side orelse vert else vert orelse side;
+                } else {
+                    place = side;
+                }
+                return .{ .hit = .{ @intCast(dda.ix), @intCast(hit_y), @intCast(dda.iz) }, .place = place };
+            }
+        }
+        dda.advance();
+    }
+    return null;
+}
+
+/// Center crosshair marking the captured-mouse pick point.
+fn drawCrosshair(renderer: ?*c.SDL_Renderer) void {
+    _ = c.SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    const cx: c_int = window_w / 2;
+    const cy: c_int = window_h / 2;
+    const horiz: c.SDL_Rect = .{ .x = cx - 5, .y = cy - 1, .w = 11, .h = 3 };
+    const vert: c.SDL_Rect = .{ .x = cx - 1, .y = cy - 5, .w = 3, .h = 11 };
+    _ = c.SDL_RenderFillRect(renderer, &horiz);
+    _ = c.SDL_RenderFillRect(renderer, &vert);
 }
 
 fn drawFpsOverlay(ctx: ?*c.nk_context, fps: f64) void {
@@ -257,6 +397,39 @@ test {
     _ = render;
     _ = gen;
     _ = lighting;
+    _ = anim;
     _ = @import("world.zig");
     _ = @import("camera.zig");
+}
+
+test "pickPixel hits the voxel under the pixel" {
+    const world_mod = @import("world.zig");
+    var world = try world_mod.World.init(std.testing.allocator, 8, 8, 8);
+    defer world.deinit();
+    try world.fillBox(5, 2, 2, 6, 4, 3, 1); // wall at x=5, y 2..3, z=2
+    try world.fillBox(0, 0, 0, 8, 1, 8, 1); // floor at y=0
+    try world.fillBox(5, 6, 2, 6, 7, 3, 1); // ceiling voxel (5,6,2)
+    const cam: Camera = .{ .x = 1.5, .y = 2.5, .z = 2.5, .yaw = 0 };
+    // 8x8 "screen": f = 4, center pixel (4,4) is the horizontal ray.
+
+    // Center pixel: horizontal hit on the wall, side placement.
+    const wall = pickPixel(&world, cam, 4.0, 4.0, 8, 8, 16.0).?;
+    try std.testing.expectEqual([3]usize{ 5, 2, 2 }, wall.hit);
+    try std.testing.expectEqual([3]usize{ 4, 2, 2 }, wall.place.?);
+
+    // Bottom row: steep down-ray hits the floor, placement on top.
+    const floor_pick = pickPixel(&world, cam, 4.0, 8.0, 8, 8, 16.0).?;
+    try std.testing.expectEqual(@as(usize, 0), floor_pick.hit[1]);
+    try std.testing.expectEqual(@as(usize, 1), floor_pick.place.?[1]);
+
+    // sy 0.5 (slope 0.875): up-ray meets the ceiling voxel's bottom
+    // face inside its column, placement below it.
+    const ceil = pickPixel(&world, cam, 4.0, 0.5, 8, 8, 16.0).?;
+    try std.testing.expectEqual([3]usize{ 5, 6, 2 }, ceil.hit);
+    try std.testing.expectEqual([3]usize{ 5, 5, 2 }, ceil.place.?);
+
+    // Nothing within range.
+    try std.testing.expectEqual(@as(?PickResult, null), pickPixel(&world, cam, 4.0, 4.0, 8, 8, 2.0));
+    // Looking back at open air: no hit.
+    try std.testing.expectEqual(@as(?PickResult, null), pickPixel(&world, .{ .x = 1.5, .y = 2.5, .z = 2.5, .yaw = std.math.pi }, 4.0, 4.0, 8, 8, 16.0));
 }
