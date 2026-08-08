@@ -225,49 +225,46 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
       Deferred (profiling-gated): baked per-column side-exposure nibble
       mask (4 bits/voxel, recompute the 5 affected columns on edit) if
       neighbor-cursor culling still shows up hot.
-7. Pre-fog refactor pass — structural groundwork for milestones 8-13. No
-   behavior change (verify: headless PPMs byte-identical across the 37
-   camera views; `--bench` shows no regression — investigate >~5%).
-   Order: a-c reshape render.zig, d-f reshape world.zig data, g-h are
-   small cleanups that ride along.
-   a. `RenderParams` struct (fog density/cutoff, sun az/el, time,
-      fog-glow light-map slot) threaded `render -> renderColumn ->
-      processCell`; update the 3 call sites in main.zig (bench,
-      headless, interactive).
-   b. Split `processCell` (render.zig:367, 138 lines, 20 params — the
-      god function every remaining milestone lands in) into: segment
-      generation (geometry/visibility -> segment records
-      `{mat, face, t, r0, r1, ao_stops}`), `segmentColor(seg, params)`
-      (the single LUT/light/fog composition point for 8-13), and
-      `claimGrad`.
-   c. Extract the XZ DDA stepper from `renderColumn` (render.zig:237-280,
-      pure ray math written inline) into a reusable
-      `DdaIterator{init, next()}` plus a pure
-      `firstSolidInColumn(world, ix, iz, y_lo, y_hi)` interval helper;
-      `renderColumn` consumes both. Milestone 12's sun march reuses them
-      verbatim (elevation => height interval affine in t).
-   d. Palette becomes runtime-mutable: entries `{rgb: u32, emissive: u8}`
-      (0 = not emissive; crystals 9-11 become emissive); `shade_lut`
-      moves from comptime to runtime, rebuilt on palette change (per
-      frame during animation); emissive materials bypass face/AO
-      shading (unshaded LUT path). Required by 9-10.
-   e. Column light stream storage (no behavior yet): lazy
-      `?[]LightRun{count: u8, color_id: u8, intensity: u8}` + `base_y`
-      per the Storage table above; alloc/free in `init`/`deinit`/
-      `setColumnRuns`; `LightCursor` mirroring `RunCursor` (or a cursor
-      generic over both run types); `topSolidY(col)` helper for 11's sky
-      defaults. Extend the `expectCoverage`/`worldsEqual` test
-      invariants to cover light runs.
-   f. Edit API reports dirty extents: `set`/`fillBox` return (or record
-      in `World`) the touched columns + y-ranges, consumed by 10's
-      incremental relight. Also make OOB handling consistent — `set`
-      silently no-ops while `fillBox` clamps; clamp both.
-   g. Unify the three pixel-write sites (`claim`, `claimGrad`, sky fill)
-      behind one span-fill helper so 13's fog glow has a single
-      injection point.
-   h. Accumulated time (`time_s: f64 += dt`) in the main loop, carried
-      in `RenderParams` — drives 10's palette animation and 12's
-      animated sun.
+7. COMPLETED - Pre-fog refactor pass — structural groundwork for milestones
+   8-13. Verified: headless PPMs byte-identical across the 37 camera views
+   after every sub-part; `--bench 1000` flat (1.55 -> 1.64 ms, within
+   machine drift; A/B stash checks showed no regression from any part).
+   a. COMPLETED - `RenderParams` struct (fog density/cutoff, sun az/el,
+      time, fog-glow light-map slot) threaded `render -> renderColumn ->
+      processCell`; 3 call sites in main.zig updated.
+   b. COMPLETED - `processCell` split: `CellCtx` + `genSegments` emits
+      `Segment{mat, face, r0, r1, t, ao}` records to a `SegmentSink`;
+      `segmentColor(seg, params)` is the single LUT composition point;
+      claims go through `claimGrad`.
+   c. COMPLETED - `DdaIterator` (init/t1()/advance() over public fields)
+      + `world.firstSolidInColumn` interval helper. NOTE 1: an iterator
+      `next() ?DdaCell` returning a cell record by value cost ~7%
+      (state spilled to memory each cell); the field-access + advance()
+      shape is free and is the final form. NOTE 2: calling
+      firstSolidInColumn as a per-cell fast reject in processCell cost
+      ~5% (double run scan); the renderer does not call it — it exists
+      for milestone 12's sun march.
+   d. COMPLETED - Runtime palette: `PaletteEntry{rgb, emissive}`,
+      `world_mod.palette` is now a var; `shade_lut` is a runtime var
+      with `rebuildShadeLut()`; emissive entries get an unshaded LUT
+      row. AMENDMENT: crystals 9-11 stay emissive=0 until milestone 9
+      (flipping them here would have broken the byte-identical-PPM
+      requirement).
+   e. COMPLETED - Column light storage: `?[]LightRun{count, color_id,
+      intensity}` + `light_base_y` (runs cover
+      `(base_y - total, base_y]`; default applies outside); freed in
+      deinit/setColumnRuns; `RunCursor` generalized to `CursorFor(R)`
+      with `LightCursor` alias (mat()/peek() compile-error on
+      non-material cursors); `topSolidY(col, h)`; expectCoverage/
+      worldsEqual cover light runs.
+   f. COMPLETED - `World.dirty: ?Region` merged bounding box of
+      set/fillBox touches + `takeDirty()`; `set` now clamps OOB coords
+      like fillBox instead of no-op.
+   g. COMPLETED - `fillSpans` is the single pixel-write path; claim/
+      claimGrad/sky fill are ConstSrc/GradSrc/SkySrc color taps over it
+      (fixed-point lerp math unchanged).
+   h. COMPLETED - `time_s: f64 += dt` in the main loop, carried in
+      RenderParams (headless/bench pass time 0).
 8. Distance fog (exponential + low-pass palette variant; after 7b/7g it
    lives entirely in `segmentColor` + the sky fill; fog glow deferred to
    milestone 13 since it needs the light map).
