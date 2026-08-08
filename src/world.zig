@@ -32,59 +32,96 @@ pub const MatRun = struct {
     palette_id: u8,
 };
 
+pub const LightRun = struct {
+    count: u8,
+    color_id: u8,
+    intensity: u8,
+};
+
 pub const Column = struct {
     runs: []MatRun,
+    /// Explicit light deviations; null = default derived from the
+    /// material runs (full sky light above the topmost solid run, dark
+    /// below). When present, the runs cover y in
+    /// (light_base_y - total_count, light_base_y] top-to-bottom; the
+    /// default applies outside that span. Freed back to null when it
+    /// holds no deviations.
+    light: ?[]LightRun = null,
+    light_base_y: u16 = 0,
 };
 
-pub const RunCursor = struct {
-    runs: []const MatRun,
-    idx: usize,
-    lo: i32,
-    hi: i32,
+/// Topmost solid voxel y in the column, or null when fully air. Backs
+/// milestone 11's sky-light defaults.
+pub fn topSolidY(col: *const Column, h: i32) ?i32 {
+    var hi: i32 = h - 1;
+    for (col.runs) |run| {
+        if (run.palette_id != 0) return hi;
+        hi -= run.count;
+    }
+    return null;
+}
 
-    pub fn init(runs: []const MatRun, h: i32, y: i32) RunCursor {
-        var idx: usize = 0;
-        var hi: i32 = h - 1;
-        var lo: i32 = hi - @as(i32, runs[0].count) + 1;
-        while (y < lo) {
-            idx += 1;
-            hi = lo - 1;
-            lo = hi - @as(i32, runs[idx].count) + 1;
+/// Cursor walking a top-to-bottom run stream; generic over the run
+/// type so material and light streams share the walk logic. mat() and
+/// peek() are material-specific (0 = air).
+pub fn CursorFor(comptime R: type) type {
+    return struct {
+        const Self = @This();
+
+        runs: []const R,
+        idx: usize,
+        lo: i32,
+        hi: i32,
+
+        pub fn init(runs: []const R, h: i32, y: i32) Self {
+            var idx: usize = 0;
+            var hi: i32 = h - 1;
+            var lo: i32 = hi - @as(i32, runs[0].count) + 1;
+            while (y < lo) {
+                idx += 1;
+                hi = lo - 1;
+                lo = hi - @as(i32, runs[idx].count) + 1;
+            }
+            return .{ .runs = runs, .idx = idx, .lo = lo, .hi = hi };
         }
-        return .{ .runs = runs, .idx = idx, .lo = lo, .hi = hi };
-    }
 
-    pub fn mat(self: *const RunCursor) u8 {
-        return self.runs[self.idx].palette_id;
-    }
-
-    /// Material at y without moving the cursor; y must be within one
-    /// voxel of the current run ([lo-1, hi+1], i.e. y +/- 1 queries land
-    /// on adjacent runs, which is all AO neighbor sampling needs).
-    /// Out-of-world heights read as air, matching World.get.
-    pub fn peek(self: *const RunCursor, y: i32) u8 {
-        std.debug.assert(y >= self.lo - 1 and y <= self.hi + 1);
-        if (y >= self.lo and y <= self.hi) return self.runs[self.idx].palette_id;
-        if (y > self.hi) {
-            if (self.idx == 0) return 0;
-            return self.runs[self.idx - 1].palette_id;
+        pub fn mat(self: *const Self) u8 {
+            if (R != MatRun) @compileError("mat() requires a MatRun cursor");
+            return self.runs[self.idx].palette_id;
         }
-        if (self.idx + 1 >= self.runs.len) return 0;
-        return self.runs[self.idx + 1].palette_id;
-    }
 
-    pub fn up(self: *RunCursor) void {
-        self.idx -= 1;
-        self.lo = self.hi + 1;
-        self.hi = self.lo + @as(i32, self.runs[self.idx].count) - 1;
-    }
+        /// Material at y without moving the cursor; y must be within one
+        /// voxel of the current run ([lo-1, hi+1], i.e. y +/- 1 queries land
+        /// on adjacent runs, which is all AO neighbor sampling needs).
+        /// Out-of-world heights read as air, matching World.get.
+        pub fn peek(self: *const Self, y: i32) u8 {
+            if (R != MatRun) @compileError("peek() requires a MatRun cursor");
+            std.debug.assert(y >= self.lo - 1 and y <= self.hi + 1);
+            if (y >= self.lo and y <= self.hi) return self.runs[self.idx].palette_id;
+            if (y > self.hi) {
+                if (self.idx == 0) return 0;
+                return self.runs[self.idx - 1].palette_id;
+            }
+            if (self.idx + 1 >= self.runs.len) return 0;
+            return self.runs[self.idx + 1].palette_id;
+        }
 
-    pub fn down(self: *RunCursor) void {
-        self.idx += 1;
-        self.hi = self.lo - 1;
-        self.lo = self.hi - @as(i32, self.runs[self.idx].count) + 1;
-    }
-};
+        pub fn up(self: *Self) void {
+            self.idx -= 1;
+            self.lo = self.hi + 1;
+            self.hi = self.lo + @as(i32, self.runs[self.idx].count) - 1;
+        }
+
+        pub fn down(self: *Self) void {
+            self.idx += 1;
+            self.hi = self.lo - 1;
+            self.lo = self.hi - @as(i32, self.runs[self.idx].count) + 1;
+        }
+    };
+}
+
+pub const RunCursor = CursorFor(MatRun);
+pub const LightCursor = CursorFor(LightRun);
 
 pub const World = struct {
     w: usize,
@@ -103,18 +140,24 @@ pub const World = struct {
         };
         var initialized: usize = 0;
         errdefer {
-            for (world.columns[0..initialized]) |col| allocator.free(col.runs);
+            for (world.columns[0..initialized]) |col| {
+                allocator.free(col.runs);
+                if (col.light) |l| allocator.free(l);
+            }
             allocator.free(world.columns);
         }
         for (world.columns, 0..) |*col, i| {
-            col.runs = try allocUniformRuns(allocator, h, 0);
+            col.* = .{ .runs = try allocUniformRuns(allocator, h, 0) };
             initialized = i + 1;
         }
         return world;
     }
 
     pub fn deinit(self: *World) void {
-        for (self.columns) |col| self.allocator.free(col.runs);
+        for (self.columns) |col| {
+            self.allocator.free(col.runs);
+            if (col.light) |l| self.allocator.free(l);
+        }
         self.allocator.free(self.columns);
     }
 
@@ -142,7 +185,8 @@ pub const World = struct {
         std.debug.assert(x < self.w and z < self.d);
         const col = &self.columns[x * self.d + z];
         self.allocator.free(col.runs);
-        col.runs = runs;
+        if (col.light) |l| self.allocator.free(l);
+        col.* = .{ .runs = runs };
     }
 
     pub fn get(self: *const World, x: i32, y: i32, z: i32) u8 {
@@ -259,6 +303,18 @@ fn expectCoverage(world: *const World, x: i32, z: i32) !void {
         total += run.count;
     }
     try std.testing.expectEqual(world.h, total);
+    if (col.light) |runs| {
+        var ltotal: usize = 0;
+        for (runs, 0..) |run, i| {
+            try std.testing.expect(run.count > 0);
+            if (i > 0) try std.testing.expect(
+                run.color_id != runs[i - 1].color_id or run.intensity != runs[i - 1].intensity or runs[i - 1].count == 255,
+            );
+            ltotal += run.count;
+        }
+        try std.testing.expect(ltotal <= world.h);
+        try std.testing.expect(col.light_base_y < world.h);
+    }
 }
 
 test "fillBox and get" {
@@ -319,6 +375,46 @@ test "runs split at 255" {
     try world.set(0, 255, 0, 3);
     try std.testing.expectEqual(3, world.get(0, 255, 0));
     try expectCoverage(&world, 0, 0);
+}
+
+test "topSolidY finds the topmost solid voxel" {
+    var world = try World.init(std.testing.allocator, 1, 16, 1);
+    defer world.deinit();
+    const col = &world.columns[0];
+    try std.testing.expectEqual(null, topSolidY(col, 16));
+    try world.fillBox(0, 3, 0, 1, 7, 1, 5);
+    try std.testing.expectEqual(6, topSolidY(col, 16));
+    try world.set(0, 12, 0, 4);
+    try std.testing.expectEqual(12, topSolidY(col, 16));
+}
+
+test "light stream storage lifecycle" {
+    const allocator = std.testing.allocator;
+    var world = try World.init(allocator, 2, 16, 2);
+    defer world.deinit();
+    for (world.columns) |col| try std.testing.expect(col.light == null);
+
+    const col = &world.columns[1 * 2 + 1];
+    const runs = try allocator.alloc(LightRun, 2);
+    runs[0] = .{ .count = 4, .color_id = 1, .intensity = 200 };
+    runs[1] = .{ .count = 3, .color_id = 1, .intensity = 120 };
+    col.light = runs;
+    col.light_base_y = 9;
+    try expectCoverage(&world, 1, 1);
+
+    var cur = LightCursor.init(col.light.?, 10, 9);
+    try std.testing.expectEqual(9, cur.hi);
+    try std.testing.expectEqual(6, cur.lo);
+    try std.testing.expectEqual(200, cur.runs[cur.idx].intensity);
+    cur.down();
+    try std.testing.expectEqual(5, cur.hi);
+    try std.testing.expectEqual(120, cur.runs[cur.idx].intensity);
+
+    // Replacing the material runs drops the stale light stream.
+    const fresh = try World.allocUniformRuns(allocator, 16, 0);
+    world.setColumnRuns(1, 1, fresh);
+    try std.testing.expect(col.light == null);
+    try std.testing.expectEqual(@as(u16, 0), col.light_base_y);
 }
 
 test "firstSolidInColumn finds interval overlap" {

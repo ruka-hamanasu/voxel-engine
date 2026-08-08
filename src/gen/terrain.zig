@@ -199,6 +199,14 @@ fn expectCoverage(world: *const World, x: i32, z: i32) !void {
         total += run.count;
     }
     try std.testing.expectEqual(world.h, total);
+    if (col.light) |runs| {
+        var ltotal: usize = 0;
+        for (runs) |run| {
+            try std.testing.expect(run.count > 0);
+            ltotal += run.count;
+        }
+        try std.testing.expect(ltotal <= world.h);
+    }
 }
 
 fn worldsEqual(a: *const World, b: *const World) bool {
@@ -207,6 +215,14 @@ fn worldsEqual(a: *const World, b: *const World) bool {
         if (ca.runs.len != cb.runs.len) return false;
         for (ca.runs, cb.runs) |ra, rb| {
             if (ra.count != rb.count or ra.palette_id != rb.palette_id) return false;
+        }
+        if ((ca.light == null) != (cb.light == null)) return false;
+        if (ca.light) |la| {
+            const lb = cb.light.?;
+            if (ca.light_base_y != cb.light_base_y or la.len != lb.len) return false;
+            for (la, lb) |ra, rb| {
+                if (ra.count != rb.count or ra.color_id != rb.color_id or ra.intensity != rb.intensity) return false;
+            }
         }
     }
     return true;
