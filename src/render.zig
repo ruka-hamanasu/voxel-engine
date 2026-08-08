@@ -376,8 +376,73 @@ fn claimGrad(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: 
     }
 }
 
-fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList, params: RenderParams) void {
+/// Visible face fragment produced by segment generation; the single
+/// record type crossing from geometry/visibility into shading. r0/r1
+/// are the unclipped row range, t/ao the distance and AO stops at those
+/// endpoints.
+const Segment = struct {
+    mat: u8,
+    face: usize,
+    r0: f32,
+    r1: f32,
+    t: [2]f32,
+    ao: [2]f32,
+};
+
+/// The single LUT/light/fog composition point; milestones 8-13 extend
+/// this function and nowhere else.
+fn segmentColor(seg: Segment, params: RenderParams) [2]u32 {
     _ = params;
+    return .{
+        shadeAt(seg.mat, seg.face, seg.ao[0]),
+        shadeAt(seg.mat, seg.face, seg.ao[1]),
+    };
+}
+
+const SegmentSink = struct {
+    fb: []u32,
+    height: usize,
+    sx: usize,
+    free: *SpanList,
+    params: RenderParams,
+
+    fn emit(self: *SegmentSink, seg: Segment) void {
+        const c = segmentColor(seg, self.params);
+        claimGrad(self.fb, self.height, self.sx, self.free, seg.r0, seg.r1, c[0], c[1]);
+    }
+};
+
+/// Immutable-ish cell context shared by the generation loops; the
+/// neighbor cursors mutate as they walk y in lockstep.
+const CellCtx = struct {
+    world: *const World,
+    runs: []const world_mod.MatRun,
+    ix: i32,
+    iz: i32,
+    cam_y: f32,
+    f: f32,
+    t0: f32,
+    t1: f32,
+    hf: f32,
+    ua: f32,
+    va: f32,
+    ub: f32,
+    vb: f32,
+    side_u: f32,
+    side_face: usize,
+    y_lo: i32,
+    y_hi: i32,
+    wh: i32,
+    ncur: ?world_mod.RunCursor,
+    lacur: ?world_mod.RunCursor,
+    lbcur: ?world_mod.RunCursor,
+
+    fn row(self: *const CellCtx, y: i32, t: f32) f32 {
+        return rowAt(y, self.cam_y, self.f, t, self.hf);
+    }
+};
+
+fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList, params: RenderParams) void {
     if (free.isEmpty()) return;
     const t0 = @max(t0_in, 1e-4);
     const hf: f32 = @floatFromInt(height);
@@ -400,77 +465,104 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     const vb = frac01(cam_z + dz * t1 - izf);
     const side_u = if (axis == .x_side) va else ua;
 
+    var ctx: CellCtx = .{
+        .world = world,
+        .runs = col.runs,
+        .ix = ix,
+        .iz = iz,
+        .cam_y = cam_y,
+        .f = f,
+        .t0 = t0,
+        .t1 = t1,
+        .hf = hf,
+        .ua = ua,
+        .va = va,
+        .ub = ub,
+        .vb = vb,
+        .side_u = side_u,
+        .side_face = @intFromEnum(axis),
+        .y_lo = y_lo,
+        .y_hi = y_hi,
+        .wh = wh,
+        .ncur = null,
+        .lacur = null,
+        .lbcur = null,
+    };
+
     // Neighbor occupancy for face culling + side-face AO: ncur covers
     // the previous DDA cell (the air side of side faces); lacur/lbcur
     // cover the diagonal columns flanking it. All three walk y upward in
     // lockstep with the segment loop, amortized O(1) per voxel.
-    var ncur: ?world_mod.RunCursor = null;
-    var lacur: ?world_mod.RunCursor = null;
-    var lbcur: ?world_mod.RunCursor = null;
     if (has_prev) {
         if (world.columnAt(px, pz)) |pcol| {
-            ncur = world_mod.RunCursor.init(pcol.runs, wh, y_lo);
+            ctx.ncur = world_mod.RunCursor.init(pcol.runs, wh, y_lo);
             if (axis == .x_side) {
-                if (world.columnAt(px, pz - 1)) |c| lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-                if (world.columnAt(px, pz + 1)) |c| lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px, pz - 1)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px, pz + 1)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
             } else {
-                if (world.columnAt(px - 1, pz)) |c| lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-                if (world.columnAt(px + 1, pz)) |c| lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px - 1, pz)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px + 1, pz)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
             }
         }
     }
 
-    const side_face: usize = @intFromEnum(axis);
+    var sink: SegmentSink = .{ .fb = fb, .height = height, .sx = sx, .free = free, .params = params };
+    genSegments(&ctx, &sink);
+}
+
+/// Segment generation: geometry/visibility only, emitting Segment
+/// records front-to-back. All shading decisions live in segmentColor.
+fn genSegments(ctx: *CellCtx, sink: *SegmentSink) void {
+    const free = sink.free;
     const top_face: usize = @intFromEnum(Face.top);
     const bottom_face: usize = @intFromEnum(Face.bottom);
 
-    var y = y_lo;
-    var cur = world_mod.RunCursor.init(col.runs, wh, y_lo);
-    while (y <= y_hi) {
+    var y = ctx.y_lo;
+    var cur = world_mod.RunCursor.init(ctx.runs, ctx.wh, ctx.y_lo);
+    while (y <= ctx.y_hi) {
         const seg_lo = y;
-        const seg_hi = @min(cur.hi, y_hi);
+        const seg_hi = @min(cur.hi, ctx.y_hi);
         if (cur.mat() != 0) {
             const mat = cur.mat();
-            const side_max = shade_lut[mat][side_face][3];
-            if (ncur) |*n| {
+            if (ctx.ncur) |*n| {
                 var sy = seg_lo;
                 while (sy <= seg_hi) {
                     while (sy > n.hi) n.up();
                     const e = @min(seg_hi, n.hi);
-                    if (n.mat() == 0 and spanOverlap(free, rowAt(e + 1, cam_y, f, t0, hf), rowAt(sy, cam_y, f, t0, hf))) {
+                    if (n.mat() == 0 and spanOverlap(free, ctx.row(e + 1, ctx.t0), ctx.row(sy, ctx.t0))) {
                         // Air-backed sub-segment: claim per voxel with
                         // AO stops. Stops are not shareable between
                         // adjacent voxels (the below-voxel's top corner
                         // and the above-voxel's bottom corner sample
                         // different air-side voxels), but runs of max-AO
                         // voxels accumulate in [pend, yy) and flush as
-                        // one constant claim.
+                        // one constant segment.
                         var pend = sy;
                         var yy = sy;
                         while (yy <= e) : (yy += 1) {
-                            if (lacur) |*la| {
+                            if (ctx.lacur) |*la| {
                                 while (yy > la.hi) la.up();
                             }
-                            if (lbcur) |*lb| {
+                            if (ctx.lbcur) |*lb| {
                                 while (yy > lb.hi) lb.up();
                             }
-                            const stops = sideAoStops(n, optCursor(&lacur), optCursor(&lbcur), yy, side_u);
+                            const stops = sideAoStops(n, optCursor(&ctx.lacur), optCursor(&ctx.lbcur), yy, ctx.side_u);
                             if (stops[0] == 3 and stops[1] == 3) continue;
                             if (pend < yy) {
-                                claim(fb, height, sx, free, rowAt(yy, cam_y, f, t0, hf), rowAt(pend, cam_y, f, t0, hf), side_max);
+                                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 } });
                             }
-                            claimGrad(fb, height, sx, free, rowAt(yy + 1, cam_y, f, t0, hf), rowAt(yy, cam_y, f, t0, hf), shadeAt(mat, side_face, stops[0]), shadeAt(mat, side_face, stops[1]));
+                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops });
                             pend = yy + 1;
                         }
                         if (pend <= e) {
-                            claim(fb, height, sx, free, rowAt(e + 1, cam_y, f, t0, hf), rowAt(pend, cam_y, f, t0, hf), side_max);
+                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e + 1, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 } });
                         }
                         if (free.isEmpty()) return;
                     }
                     sy = e + 1;
                 }
             } else {
-                claim(fb, height, sx, free, rowAt(seg_hi + 1, cam_y, f, t0, hf), rowAt(seg_lo, cam_y, f, t0, hf), side_max);
+                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(seg_hi + 1, ctx.t0), .r1 = ctx.row(seg_lo, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 } });
                 if (free.isEmpty()) return;
             }
             // Bottom face visible only at a run's lower boundary where
@@ -479,40 +571,40 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
             const below_air = seg_lo == cur.lo and
                 (cur.idx + 1 >= cur.runs.len or cur.runs[cur.idx + 1].palette_id == 0);
             if (below_air) {
-                const r_near = rowAt(seg_lo, cam_y, f, t0, hf);
-                const r_far = rowAt(seg_lo, cam_y, f, t1, hf);
+                const r_near = ctx.row(seg_lo, ctx.t0);
+                const r_far = ctx.row(seg_lo, ctx.t1);
                 if (spanOverlap(free, r_near, r_far)) {
-                    const stops = faceAoStops(world, ix, iz, seg_lo - 1, ua, va, ub, vb);
-                    claimGrad(fb, height, sx, free, r_near, r_far, shadeAt(mat, bottom_face, stops[0]), shadeAt(mat, bottom_face, stops[1]));
+                    const stops = faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_lo - 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
+                    sink.emit(.{ .mat = mat, .face = bottom_face, .r0 = r_near, .r1 = r_far, .t = .{ ctx.t0, ctx.t1 }, .ao = stops });
                     if (free.isEmpty()) return;
                 }
             }
         }
         y = seg_hi + 1;
-        if (y <= y_hi) cur.up();
+        if (y <= ctx.y_hi) cur.up();
     }
 
-    y = y_hi;
-    cur = world_mod.RunCursor.init(col.runs, wh, y_hi);
-    while (y >= y_lo) {
+    y = ctx.y_hi;
+    cur = world_mod.RunCursor.init(ctx.runs, ctx.wh, ctx.y_hi);
+    while (y >= ctx.y_lo) {
         const seg_hi = y;
-        const seg_lo = @max(cur.lo, y_lo);
+        const seg_lo = @max(cur.lo, ctx.y_lo);
         if (cur.mat() != 0) {
             // Top face visible only at a run's upper boundary.
             const above_air = seg_hi == cur.hi and
                 (cur.idx == 0 or cur.runs[cur.idx - 1].palette_id == 0);
             if (above_air) {
-                const r_far = rowAt(seg_hi + 1, cam_y, f, t1, hf);
-                const r_near = rowAt(seg_hi + 1, cam_y, f, t0, hf);
+                const r_far = ctx.row(seg_hi + 1, ctx.t1);
+                const r_near = ctx.row(seg_hi + 1, ctx.t0);
                 if (spanOverlap(free, r_far, r_near)) {
-                    const stops = faceAoStops(world, ix, iz, seg_hi + 1, ua, va, ub, vb);
-                    claimGrad(fb, height, sx, free, r_far, r_near, shadeAt(cur.mat(), top_face, stops[1]), shadeAt(cur.mat(), top_face, stops[0]));
+                    const stops = faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_hi + 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
+                    sink.emit(.{ .mat = cur.mat(), .face = top_face, .r0 = r_far, .r1 = r_near, .t = .{ ctx.t1, ctx.t0 }, .ao = .{ stops[1], stops[0] } });
                     if (free.isEmpty()) return;
                 }
             }
         }
         y = seg_lo - 1;
-        if (y >= y_lo) cur.down();
+        if (y >= ctx.y_lo) cur.down();
     }
 }
 
