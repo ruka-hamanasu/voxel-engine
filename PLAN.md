@@ -272,8 +272,15 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
    camera views; default-fog views show distance-graded haze with a
    seamless horizon; `--fog 0 --bench 1000` 1.58 ms (drift-level vs the
    1.63 ms pre-change baseline), default fog 1.77 ms (+9%, the actual
-   fog work). Default density 0.05 (0.08 read as pea soup at vista
-   range; final tuning is milestone 13's pass).
+   fog work). Draw distance doubled after tuning feedback: `max_dist`
+   48 -> 96 with default density 0.025 (0.05 at cutoff 48 read as
+   claustrophobic; 0.08 was pea soup). At 96 the fog hides the cutoff
+   completely while terrain reads to ~60 units; spawn view 2.20 ms,
+   `--fog 0` 2.07 ms (the extra march draws real geometry). NOTE: the
+   max_dist bump invalidates the m7-base byte-identical comparison —
+   geometry in (48, 96] now renders where sky used to be; that's the
+   intended change, and the `--fog 0` regression check now only covers
+   the fog code path itself. Final tuning is milestone 13's pass.
    - `RenderParams` gains `fog_density` (0 disables), `fog_color`
      (horizon-row sky color 0x8ea6d2); `fog_cutoff` caps the DDA march
      (`dda.t0 >= cutoff` => every later hit fully fogged => fall through

@@ -6,13 +6,13 @@ const World = world_mod.World;
 const Camera = camera_mod.Camera;
 
 pub const hfov: f32 = std.math.pi / 2.0;
-pub const max_dist: f32 = 48.0;
+pub const max_dist: f32 = 96.0;
 
 /// Per-frame render configuration, threaded render -> renderColumn ->
 /// processCell. fog_* went live in milestone 8; sun/time/glow land in
 /// milestones 10-13.
 pub const RenderParams = struct {
-    fog_density: f32 = 0.05,
+    fog_density: f32 = 0.025,
     fog_cutoff: f32 = max_dist,
     fog_color: u32 = 0x8ea6d2, // horizon-row sky color
     sun_azimuth: f32 = 0.0,
