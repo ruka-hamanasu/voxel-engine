@@ -185,10 +185,39 @@ src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
    boost, noclip clamped to world bounds; headless render unchanged).
 5. COMPLETED - Procedural demo world (terrain, caves, arches). Modular
    generator facade (`--gen`, `--seed` args; `--cam` headless camera override).
-6. Per-vertex fake AO (3-neighbor, vertical 2-stop gradient per span;
-   implemented against the current simple shading loop, re-integrated into
-   the single-pass zipper in milestone 8). Verify: headless PPM showing
-   crevice/corner darkening.
+6. Fake AO, split into two passes:
+   a. COMPLETED - Inner-loop optimizations (verified: headless PPMs
+      byte-identical to pre-change output across 37 camera views; ~2.6-3.4x
+      faster via `--bench`):
+      - Sky color LUT: one `height`-entry `u32` table per frame, replacing
+        per-sky-pixel float lerps.
+      - Shade LUT: comptime `[mat][face] -> u32` table, collapsing shading
+        arithmetic to one lookup (extended to `[mat][face][ao]` in 6b).
+      - NOTE: per-cell reciprocal strength reduction of `proj()` was tried
+        and REVERTED — the distributed form `c - y*k` rounds differently
+        than `(y - cam_y) * f / t` and flips tie-break rows when the camera
+        sits at an exact integer height. Projection keeps the original op
+        sequence; the claim-count reduction below makes it cheap.
+      - Run-coalesced claims: side spans claimed per run segment (zippered
+        against the previous cell's runs), top/bottom claimed only at run
+        boundaries where the adjacent voxel is air — interior planes are
+        provably never visible (a ray reaching them would already have been
+        claimed by the occluding voxel at a strictly nearer distance).
+      - Exact face culling: a side face is skipped where the same-y voxel in
+        the previous DDA cell is solid, via a lockstep `RunCursor` on the
+        previous column (amortized O(1) per segment, no per-query run scans).
+        6b's AO neighbor queries reuse the same occupancy walk.
+      - `--bench N` flag: N headless renders, prints ms/frame.
+   b. Per-vertex fake AO: Minecraft 3-neighbor (side1, side2, corner),
+      factors {0.45, 0.65, 0.82, 1.0}; 2-stop vertical gradient per span,
+      stops sampled at the ray's hit u; fixed-point lerp fill with a
+      constant-fill fast path when both stops are max. Implemented against
+      the 6a-optimized loop, re-integrated into the single-pass zipper in
+      milestone 8. Verify: headless PPM showing crevice/corner darkening +
+      frame-time delta vs 6a.
+   Deferred (profiling-gated): baked per-column side-exposure nibble mask
+   (4 bits/voxel, recompute the 5 affected columns on edit) if
+   neighbor-cursor culling still shows up hot.
 7. Distance fog (exponential + low-pass palette variant; fog glow deferred
    to milestone 12 since it needs the light map).
 8. Colored flood-fill lighting + emissive voxels (full flood only).

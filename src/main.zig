@@ -23,6 +23,7 @@ pub fn main(init: std.process.Init) !void {
     var opts: gen.Options = .{};
     var generator: gen.Generator = .terrain;
     var cam_override: ?[4]f32 = null;
+    var bench_frames: u32 = 0;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
@@ -48,6 +49,10 @@ pub fn main(init: std.process.Init) !void {
                 v.* = try std.fmt.parseFloat(f32, part);
             }
             cam_override = vals;
+        } else if (std.mem.eql(u8, arg, "--bench")) {
+            i += 1;
+            if (i >= args.len) return error.MissingBenchValue;
+            bench_frames = try std.fmt.parseInt(u32, std.mem.span(args[i]), 10);
         }
     }
 
@@ -57,6 +62,17 @@ pub fn main(init: std.process.Init) !void {
     const world = &result.world;
     var cam = result.spawn;
     if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
+
+    if (bench_frames > 0) {
+        const start = std.Io.Clock.Timestamp.now(init.io, .awake);
+        for (0..bench_frames) |_| {
+            render.render(&framebuffer, render_w, render_h, world, cam);
+            std.mem.doNotOptimizeAway(framebuffer[0]);
+        }
+        const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
+        std.debug.print("bench: {} frames, {d:.3} ms/frame\n", .{ bench_frames, ns / 1e6 / @as(f64, @floatFromInt(bench_frames)) });
+        if (headless_path == null) return;
+    }
 
     if (headless_path) |path| {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });

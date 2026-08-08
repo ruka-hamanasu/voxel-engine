@@ -11,6 +11,19 @@ pub const max_dist: f32 = 48.0;
 const Face = enum(u2) { top, bottom, x_side, z_side };
 const face_factor = [4]f32{ 1.0, 0.5, 0.8, 0.6 };
 
+const shade_lut = blk: {
+    var lut: [world_mod.palette.len][4]u32 = undefined;
+    for (world_mod.palette, 0..) |cp, m| {
+        for (face_factor, 0..) |factor, fi| {
+            const r: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 16) & 0xff)) * factor);
+            const g: u32 = @intFromFloat(@as(f32, @floatFromInt((cp >> 8) & 0xff)) * factor);
+            const b: u32 = @intFromFloat(@as(f32, @floatFromInt(cp & 0xff)) * factor);
+            lut[m][fi] = 0xff000000 | (r << 16) | (g << 8) | b;
+        }
+    }
+    break :blk lut;
+};
+
 const Span = struct { y0: u16, y1: u16 };
 
 pub const SpanList = struct {
@@ -68,14 +81,7 @@ pub const SpanList = struct {
     }
 };
 
-fn shade(mat: u8, face: Face) u32 {
-    const c = world_mod.palette[mat];
-    const factor = face_factor[@intFromEnum(face)];
-    const r: u32 = @intFromFloat(@as(f32, @floatFromInt((c >> 16) & 0xff)) * factor);
-    const g: u32 = @intFromFloat(@as(f32, @floatFromInt((c >> 8) & 0xff)) * factor);
-    const b: u32 = @intFromFloat(@as(f32, @floatFromInt(c & 0xff)) * factor);
-    return 0xff000000 | (r << 16) | (g << 8) | b;
-}
+const max_sky_height = 4096;
 
 fn skyColor(row: usize, height: usize) u32 {
     const t = @as(f32, @floatFromInt(row)) / @as(f32, @floatFromInt(height));
@@ -86,6 +92,11 @@ fn skyColor(row: usize, height: usize) u32 {
 }
 
 pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: Camera) void {
+    std.debug.assert(height <= max_sky_height);
+    var sky_buf: [max_sky_height]u32 = undefined;
+    const sky = sky_buf[0..height];
+    for (sky, 0..) |*px, row| px.* = skyColor(row, height);
+
     const wf: f32 = @floatFromInt(width);
     const f = (wf * 0.5) / @tan(hfov * 0.5);
     const fwd = cam.forward();
@@ -95,11 +106,11 @@ pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: 
         const hx = (@as(f32, @floatFromInt(sx)) + 0.5 - wf * 0.5) / f;
         const dx = fwd[0] + rgt[0] * hx;
         const dz = fwd[1] + rgt[1] * hx;
-        renderColumn(fb, height, world, cam, f, sx, dx, dz);
+        renderColumn(fb, height, world, cam, f, sx, dx, dz, sky);
     }
 }
 
-fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f32, sx: usize, dx: f32, dz: f32) void {
+fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f32, sx: usize, dx: f32, dz: f32, sky: []const u32) void {
     var free = SpanList.initFull(@intCast(height));
 
     var ix: i32 = @intFromFloat(@floor(cam.x));
@@ -124,10 +135,16 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f
 
     var t0: f32 = 0;
     var axis: Face = .x_side;
+    var px: i32 = 0;
+    var pz: i32 = 0;
+    var has_prev = false;
 
     while (t0 < max_dist and !free.isEmpty()) {
         const t1 = @min(@min(t_max_x, t_max_z), max_dist);
-        processCell(fb, height, sx, world, ix, iz, cam.y, f, t0, t1, axis, &free);
+        processCell(fb, height, sx, world, ix, iz, px, pz, has_prev, cam.y, f, t0, t1, axis, &free);
+        px = ix;
+        pz = iz;
+        has_prev = true;
         if (t_max_x < t_max_z) {
             t0 = t_max_x;
             t_max_x += t_delta_x;
@@ -143,13 +160,13 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f
 
     for (free.spans[0..free.len]) |s| {
         for (s.y0..s.y1) |row| {
-            fb[sx * height + row] = skyColor(row, height);
+            fb[sx * height + row] = sky[row];
         }
     }
 }
 
-fn proj(h_world: f32, t: f32, height: usize, cam_y: f32, f: f32) f32 {
-    return @as(f32, @floatFromInt(height)) * 0.5 - (h_world - cam_y) * f / t;
+fn rowAt(y: i32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
+    return hf * 0.5 - (@as(f32, @floatFromInt(y)) - cam_y) * f / t;
 }
 
 fn claim(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, color: u32) void {
@@ -170,7 +187,7 @@ fn claim(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32,
     }
 }
 
-fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, cam_y: f32, f: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList) void {
+fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_y: f32, f: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList) void {
     if (free.isEmpty()) return;
     const t0 = @max(t0_in, 1e-4);
     const hf: f32 = @floatFromInt(height);
@@ -181,28 +198,65 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     const y_hi: i32 = @min(@as(i32, @intFromFloat(@floor(h_hi))), @as(i32, @intCast(world.h)) - 1);
     if (y_lo > y_hi) return;
     const col = world.columnAt(ix, iz) orelse return;
+    const wh: i32 = @intCast(world.h);
 
-    var y: i32 = y_lo;
-    var cur = world_mod.RunCursor.init(col.runs, @intCast(world.h), y_lo);
-    while (y <= y_hi) : (y += 1) {
-        const mat = cur.mat();
-        if (y < y_hi and y == cur.hi) cur.up();
-        if (mat == 0) continue;
-        const yf: f32 = @floatFromInt(y);
-        claim(fb, height, sx, free, proj(yf + 1, t0, height, cam_y, f), proj(yf, t0, height, cam_y, f), shade(mat, axis));
-        claim(fb, height, sx, free, proj(yf, t0, height, cam_y, f), proj(yf, t1, height, cam_y, f), shade(mat, .bottom));
-        if (free.isEmpty()) return;
+    var ncur: ?world_mod.RunCursor = null;
+    if (has_prev) {
+        if (world.columnAt(px, pz)) |pcol| {
+            ncur = world_mod.RunCursor.init(pcol.runs, wh, y_lo);
+        }
+    }
+
+    const side_face: usize = @intFromEnum(axis);
+
+    var y = y_lo;
+    var cur = world_mod.RunCursor.init(col.runs, wh, y_lo);
+    while (y <= y_hi) {
+        const seg_lo = y;
+        const seg_hi = @min(cur.hi, y_hi);
+        if (cur.mat() != 0) {
+            const side = shade_lut[cur.mat()][side_face];
+            if (ncur) |*n| {
+                var sy = seg_lo;
+                while (sy <= seg_hi) {
+                    while (sy > n.hi) n.up();
+                    const e = @min(seg_hi, n.hi);
+                    if (n.mat() == 0) {
+                        claim(fb, height, sx, free, rowAt(e + 1, cam_y, f, t0, hf), rowAt(sy, cam_y, f, t0, hf), side);
+                        if (free.isEmpty()) return;
+                    }
+                    sy = e + 1;
+                }
+            } else {
+                claim(fb, height, sx, free, rowAt(seg_hi + 1, cam_y, f, t0, hf), rowAt(seg_lo, cam_y, f, t0, hf), side);
+                if (free.isEmpty()) return;
+            }
+            const below_air = seg_lo == cur.lo and
+                (cur.idx + 1 >= cur.runs.len or cur.runs[cur.idx + 1].palette_id == 0);
+            if (below_air) {
+                claim(fb, height, sx, free, rowAt(seg_lo, cam_y, f, t0, hf), rowAt(seg_lo, cam_y, f, t1, hf), shade_lut[cur.mat()][@intFromEnum(Face.bottom)]);
+                if (free.isEmpty()) return;
+            }
+        }
+        y = seg_hi + 1;
+        if (y <= y_hi) cur.up();
     }
 
     y = y_hi;
-    cur = world_mod.RunCursor.init(col.runs, @intCast(world.h), y_hi);
-    while (y >= y_lo) : (y -= 1) {
-        const mat = cur.mat();
-        if (y > y_lo and y == cur.lo) cur.down();
-        if (mat == 0) continue;
-        const yf: f32 = @floatFromInt(y);
-        claim(fb, height, sx, free, proj(yf + 1, t1, height, cam_y, f), proj(yf + 1, t0, height, cam_y, f), shade(mat, .top));
-        if (free.isEmpty()) return;
+    cur = world_mod.RunCursor.init(col.runs, wh, y_hi);
+    while (y >= y_lo) {
+        const seg_hi = y;
+        const seg_lo = @max(cur.lo, y_lo);
+        if (cur.mat() != 0) {
+            const above_air = seg_hi == cur.hi and
+                (cur.idx == 0 or cur.runs[cur.idx - 1].palette_id == 0);
+            if (above_air) {
+                claim(fb, height, sx, free, rowAt(seg_hi + 1, cam_y, f, t1, hf), rowAt(seg_hi + 1, cam_y, f, t0, hf), shade_lut[cur.mat()][@intFromEnum(Face.top)]);
+                if (free.isEmpty()) return;
+            }
+        }
+        y = seg_lo - 1;
+        if (y >= y_lo) cur.down();
     }
 }
 
