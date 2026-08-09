@@ -14,10 +14,11 @@ const OFace = shade.OFace;
 
 pub const hfov: f32 = std.math.pi / 2.0;
 pub const max_dist: f32 = 96.0;
+/// Tallest renderable frame (the sky gradient buffer is stack-sized).
+pub const max_sky_height = shade.max_sky_height;
 
 /// Per-frame render configuration, threaded render -> renderColumn ->
-/// processCell. fog_* went live in milestone 8, light in milestone 9;
-/// sun/time/glow land in milestones 10-13.
+/// processCell. fog_* went live in milestone 8, light in milestone 9.
 pub const RenderParams = struct {
     fog_density: f32 = 0.025,
     fog_cutoff: f32 = max_dist,
@@ -25,10 +26,7 @@ pub const RenderParams = struct {
     /// false = treat every column as unlit (identity tint), ignoring
     /// the flood-filled light runs; runtime toggle for the L hotkey.
     light: bool = true,
-    sun_azimuth: f32 = 0.0,
-    sun_elevation: f32 = 0.0,
     time_s: f64 = 0.0,
-    glow_map: ?*const anyopaque = null,
 };
 
 /// Rebuild the shade LUT after a palette mutation (milestone 10 calls

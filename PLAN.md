@@ -100,11 +100,14 @@ Palette: `palette_id -> RGB + emissive flag/intensity`. Untextured flat colors.
       only, never view-dependent).
     - **Low-pass palette fog:** distant colors pre-collapse toward a
       shared macro-color, killing sub-pixel shimmer at 480x270 for free.
-  - **Fog glow:** a per-column ambient fog-glow color from a precomputed
-    2D XZ map (blurred light overlay, see SINGLE-PASS-LIGHTING.md) is
-    looked up once per hit and distance-weighted into the fog destination,
-    so distant geometry fades toward the local haze rather than a single
-    global color.
+  - **Fog glow (rejected, milestone 13):** a per-column fog-glow color
+    from a precomputed 2D XZ blurred-light map, distance-weighted into
+    the fog destination, was planned and cut. A 2D column blur only
+    tints distant haze — it cannot read as glow around a source (e.g.
+    a neon sign) without tracking each air cell volumetrically, which
+    is a different feature at a much higher cost. The fake-bloom
+    palette convention plus the emissive fog curve cover the look at
+    zero code cost.
 
 ## Lighting
 
@@ -146,7 +149,7 @@ materials.
 the sky field is ANALYTIC per column — an air cell at y is sky-lit iff
 `y > top_solid_y` of its column (cached per column, maintained by
 `setRange`/`setColumnRuns`). Sky-lit = full shading, below = `sky_ambient`
-floor (~0.25). Faces sample the sky bit in the air cell they are
+floor (0.30, tuned in m13). Faces sample the sky bit in the air cell they are
 exposed to (side faces: the neighbor column; top/bottom: one voxel
 out), so Model A shadows (dark caves/overhangs, shadowed recesses)
 fall out with zero flood work, and edits update sky for free. The
@@ -179,22 +182,17 @@ segment, merged with the material stream in the single-pass zipper.
 
 ## Shadows
 
-- **Model A — occlusion shadows:** fall out of flood-fill for free; caves,
-  interiors, and the unlit sides of geometry are dark. Soft gradient falloff,
-  zero render cost.
-- **Model B — directional sun shadows:** per sun-facing hit, march a shadow
-  ray toward the sun. Reuses the column-DDA machinery: fixed sun azimuth +
-  elevation => 2D XZ march, and in each crossed column the ray spans a fixed
-  height interval tested against the column's material runs
-  (interval-overlap scan).
-  First solid run overlapping the interval = shadowed; exiting world top =
-  sunlit. Early-out; typical
-  cost a few columns, worst case `H / tan(elevation)`.
-  - **Arches/overhangs work** because the march tests real geometry, not a
-    heightmap.
-  - Shadowed regions fall back to the column's ambient light, not black.
-- **Sun is animated:** the march makes changing sun angle nearly free; the
-  sky flood-fill ambient stays fixed.
+**Model A — occlusion shadows (adopted):** caves, interiors, and the
+unlit sides of geometry fall out of flood-fill / the analytic sky
+light for free. Soft gradient falloff, zero render cost.
+
+**Model B — directional sun shadows (skipped, milestone 12):** a
+per-hit shadow ray march toward the sun, reusing the column-DDA
+machinery (fixed azimuth + elevation => 2D XZ march, height interval
+tested against each crossed column's material runs; arches/overhangs
+correct, shadowed regions fall back to ambient) plus an animated sun.
+Cut because Model A reads well enough; the design is recorded here in
+case it is ever revisited.
 
 ## Interaction
 
@@ -263,9 +261,16 @@ entries here record scope and outcome only.
     emissive palette pulse (`--anim`/`--time`).
 11. COMPLETED - Analytic sky light (Model A shadows) + additive glow
     (revised design; see the Lighting section). Default-mode baselines
-    re-generated. Deferred: sky-BFS side-leak; `sky_ambient` /
-    `glow_gain` / attenuation tuning to m13.
-12. Directional sun march (Model B; reuses 7c's `DdaIterator` +
+    re-generated. Deferred: sky-BFS side-leak.
+12. SKIPPED - Directional sun march (Model B; reuses 7c's `DdaIterator` +
     `firstSolidInColumn`) + animated sun.
-13. Fog glow from light map (single injection point from 7g) + tuning
-    pass (resolution, fog cutoff, light radius).
+13. COMPLETED - Fog glow CUT (a 2D XZ haze tint can't read as source
+    glow without volumetric air-cell tracking). `--width`/`--height`
+    render-resolution CLI (runtime framebuffer) + `--fogcut`/`--atten`
+    tuning flags. Tuning outcomes: fog_density 0.025 / cutoff 96 kept
+    (variants near-identical in the bounded world), attenuation 8 kept
+    (4 washed the whole cave, 16 lost the glow), glow_gain 0.5 kept
+    (0.65 clipped hot), sky_ambient 0.25 -> 0.30 for cave readability.
+    Identity path byte-identical; bench neutral.
+14. Control panel.
+15. Cyberpunk city mapgen.

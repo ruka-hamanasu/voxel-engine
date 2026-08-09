@@ -48,7 +48,7 @@ const ao_factor = [4]f32{ 0.45, 0.65, 0.82, 1.0 };
 /// Brightness of air below a column's topmost solid (milestone 11
 /// analytic sky): caves/overhangs read dark but not black, and AO
 /// still darkens further on top. Sky-lit air is factor 1.0.
-pub const sky_ambient: f32 = 0.25;
+pub const sky_ambient: f32 = 0.30;
 
 /// [palette][face][ao_level][sky] -> shaded color; collapses all
 /// shading arithmetic into one L1-resident lookup. sky is the milestone

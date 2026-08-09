@@ -13,13 +13,8 @@ const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
 const anim = @import("anim.zig");
 
-const render_w = 480;
-const render_h = 270;
 const window_w = 960;
 const window_h = 540;
-
-var framebuffer: [render_w * render_h]u32 = undefined;
-var staging: [render_w * render_h]u32 = undefined;
 
 pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.vector;
@@ -29,9 +24,13 @@ pub fn main(init: std.process.Init) !void {
     var cam_override: ?[4]f32 = null;
     var bench_frames: u32 = 0;
     var fog_density: ?f32 = null;
+    var fog_cutoff: ?f32 = null;
+    var light_params: lighting.Params = .{};
     var light_enabled = true;
     var anim_enabled = true;
     var time_s: f64 = 0;
+    var render_w: usize = 480;
+    var render_h: usize = 270;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
@@ -65,6 +64,14 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingFogValue;
             fog_density = try std.fmt.parseFloat(f32, std.mem.span(args[i]));
+        } else if (std.mem.eql(u8, arg, "--fogcut")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFogcutValue;
+            fog_cutoff = try std.fmt.parseFloat(f32, std.mem.span(args[i]));
+        } else if (std.mem.eql(u8, arg, "--atten")) {
+            i += 1;
+            if (i >= args.len) return error.MissingAttenValue;
+            light_params.attenuation = try std.fmt.parseInt(u8, std.mem.span(args[i]), 10);
         } else if (std.mem.eql(u8, arg, "--light")) {
             i += 1;
             if (i >= args.len) return error.MissingLightValue;
@@ -77,10 +84,24 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingTimeValue;
             time_s = try std.fmt.parseFloat(f64, std.mem.span(args[i]));
+        } else if (std.mem.eql(u8, arg, "--width")) {
+            i += 1;
+            if (i >= args.len) return error.MissingWidthValue;
+            render_w = try std.fmt.parseInt(usize, std.mem.span(args[i]), 10);
+        } else if (std.mem.eql(u8, arg, "--height")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHeightValue;
+            render_h = try std.fmt.parseInt(usize, std.mem.span(args[i]), 10);
         }
     }
+    if (render_w == 0 or render_h == 0 or render_h > render.max_sky_height)
+        return error.BadResolution;
 
     const allocator = init.gpa;
+    const framebuffer = try allocator.alloc(u32, render_w * render_h);
+    defer allocator.free(framebuffer);
+    const staging = try allocator.alloc(u32, render_w * render_h);
+    defer allocator.free(staging);
     var result = try gen.generate(generator, allocator, opts);
     defer result.deinit(allocator);
     const world = &result.world;
@@ -90,12 +111,13 @@ pub fn main(init: std.process.Init) !void {
     var rparams: render.RenderParams = .{};
     rparams.light = light_enabled;
     if (fog_density) |d| rparams.fog_density = d;
+    if (fog_cutoff) |co| rparams.fog_cutoff = co;
 
     var flood_stats: lighting.Stats = .{};
     var flood_ms: f64 = 0;
     if (light_enabled) {
         const fstart = std.Io.Clock.Timestamp.now(init.io, .awake);
-        flood_stats = try lighting.floodAll(world, allocator, .{});
+        flood_stats = try lighting.floodAll(world, allocator, light_params);
         flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
     }
     // Generation's dirty extents are fully covered by the initial flood.
@@ -109,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..bench_frames) |_| {
-            render.render(&framebuffer, render_w, render_h, world, cam, rparams);
+            render.render(framebuffer, render_w, render_h, world, cam, rparams);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -121,9 +143,9 @@ pub fn main(init: std.process.Init) !void {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
         std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
-        render.render(&framebuffer, render_w, render_h, world, cam, rparams);
-        render.transpose(&staging, &framebuffer, render_w, render_h);
-        try render.writePpm(init.io, allocator, path, &staging, render_w, render_h);
+        render.render(framebuffer, render_w, render_h, world, cam, rparams);
+        render.transpose(staging, framebuffer, render_w, render_h);
+        try render.writePpm(init.io, allocator, path, staging, render_w, render_h);
         return;
     }
 
@@ -160,8 +182,8 @@ pub fn main(init: std.process.Init) !void {
         renderer,
         c.SDL_PIXELFORMAT_ARGB8888,
         c.SDL_TEXTUREACCESS_STREAMING,
-        render_w,
-        render_h,
+        @intCast(render_w),
+        @intCast(render_h),
     ) orelse {
         std.log.err("SDL_CreateTexture: {s}", .{c.SDL_GetError()});
         return error.SdlTextureFailed;
@@ -223,8 +245,8 @@ pub fn main(init: std.process.Init) !void {
                         var sx: f32 = @floatFromInt(render_w / 2);
                         var sy: f32 = @floatFromInt(render_h / 2);
                         if (!mouse_captured) {
-                            sx = @as(f32, @floatFromInt(event.button.x)) * render_w / window_w;
-                            sy = @as(f32, @floatFromInt(event.button.y)) * render_h / window_h;
+                            sx = @as(f32, @floatFromInt(event.button.x)) * @as(f32, @floatFromInt(render_w)) / window_w;
+                            sy = @as(f32, @floatFromInt(event.button.y)) * @as(f32, @floatFromInt(render_h)) / window_h;
                         }
                         if (pickPixel(world, cam, sx, sy, render_w, render_h, pick_dist)) |pick| {
                             if (left) {
@@ -269,7 +291,7 @@ pub fn main(init: std.process.Init) !void {
         if (world.takeDirty()) |r| {
             if (light_enabled) {
                 const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
-                const rstats = try lighting.relight(world, allocator, r, .{});
+                const rstats = try lighting.relight(world, allocator, r, light_params);
                 const rms = @as(f64, @floatFromInt(rstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
                 std.log.info("relight: {} columns, {} runs, {d:.2} ms", .{ rstats.lit_columns, rstats.runs, rms });
             }
@@ -280,10 +302,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         rparams.time_s = time_s;
-        render.render(&framebuffer, render_w, render_h, world, cam, rparams);
-        render.transpose(&staging, &framebuffer, render_w, render_h);
+        render.render(framebuffer, render_w, render_h, world, cam, rparams);
+        render.transpose(staging, framebuffer, render_w, render_h);
 
-        if (c.SDL_UpdateTexture(texture, null, &staging, render_w * 4) != 0) {
+        if (c.SDL_UpdateTexture(texture, null, staging.ptr, @intCast(render_w * 4)) != 0) {
             std.log.err("SDL_UpdateTexture: {s}", .{c.SDL_GetError()});
             return error.SdlTextureUpdateFailed;
         }

@@ -163,9 +163,12 @@ PLAN.md now adopts this algorithm directly:
    attenuation radius at 10 cm voxel scale needs ~30–60 steps.
 
 Plan-specific pieces layered on top of the discussion: sky-light seeding
-with a free downward fast-path, incremental clear-then-reflood edits, the
-Model B directional sun march (interval-tested against material runs), fake
-AO, and distance fog. Runs use `u8` counts as in the discussion — runs
+with a free downward fast-path, incremental clear-then-reflood edits,
+fake AO, and distance fog. (The Model B directional sun march was
+planned and later skipped in milestone 12; the discussion's per-column
+fog-glow map from "Properties" above was likewise cut in milestone 13 —
+a 2D XZ haze tint cannot read as glow around a source without
+per-air-cell volumetric tracking.) Runs use `u8` counts as in the discussion — runs
 longer than 255 voxels are split into consecutive identical runs — and all
 run fields are `u8`, so the structs (2 B material, 4 B light since
 milestone 9b added the arrival-direction byte) have alignment
