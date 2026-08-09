@@ -211,6 +211,7 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
             if (col.light) |l| allocator.free(l);
             col.light = null;
             col.light_base_y = 0;
+            col.light_lo = 0;
             var top: ?usize = null;
             var bot: usize = 0;
             for (0..s.h) |y| {
@@ -238,6 +239,7 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
             const owned = try runs.toOwnedSlice(allocator);
             col.light = owned;
             col.light_base_y = @intCast(hi_y);
+            col.light_lo = @intCast(bot);
             stats.lit_columns += 1;
             stats.runs += owned.len;
         }

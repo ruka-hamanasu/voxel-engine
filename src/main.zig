@@ -11,11 +11,9 @@ const Camera = @import("camera.zig").Camera;
 const render = @import("render.zig");
 const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
+const lod_mod = @import("lod.zig");
 const anim = @import("anim.zig");
 const clap = @import("clap");
-
-const window_w = 960;
-const window_h = 540;
 
 pub fn main(init: std.process.Init) !void {
     const params = comptime clap.parseParamsComptime(
@@ -27,12 +25,14 @@ pub fn main(init: std.process.Init) !void {
         \\    --bench <u32>     Render N frames and report ms/frame.
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
+        \\    --lod <f32>       LOD switch distance (default 48; 0 disables the coarse world).
         \\    --atten <u8>      Light attenuation.
         \\    --no-light        Disable lighting.
         \\    --no-anim         Disable palette animation.
         \\    --time <f64>      Animation time in seconds.
         \\    --width <usize>   Render width (default 480).
         \\    --height <usize>  Render height (default 270).
+        \\    --scale <u32>     Window scale factor vs render resolution (default 2).
         \\
     );
 
@@ -85,6 +85,12 @@ pub fn main(init: std.process.Init) !void {
     const render_h = res.args.height orelse 270;
     if (render_w == 0 or render_h == 0 or render_h > render.max_sky_height)
         return error.BadResolution;
+    const scale = res.args.scale orelse 2;
+    if (scale == 0) return error.BadResolution;
+    const window_w = std.math.mul(usize, render_w, scale) catch return error.BadResolution;
+    const window_h = std.math.mul(usize, render_h, scale) catch return error.BadResolution;
+    if (window_w > std.math.maxInt(c_int) or window_h > std.math.maxInt(c_int))
+        return error.BadResolution;
 
     const allocator = init.gpa;
     const framebuffer = try allocator.alloc(u32, render_w * render_h);
@@ -101,6 +107,13 @@ pub fn main(init: std.process.Init) !void {
     rparams.light = light_enabled;
     if (res.args.fog) |d| rparams.fog_density = d;
     if (res.args.fogcut) |co| rparams.fog_cutoff = co;
+    if (res.args.lod) |ld| rparams.lod_dist = ld;
+
+    // Half-resolution far-field world (milestone 16): built once here,
+    // incrementally rebuilt from dirty regions on edits.
+    var lod_world: ?World = if (rparams.lod_dist > 0) try lod_mod.build(allocator, world) else null;
+    defer if (lod_world) |*lw| lw.deinit();
+    const lod: ?*const World = if (lod_world) |*lw| lw else null;
 
     var flood_stats: lighting.Stats = .{};
     var flood_ms: f64 = 0;
@@ -108,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
         const fstart = std.Io.Clock.Timestamp.now(init.io, .awake);
         flood_stats = try lighting.floodAll(world, allocator, light_params);
         flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+        if (lod_world) |*lw| _ = try lighting.floodAll(lw, allocator, light_params);
     }
     // Generation's dirty extents are fully covered by the initial flood.
     _ = world.takeDirty();
@@ -120,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..bench_frames) |_| {
-            render.render(framebuffer, render_w, render_h, world, cam, rparams);
+            render.render(framebuffer, render_w, render_h, world, lod, cam, rparams);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -132,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
         std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
-        render.render(framebuffer, render_w, render_h, world, cam, rparams);
+        render.render(framebuffer, render_w, render_h, world, lod, cam, rparams);
         render.transpose(staging, framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, staging, render_w, render_h);
         return;
@@ -148,8 +162,8 @@ pub fn main(init: std.process.Init) !void {
         "voxel-engine",
         c.SDL_WINDOWPOS_CENTERED,
         c.SDL_WINDOWPOS_CENTERED,
-        window_w,
-        window_h,
+        @intCast(window_w),
+        @intCast(window_h),
         c.SDL_WINDOW_SHOWN,
     ) orelse {
         std.log.err("SDL_CreateWindow: {s}", .{c.SDL_GetError()});
@@ -234,8 +248,8 @@ pub fn main(init: std.process.Init) !void {
                         var sx: f32 = @floatFromInt(render_w / 2);
                         var sy: f32 = @floatFromInt(render_h / 2);
                         if (!mouse_captured) {
-                            sx = @as(f32, @floatFromInt(event.button.x)) * @as(f32, @floatFromInt(render_w)) / window_w;
-                            sy = @as(f32, @floatFromInt(event.button.y)) * @as(f32, @floatFromInt(render_h)) / window_h;
+                            sx = @as(f32, @floatFromInt(event.button.x)) * @as(f32, @floatFromInt(render_w)) / @as(f32, @floatFromInt(window_w));
+                            sy = @as(f32, @floatFromInt(event.button.y)) * @as(f32, @floatFromInt(render_h)) / @as(f32, @floatFromInt(window_h));
                         }
                         if (pickPixel(world, cam, sx, sy, render_w, render_h, pick_dist)) |pick| {
                             if (left) {
@@ -278,6 +292,12 @@ pub fn main(init: std.process.Init) !void {
         cam.update(input, @floatCast(dt), world.w, world.h, world.d);
 
         if (world.takeDirty()) |r| {
+            if (lod_world) |*lw| {
+                try lod_mod.rebuildRegion(allocator, world, lw, r);
+                if (light_enabled) {
+                    _ = try lighting.relight(lw, allocator, lod_mod.coarseRegion(lw, r), light_params);
+                }
+            }
             if (light_enabled) {
                 const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
                 const rstats = try lighting.relight(world, allocator, r, light_params);
@@ -291,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         rparams.time_s = time_s;
-        render.render(framebuffer, render_w, render_h, world, cam, rparams);
+        render.render(framebuffer, render_w, render_h, world, lod, cam, rparams);
         render.transpose(staging, framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, staging.ptr, @intCast(render_w * 4)) != 0) {
@@ -301,10 +321,10 @@ pub fn main(init: std.process.Init) !void {
         _ = c.SDL_RenderClear(renderer);
         _ = c.SDL_RenderCopy(renderer, texture, null, null);
 
-        drawFpsOverlay(ctx, fps);
+        drawFpsOverlay(ctx, fps, window_w);
         c.nk_sdl_render(c.NK_ANTI_ALIASING_ON);
 
-        if (mouse_captured) drawCrosshair(renderer);
+        if (mouse_captured) drawCrosshair(renderer, window_w, window_h);
 
         c.SDL_RenderPresent(renderer);
         frame +%= 1;
@@ -379,20 +399,20 @@ fn pickPixel(world: *const World, cam: Camera, sx: f32, sy: f32, width: usize, h
 }
 
 /// Center crosshair marking the captured-mouse pick point.
-fn drawCrosshair(renderer: ?*c.SDL_Renderer) void {
+fn drawCrosshair(renderer: ?*c.SDL_Renderer, window_w: usize, window_h: usize) void {
     _ = c.SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    const cx: c_int = window_w / 2;
-    const cy: c_int = window_h / 2;
+    const cx: c_int = @intCast(window_w / 2);
+    const cy: c_int = @intCast(window_h / 2);
     const horiz: c.SDL_Rect = .{ .x = cx - 5, .y = cy - 1, .w = 11, .h = 3 };
     const vert: c.SDL_Rect = .{ .x = cx - 1, .y = cy - 5, .w = 3, .h = 11 };
     _ = c.SDL_RenderFillRect(renderer, &horiz);
     _ = c.SDL_RenderFillRect(renderer, &vert);
 }
 
-fn drawFpsOverlay(ctx: ?*c.nk_context, fps: f64) void {
+fn drawFpsOverlay(ctx: ?*c.nk_context, fps: f64, window_w: usize) void {
     const w: f32 = 110;
     const h: f32 = 36;
-    const bounds: c.struct_nk_rect = .{ .x = window_w - w - 8, .y = 8, .w = w, .h = h };
+    const bounds: c.struct_nk_rect = .{ .x = @as(f32, @floatFromInt(window_w)) - w - 8, .y = 8, .w = w, .h = h };
     const flags = c.NK_WINDOW_NO_SCROLLBAR | c.NK_WINDOW_NO_INPUT;
 
     if (c.nk_begin(ctx, "fps", bounds, flags) != 0) {

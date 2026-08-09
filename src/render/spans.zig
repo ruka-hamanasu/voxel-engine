@@ -130,7 +130,9 @@ pub const SkySrc = struct {
 
 /// The single pixel-write path: claim, gradient claim, and the sky
 /// fill all go through here, giving milestone 13's fog glow one
-/// injection point. src provides seek(row)/next(row) color taps.
+/// injection point. src provides seek(row)/next(row) color taps. The
+/// write loop slices the destination once so ReleaseSafe drops the
+/// per-pixel bounds checks; constant and sky sources get bulk fills.
 pub fn fillSpans(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, r1: f32, src: anytype) void {
     if (free.isEmpty() or !(r1 > r0)) return;
     var s = src;
@@ -149,9 +151,15 @@ pub fn fillSpans(fb: []u32, height: usize, sx: usize, free: *SpanList, r0: f32, 
             i += 1;
             continue;
         }
-        s.seek(ia);
-        for (ia..ib) |row| {
-            fb[sx * height + row] = s.next(@intCast(row));
+        const dst = fb[sx * height + ia .. sx * height + ib];
+        const S = @TypeOf(s);
+        if (S == SkySrc) {
+            @memcpy(dst, s.sky[ia..ib]);
+        } else if (S == ConstSrc) {
+            for (dst) |*px| px.* = s.c;
+        } else {
+            s.seek(ia);
+            for (dst, ia..) |*px, row| px.* = s.next(@intCast(row));
         }
         free.subtract(ia, ib);
         // A fully consumed span shifts the rest of the list down into

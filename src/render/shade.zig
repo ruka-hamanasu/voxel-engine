@@ -58,6 +58,31 @@ pub const sky_ambient: f32 = 0.30;
 /// full-bright color. Runtime-var so milestone 10's palette animation
 /// can rebuild it.
 var shade_lut: [world_mod.default_palette.len][4][4][2]u32 = buildShadeLut(world_mod.default_palette);
+/// Same table pre-unpacked into f32 lanes (exact: channels are 0-255),
+/// so shadeAtV skips the per-stop unpack converts.
+var shade_lut_v4: [world_mod.default_palette.len][4][4][2]V4 = unpackLut(buildShadeLut(world_mod.default_palette));
+/// Unpacked palette colors for applyGlowV's light tint (rebuilt with
+/// the shade LUT after palette mutations).
+var light_v4: [world_mod.default_palette.len]V4 = unpackPalette(world_mod.default_palette);
+
+fn unpackLut(lut: [world_mod.default_palette.len][4][4][2]u32) [world_mod.default_palette.len][4][4][2]V4 {
+    @setEvalBranchQuota(10000);
+    var out: [world_mod.default_palette.len][4][4][2]V4 = undefined;
+    for (lut, 0..) |m, mi| {
+        for (m, 0..) |f, fi| {
+            for (f, 0..) |a, ai| {
+                for (a, 0..) |c, si| out[mi][fi][ai][si] = unpackRgb(c);
+            }
+        }
+    }
+    return out;
+}
+
+fn unpackPalette(palette: [world_mod.default_palette.len]world_mod.PaletteEntry) [world_mod.default_palette.len]V4 {
+    var out: [world_mod.default_palette.len]V4 = undefined;
+    for (palette, 0..) |entry, m| out[m] = unpackRgb(entry.rgb);
+    return out;
+}
 
 fn buildShadeLut(palette: [world_mod.default_palette.len]world_mod.PaletteEntry) [world_mod.default_palette.len][4][4][2]u32 {
     var lut: [world_mod.default_palette.len][4][4][2]u32 = undefined;
@@ -83,6 +108,8 @@ fn buildShadeLut(palette: [world_mod.default_palette.len]world_mod.PaletteEntry)
 /// this per frame while animating).
 pub fn rebuildShadeLut() void {
     shade_lut = buildShadeLut(world_mod.palette);
+    shade_lut_v4 = unpackLut(shade_lut);
+    light_v4 = unpackPalette(world_mod.palette);
 }
 
 /// Distance fog (milestone 8). fog_factor buckets a normalized
@@ -97,17 +124,37 @@ pub const fog_buckets = 64;
 
 var fog_factor: [fog_buckets]f32 = undefined;
 var fog_dest: [world_mod.default_palette.len][fog_buckets]u32 = undefined;
+var fog_dest_v4: [world_mod.default_palette.len][fog_buckets]V4 = undefined;
+
+/// RGB channel math as f32x4 (alpha lane unused, forced to 0xff on
+/// pack). Per-lane op order matches the scalar original, so results
+/// stay bit-identical.
+pub const V4 = @Vector(4, f32);
+
+fn unpackRgb(c: u32) V4 {
+    return .{
+        @floatFromInt((c >> 16) & 0xff),
+        @floatFromInt((c >> 8) & 0xff),
+        @floatFromInt(c & 0xff),
+        0,
+    };
+}
+
+pub fn packRgb(v: V4) u32 {
+    const iv: @Vector(4, u32) = @intFromFloat(v);
+    return 0xff000000 | (iv[0] << 16) | (iv[1] << 8) | iv[2];
+}
+
+/// The shading stages historically round-tripped through u32 with a
+/// truncating conversion per stage; keeping the pipeline in the vector
+/// domain with an explicit @trunc per stage reproduces those
+/// intermediate integer values exactly while packing only once.
+fn lerpColorV(a: V4, b: V4, f: f32) V4 {
+    return @trunc(a + (b - a) * @as(V4, @splat(f)));
+}
 
 pub fn lerpColor(a: u32, b: u32, f: f32) u32 {
-    var out: u32 = 0xff000000;
-    inline for (0..3) |k| {
-        const sh: u5 = @intCast((2 - k) * 8);
-        const ca: f32 = @floatFromInt((a >> sh) & 0xff);
-        const cb: f32 = @floatFromInt((b >> sh) & 0xff);
-        const ch: u32 = @intFromFloat(ca + (cb - ca) * f);
-        out |= ch << sh;
-    }
-    return out;
+    return packRgb(lerpColorV(unpackRgb(a), unpackRgb(b), f));
 }
 
 /// Normalized exponential falloff: 0 at t=0, exactly 1 at the cutoff,
@@ -145,28 +192,25 @@ pub fn buildFogLuts(params: RenderParams) void {
                 fog_dest[m][b] = lerpColor(entry.rgb, params.fog_color, lp);
             }
         }
+        for (0..fog_buckets) |b| fog_dest_v4[m][b] = unpackRgb(fog_dest[m][b]);
     }
 }
 
 /// Shaded color at a fractional AO level: lerps between the two
 /// adjacent LUT entries so gradients stay smooth instead of snapping
 /// to the four discrete levels. sky is the analytic sky bit (1 = lit).
-pub fn shadeAt(mat: u8, face: usize, level: f32, sky: u1) u32 {
+pub fn shadeAtV(mat: u8, face: usize, level: f32, sky: u1) V4 {
     const l = std.math.clamp(level, 0.0, 3.0);
     const lo: usize = @intFromFloat(l);
     const hi: usize = @min(lo + 1, 3);
     const frac = l - @as(f32, @floatFromInt(lo));
-    const c0 = shade_lut[mat][face][lo][sky];
-    const c1 = shade_lut[mat][face][hi][sky];
-    var out: u32 = 0xff000000;
-    inline for (0..3) |k| {
-        const sh: u5 = @intCast((2 - k) * 8);
-        const a: f32 = @floatFromInt((c0 >> sh) & 0xff);
-        const b: f32 = @floatFromInt((c1 >> sh) & 0xff);
-        const c: u32 = @intFromFloat(a + (b - a) * frac);
-        out |= c << sh;
-    }
-    return out;
+    const c0 = shade_lut_v4[mat][face][lo][sky];
+    const c1 = shade_lut_v4[mat][face][hi][sky];
+    return @trunc(c0 + (c1 - c0) * @as(V4, @splat(frac)));
+}
+
+pub fn shadeAt(mat: u8, face: usize, level: f32, sky: u1) u32 {
+    return packRgb(shadeAtV(mat, face, level, sky));
 }
 
 pub const glow_gain: f32 = 0.5;
@@ -180,27 +224,26 @@ pub const glow_gain: f32 = 0.5;
 /// term dominates (neon pooling), over sky-lit surfaces it is a
 /// bounded tint that saturates only near the source. intensity 0 is
 /// identity, so the flood edge still fades continuously.
-pub fn applyGlow(c: u32, light: lighting.LightSample) u32 {
+pub fn applyGlowV(c: V4, light: lighting.LightSample) V4 {
     const f = @as(f32, @floatFromInt(light.intensity)) * (1.0 / 255.0) * glow_gain;
-    const lc = lighting.lightColor(light.color_id);
-    var out: u32 = 0xff000000;
-    inline for (0..3) |k| {
-        const sh: u5 = @intCast((2 - k) * 8);
-        const ch: f32 = @floatFromInt((c >> sh) & 0xff);
-        const lch: f32 = @floatFromInt((lc >> sh) & 0xff);
-        const v: u32 = @intFromFloat(@min(ch + lch * f, 255.0));
-        out |= v << sh;
-    }
-    return out;
+    return @trunc(@min(c + light_v4[light.color_id] * @as(V4, @splat(f)), @as(V4, @splat(255.0))));
+}
+
+pub fn applyGlow(c: u32, light: lighting.LightSample) u32 {
+    return packRgb(applyGlowV(unpackRgb(c), light));
 }
 
 /// Fog one shaded stop: bucket the distance, lerp toward the material's
 /// (pre-collapsed) fog destination. Per-stop so the gradient fill
 /// lerps between fogged endpoints.
-pub fn fogStop(mat: u8, t: f32, c: u32, params: RenderParams) u32 {
+pub fn fogStopV(mat: u8, t: f32, c: V4, params: RenderParams) V4 {
     const scale = @as(f32, @floatFromInt(fog_buckets)) / params.fog_cutoff;
     const b: usize = @intFromFloat(std.math.clamp(t * scale, 0.0, @as(f32, @floatFromInt(fog_buckets - 1))));
-    return lerpColor(c, fog_dest[mat][b], fog_factor[b]);
+    return lerpColorV(c, fog_dest_v4[mat][b], fog_factor[b]);
+}
+
+pub fn fogStop(mat: u8, t: f32, c: u32, params: RenderParams) u32 {
+    return packRgb(fogStopV(mat, t, unpackRgb(c), params));
 }
 
 pub const max_sky_height = 4096;

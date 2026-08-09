@@ -41,6 +41,13 @@ pub const LightRun = struct {
     dir: u8,
 };
 
+/// Short run streams live directly in the column: runs.len <= cap
+/// implies runs.ptr == &inline_runs. 8 runs x 2 B keeps Column at
+/// exactly 64 B (one cache line), so the far-field march touches a
+/// single line per column instead of chasing a runs pointer into
+/// scattered allocations.
+pub const inline_runs_cap = 8;
+
 pub const Column = struct {
     runs: []MatRun,
     /// Explicit light deviations; null = default derived from the
@@ -51,13 +58,39 @@ pub const Column = struct {
     /// holds no deviations.
     light: ?[]LightRun = null,
     light_base_y: u16 = 0,
+    /// Bottom of the light runs' coverage (light_base_y - total + 1);
+    /// cached by lighting.encodeColumns so the renderer's per-cell
+    /// zipper setup never re-sums run counts. Meaningless when light
+    /// is null.
+    light_lo: u16 = 0,
     /// Cached topmost solid y (no_solid when fully air), maintained by
     /// setRange/setColumnRuns so the renderer's analytic sky light
     /// (milestone 11) never rescans runs per cell.
     top_solid_y: u16 = no_solid,
+    /// Bit y = voxel y solid; valid only when h <= 64 (World.masks_ok),
+    /// else zero. Lets AO neighbor queries test solidity without a run
+    /// scan. Maintained alongside the runs by setRange/setColumnRuns.
+    solid_mask: u64 = 0,
+    inline_runs: [inline_runs_cap]MatRun = undefined,
 };
 
 pub const no_solid = std.math.maxInt(u16);
+
+/// Rebuild a column's solidity bitmask from its material runs.
+/// Caller guarantees h <= 64.
+fn computeMask(runs: []const MatRun, h: usize) u64 {
+    var mask: u64 = 0;
+    var hi: i64 = @intCast(h);
+    for (runs) |run| {
+        hi -= run.count;
+        if (run.palette_id != 0) {
+            const lo: u6 = @intCast(hi);
+            const ones: u64 = if (run.count >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(run.count)) - 1;
+            mask |= ones << lo;
+        }
+    }
+    return mask;
+}
 
 /// Topmost solid voxel y in the column, or null when fully air.
 pub fn topSolidY(col: *const Column, h: i32) ?i32 {
@@ -144,8 +177,17 @@ pub const World = struct {
     w: usize,
     h: usize,
     d: usize,
-    columns: []Column,
+    columns: []align(64) Column,
     allocator: std.mem.Allocator,
+    /// Column.solid_mask is maintained only when h <= 64.
+    masks_ok: bool,
+    /// 8x8-column groups: max top_solid_y of the group (0 when empty),
+    /// maintained by setRange/setColumnRuns. Lets the march skip cells
+    /// whose height window is entirely above everything solid in the
+    /// group without loading any Column. Valid when h <= 256.
+    macro_max: []u8,
+    macro_w: usize, // ceil(w/8)
+    macro_ok: bool,
     /// Bounding box (half-open) of everything touched by set/fillBox
     /// since the last takeDirty; consumed by milestone 10's relight.
     dirty: ?Region = null,
@@ -171,24 +213,49 @@ pub const World = struct {
         return r;
     }
 
+    /// Install a freshly-built run stream on a column: short streams
+    /// are copied into the inline buffer (and the caller's allocation
+    /// freed), long streams are adopted. Frees the previous stream
+    /// when it was out-of-line.
+    fn installRuns(self: *World, col: *Column, runs: []MatRun) void {
+        const old = col.runs;
+        if (runs.len <= inline_runs_cap) {
+            @memcpy(col.inline_runs[0..runs.len], runs);
+            self.allocator.free(runs);
+            col.runs = col.inline_runs[0..runs.len];
+        } else {
+            col.runs = runs;
+        }
+        if (old.len > inline_runs_cap) self.allocator.free(old);
+    }
+
     pub fn init(allocator: std.mem.Allocator, w: usize, h: usize, d: usize) !World {
+        const macro_w = (w + 7) / 8;
+        const macro_d = (d + 7) / 8;
         var world: World = .{
             .w = w,
             .h = h,
             .d = d,
-            .columns = try allocator.alloc(Column, w * d),
+            .columns = try allocator.alignedAlloc(Column, .@"64", w * d),
             .allocator = allocator,
+            .masks_ok = h <= 64,
+            .macro_max = try allocator.alloc(u8, macro_w * macro_d),
+            .macro_w = macro_w,
+            .macro_ok = h <= 256,
         };
+        @memset(world.macro_max, 0);
+        errdefer allocator.free(world.macro_max);
         var initialized: usize = 0;
         errdefer {
             for (world.columns[0..initialized]) |col| {
-                allocator.free(col.runs);
+                if (col.runs.len > inline_runs_cap) allocator.free(col.runs);
                 if (col.light) |l| allocator.free(l);
             }
             allocator.free(world.columns);
         }
         for (world.columns, 0..) |*col, i| {
-            col.* = .{ .runs = try allocUniformRuns(allocator, h, 0) };
+            col.* = .{ .runs = &.{} };
+            world.installRuns(col, try allocUniformRuns(allocator, h, 0));
             initialized = i + 1;
         }
         return world;
@@ -196,10 +263,39 @@ pub const World = struct {
 
     pub fn deinit(self: *World) void {
         for (self.columns) |col| {
-            self.allocator.free(col.runs);
+            if (col.runs.len > inline_runs_cap) self.allocator.free(col.runs);
             if (col.light) |l| self.allocator.free(l);
         }
         self.allocator.free(self.columns);
+        self.allocator.free(self.macro_max);
+    }
+
+    /// Recompute one 8x8 group's max top_solid_y after a column change.
+    fn updateMacro(self: *World, x: usize, z: usize) void {
+        if (!self.macro_ok) return;
+        const mx = x >> 3;
+        const mz = z >> 3;
+        var m: u16 = 0;
+        const x1 = @min((mx + 1) * 8, self.w);
+        const z1 = @min((mz + 1) * 8, self.d);
+        for (mx * 8..x1) |cx| {
+            for (mz * 8..z1) |cz| {
+                const top = self.columns[cx * self.d + cz].top_solid_y;
+                if (top != no_solid and top > m) m = top;
+            }
+        }
+        self.macro_max[mz * self.macro_w + mx] = @intCast(m);
+    }
+
+    /// Max solid y of the 8x8 group holding (x, z); null out of the
+    /// world (all air: the march may always skip such cells).
+    /// Meaningful only when macro_ok.
+    pub fn macroMax(self: *const World, x: i32, z: i32) ?u8 {
+        if (x < 0 or z < 0) return null;
+        const mx: usize = @intCast(x >> 3);
+        const mz: usize = @intCast(z >> 3);
+        if (mx >= self.macro_w or mz >= self.macro_max.len / self.macro_w) return null;
+        return self.macro_max[mz * self.macro_w + mx];
     }
 
     fn allocUniformRuns(allocator: std.mem.Allocator, h: usize, mat: u8) ![]MatRun {
@@ -225,10 +321,25 @@ pub const World = struct {
     pub fn setColumnRuns(self: *World, x: usize, z: usize, runs: []MatRun) void {
         std.debug.assert(x < self.w and z < self.d);
         const col = &self.columns[x * self.d + z];
-        self.allocator.free(col.runs);
         if (col.light) |l| self.allocator.free(l);
-        col.* = .{ .runs = runs };
+        col.light = null;
+        col.light_base_y = 0;
+        col.light_lo = 0;
+        self.installRuns(col, runs);
         col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
+        if (self.masks_ok) col.solid_mask = computeMask(col.runs, self.h);
+        self.updateMacro(x, z);
+    }
+
+    /// Solidity at (x, y, z) without decoding materials: a single bit
+    /// test when masks_ok, run scan otherwise. Matches get(...) != 0.
+    pub fn solidAt(self: *const World, x: i32, y: i32, z: i32) bool {
+        if (y < 0) return false;
+        const uy: usize = @intCast(y);
+        if (uy >= self.h) return false;
+        if (!self.masks_ok) return self.get(x, y, z) != 0;
+        const col = self.columnAt(x, z) orelse return false;
+        return (col.solid_mask >> @intCast(uy)) & 1 != 0;
     }
 
     pub fn get(self: *const World, x: i32, y: i32, z: i32) u8 {
@@ -277,7 +388,8 @@ pub const World = struct {
         return result;
     }
 
-    fn setRange(self: *World, col: *Column, d0: usize, d1: usize, mat: u8) !void {
+    fn setRange(self: *World, x: usize, z: usize, d0: usize, d1: usize, mat: u8) !void {
+        const col = &self.columns[x * self.d + z];
         var out: std.ArrayList(MatRun) = .empty;
         errdefer out.deinit(self.allocator);
 
@@ -292,9 +404,10 @@ pub const World = struct {
         }
 
         const new_runs = try out.toOwnedSlice(self.allocator);
-        self.allocator.free(col.runs);
-        col.runs = new_runs;
+        self.installRuns(col, new_runs);
         col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
+        if (self.masks_ok) col.solid_mask = computeMask(col.runs, self.h);
+        self.updateMacro(x, z);
     }
 
     fn appendRun(out: *std.ArrayList(MatRun), allocator: std.mem.Allocator, mat: u8, count: usize) !void {
@@ -320,7 +433,7 @@ pub const World = struct {
         const yc = @min(y, self.h - 1);
         const zc = @min(z, self.d - 1);
         const depth = self.h - 1 - yc;
-        try self.setRange(&self.columns[xc * self.d + zc], depth, depth + 1, mat);
+        try self.setRange(xc, zc, depth, depth + 1, mat);
         self.markDirty(.{ .x0 = xc, .y0 = yc, .z0 = zc, .x1 = xc + 1, .y1 = yc + 1, .z1 = zc + 1 });
     }
 
@@ -334,7 +447,7 @@ pub const World = struct {
         if (xa >= xb or ya >= yb or za >= zb) return;
         for (xa..xb) |x| {
             for (za..zb) |z| {
-                try self.setRange(&self.columns[x * self.d + z], self.h - yb, self.h - ya, mat);
+                try self.setRange(x, z, self.h - yb, self.h - ya, mat);
             }
         }
         self.markDirty(.{ .x0 = xa, .y0 = ya, .z0 = za, .x1 = xb, .y1 = yb, .z1 = zb });
@@ -489,6 +602,7 @@ test "light stream storage lifecycle" {
     runs[1] = .{ .count = 3, .color_id = 1, .intensity = 120, .dir = 6 };
     col.light = runs;
     col.light_base_y = 9;
+    col.light_lo = 3;
     try expectCoverage(&world, 1, 1);
 
     var cur = LightCursor.init(col.light.?, 10, 9);

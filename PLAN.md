@@ -43,6 +43,13 @@ runs tiny for cache density. All fields are `u8`, so the structs have
 alignment 1 and zero padding; keep them packed and order any future fields
 largest-to-smallest to preserve that.
 
+Columns are 64 B (one cache line) and 64-aligned: material run streams of
+<= 8 runs live inline in the column (`inline_runs`), so the far-field
+march — which touches mostly cold columns — never chases a runs pointer.
+`light_lo` caches the light stream's coverage bottom (written by
+`encodeColumns`), and `solid_mask` (h <= 64 worlds) answers solidity
+queries as a bit test for AO neighbor sampling.
+
 Columns are the *logical* unit; they may be grouped (e.g. 8x8) purely as an
 allocation/container detail for cache locality if profiling warrants it. The same groups can later host a per-macro-cell `[min_solid_y, max_solid_y]`
 summary enabling **hierarchical DDA**: the XZ march skips a macro-cell in one
@@ -268,11 +275,57 @@ entries here record scope and outcome only.
     `firstSolidInColumn`) + animated sun.
 13. COMPLETED - Fog glow CUT (a 2D XZ haze tint can't read as source
     glow without volumetric air-cell tracking). `--width`/`--height`
-    render-resolution CLI (runtime framebuffer) + `--fogcut`/`--atten`
-    tuning flags. Tuning outcomes: fog_density 0.025 / cutoff 96 kept
+    render-resolution CLI (runtime framebuffer) + `--scale` window
+    scale factor (window = render x scale, default 2) +
+    `--fogcut`/`--atten` tuning flags. Tuning outcomes: fog_density 0.025 / cutoff 96 kept
     (variants near-identical in the bounded world), attenuation 8 kept
     (4 washed the whole cave, 16 lost the glow), glow_gain 0.5 kept
     (0.65 clipped hot), sky_ambient 0.25 -> 0.30 for cave readability.
     Identity path byte-identical; bench neutral.
-14. Control panel.
-15. Cyberpunk city mapgen.
+14. COMPLETED - Single-threaded performance (960x540, ReleaseSafe).
+    Profiled via gdb stack sampling (perf blocked by
+    perf_event_paranoid=3). Key finding: the frame is per-CELL bound,
+    not per-pixel — at the default fog cutoff 96 the 48->96 march
+    range is ~80% of the worst view (10.7 ms vs 2.1 ms at cutoff 48),
+    so per-voxel flat shading would buy little (fills ~5%); draw-
+    distance headroom needs the far march to get cheaper (LOD or
+    macro-cell skip), not faster fills. Exact-output optimizations
+    applied (all verified byte-identical over the 37+37+4-view sweep,
+    now at /tmp/opencode/views.sh adapted to the --no-light CLI):
+    sky-cell early-out in processCell via top_solid_y; cached light
+    coverage (Column.light_lo) replacing per-cell count sums; single
+    prev-column fetch; per-column solid_mask bit tests for face AO;
+    s_max hoisted per frame; vectorized (f32x4, bit-identical op
+    order) shade LUT math with pre-unpacked V4 LUTs; one cursor reuse
+    in genSegments (down-walk inherits the up-walk's final cursor);
+    fillSpans sliced writes (ReleaseSafe bounds-check elision) +
+    memcpy sky/constant fills; inline short material runs in 64 B
+    aligned Columns. A lazy-diagonal-cursor variant REGRESSED and was
+    reverted (most surviving cells render side faces; laziness was
+    pure overhead). Bench (this machine, 960x540, ms/frame,
+    baseline -> current): spawn 7.59 -> 6.41, worst view
+    (96.5,40,96.5,yaw pi) 13.36 -> 10.69, aerial 7.20 -> 3.83,
+    caves 0.30 -> 0.12. Deferred levers: ReleaseFast for the render
+    module only.
+    Follow-up (macro skip + LOD, adopted): 8x8-column macro_max grid
+    (maintained by setRange/setColumnRuns) lets the march skip cells
+    whose window is provably above everything solid in the group
+    without loading a Column — exact, sweep-verified. Far-field LOD:
+    a half-resolution World (2x2x2 conservative-solid blocks, material
+    = highest solid fine voxel; src/lod.zig) marched past lod_dist
+    (default 48, --lod flag; 0 disables). The coarse march reuses
+    processCell via a 1/2-scaled coordinate frame (cam/2, dir/2, f*2)
+    — MarchCfg/marchRange; with t_begin = 0 the march is bit-identical
+    to the pre-LOD single march, and --lod 0 keeps the whole frame
+    byte-identical (regression gate: /tmp/opencode/views_lod0.sh).
+    The LOD world gets its own light flood and is rebuilt from dirty
+    regions on edits (rebuildRegion + coarse relight). max_dist
+    raised to 256 (default fog_cutoff stays 96); the historical
+    t1-clamp-at-96 semantics are preserved by marchRange's t_clamp.
+    Transpose is now 16x16 tiled (0.75 -> 0.37 ms at 960x540
+    standalone). Visual A/B (PPM screenshots): LOD differences are
+    confined to fogged distant silhouettes. Final benches (960x540,
+    ms/frame, baseline -> LOD): spawn 7.59 -> 5.97, worst view
+    13.36 -> 6.05, aerial 7.20 -> 2.27, caves 0.30 -> 0.13; worst
+    view at fogcut 160: 6.24 — longer draw distance than before at
+    half the original frame time.

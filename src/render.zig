@@ -13,7 +13,10 @@ const Face = shade.Face;
 const OFace = shade.OFace;
 
 pub const hfov: f32 = std.math.pi / 2.0;
-pub const max_dist: f32 = 96.0;
+/// March hard cap. The fine world only ever marches to lod_dist; the
+/// coarse (LOD) world absorbs everything past it, so this can sit far
+/// above the default fog cutoff.
+pub const max_dist: f32 = 256.0;
 /// Tallest renderable frame (the sky gradient buffer is stack-sized).
 pub const max_sky_height = shade.max_sky_height;
 
@@ -21,12 +24,17 @@ pub const max_sky_height = shade.max_sky_height;
 /// processCell. fog_* went live in milestone 8, light in milestone 9.
 pub const RenderParams = struct {
     fog_density: f32 = 0.025,
-    fog_cutoff: f32 = max_dist,
+    fog_cutoff: f32 = 96.0,
     fog_color: u32 = 0x8ea6d2, // horizon-row sky color
     /// false = treat every column as unlit (identity tint), ignoring
     /// the flood-filled light runs; runtime toggle for the L hotkey.
     light: bool = true,
     time_s: f64 = 0.0,
+    /// Fine/coarse march handoff distance. Past it the ray continues
+    /// in the half-resolution LOD world (~77% fogged at the default
+    /// 48, so the silhouette overestimate stays hidden). No effect
+    /// when render's lod is null.
+    lod_dist: f32 = 48.0,
 };
 
 /// Rebuild the shade LUT after a palette mutation (milestone 10 calls
@@ -110,7 +118,7 @@ pub const DdaIterator = struct {
     }
 };
 
-pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: Camera, params: RenderParams) void {
+pub fn render(fb: []u32, width: usize, height: usize, world: *const World, lod: ?*const World, cam: Camera, params: RenderParams) void {
     std.debug.assert(height <= shade.max_sky_height);
     const fog_on = params.fog_density > 0;
     if (fog_on) shade.buildFogLuts(params);
@@ -132,7 +140,11 @@ pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: 
     }
 
     const wf: f32 = @floatFromInt(width);
+    const hf0: f32 = @floatFromInt(height);
     const f = (wf * 0.5) / @tan(hfov * 0.5);
+    // Vertical half-window slope (rows per unit XZ distance), hoisted
+    // out of the per-cell window math.
+    const s_max = hf0 * 0.5 / f;
     const fwd = cam.forward();
     const rgt = cam.right();
 
@@ -140,24 +152,81 @@ pub fn render(fb: []u32, width: usize, height: usize, world: *const World, cam: 
         const hx = (@as(f32, @floatFromInt(sx)) + 0.5 - wf * 0.5) / f;
         const dx = fwd[0] + rgt[0] * hx;
         const dz = fwd[1] + rgt[1] * hx;
-        renderColumn(fb, height, world, cam, f, sx, dx, dz, sky, params);
+        renderColumn(fb, height, world, lod, cam, f, s_max, sx, dx, dz, sky, params);
     }
 }
 
-fn renderColumn(fb: []u32, height: usize, world: *const World, cam: Camera, f: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
+/// One march's geometric frame: which world, and how ray distance t
+/// maps into its coordinate system. The LOD march scales all lengths
+/// by 1/2 (cam and direction halved, f doubled), which leaves
+/// processCell's row and window math form-invariant: a coarse voxel at
+/// y_c projects exactly like the 2 fine voxels it covers.
+const MarchCfg = struct {
+    world: *const World,
+    cam_x: f32,
+    cam_y: f32,
+    cam_z: f32,
+    f: f32,
+    s_max: f32,
+    dx: f32,
+    dz: f32,
+};
+
+fn renderColumn(fb: []u32, height: usize, world: *const World, lod: ?*const World, cam: Camera, f: f32, s_max: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
     var free = SpanList.initFull(@intCast(height));
 
     // March no farther than the fog cutoff: every later hit is fully
     // fogged, so the remaining free spans might as well be sky (whose
     // horizon row is the fog color).
     const limit = @min(max_dist, params.fog_cutoff);
-    var dda = DdaIterator.init(cam.x, cam.z, dx, dz, max_dist);
-    while (dda.t0 < limit and !free.isEmpty()) {
-        processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cam.x, cam.y, cam.z, f, dx, dz, dda.t0, dda.t1(), dda.axis, &free, params);
-        dda.advance();
+    const cfg: MarchCfg = .{ .world = world, .cam_x = cam.x, .cam_y = cam.y, .cam_z = cam.z, .f = f, .s_max = s_max, .dx = dx, .dz = dz };
+    const t_switch = if (lod != null) @min(params.lod_dist, limit) else limit;
+    marchRange(fb, height, sx, cfg, 0, t_switch, &free, params);
+    if (lod) |lw| {
+        if (t_switch < limit and !free.isEmpty()) {
+            const cfg2: MarchCfg = .{ .world = lw, .cam_x = cam.x * 0.5, .cam_y = cam.y * 0.5, .cam_z = cam.z * 0.5, .f = f * 2.0, .s_max = s_max * 0.5, .dx = dx * 0.5, .dz = dz * 0.5 };
+            marchRange(fb, height, sx, cfg2, t_switch, limit, &free, params);
+        }
     }
 
     spans.fillSpans(fb, height, sx, &free, 0, @floatFromInt(height), spans.SkySrc{ .sky = sky });
+}
+
+/// March cfg's world over absolute ray distances [t_begin, t_end).
+/// With t_begin = 0 this is bit-identical to the plain single-world
+/// march (same DDA state, same processCell arguments). The cell-exit
+/// clamp preserves the historical max_dist = 96 semantics: t1 may
+/// overshoot t_end up to 96 (or t_end when that is larger), which only
+/// affects cells straddling the march limit and keeps the --lod 0 path
+/// byte-identical.
+fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, t_end: f32, free: *SpanList, params: RenderParams) void {
+    const world = cfg.world;
+    const t_clamp = @max(96.0, t_end);
+    var dda = DdaIterator.init(cfg.cam_x + cfg.dx * t_begin, cfg.cam_z + cfg.dz * t_begin, cfg.dx, cfg.dz, t_clamp - t_begin);
+    while (t_begin + dda.t0 < t_end and !free.isEmpty()) {
+        const t0 = t_begin + dda.t0;
+        const t1 = t_begin + dda.t1();
+        // Macro-cell skip: the whole 8x8 group is provably below the
+        // ray's height window (or out of the world entirely), so
+        // processCell would emit nothing — decided without loading a
+        // single Column (the macro grid stays L1-resident). Exact:
+        // h_lo > mmax + 1 implies y_lo > top_solid for every column in
+        // the group, the per-column sky-skip's own condition.
+        if (world.macro_ok) {
+            const t0c = @max(t0, 1e-4); // processCell's own clamp
+            const h_lo = cfg.cam_y - @max(cfg.s_max * t0c, cfg.s_max * t1);
+            const mmax = world.macroMax(dda.ix, dda.iz) orelse {
+                dda.advance();
+                continue;
+            };
+            if (h_lo > @as(f32, @floatFromInt(mmax)) + 1.0) {
+                dda.advance();
+                continue;
+            }
+        }
+        processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cfg.cam_x, cfg.cam_y, cfg.cam_z, cfg.f, cfg.s_max, cfg.dx, cfg.dz, t0, t1, dda.axis, free, params);
+        dda.advance();
+    }
 }
 
 fn rowAt(y: i32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
@@ -193,25 +262,27 @@ const Segment = struct {
 };
 
 /// The single LUT/light/fog composition point; milestones 8-13 extend
-/// this function and nowhere else.
+/// this function and nowhere else. Stays in shade.V4 (float lanes with
+/// a @trunc per stage) until one final pack — bit-identical to the
+/// historical per-stage u32 round-trips.
 fn segmentColor(seg: Segment, params: RenderParams) [2]u32 {
     const class = @intFromEnum(shade.faceClass(seg.face));
-    var c0 = shade.shadeAt(seg.mat, class, seg.ao[0], seg.sky);
-    var c1 = shade.shadeAt(seg.mat, class, seg.ao[1], seg.sky);
+    var c0 = shade.shadeAtV(seg.mat, class, seg.ao[0], seg.sky);
+    var c1 = shade.shadeAtV(seg.mat, class, seg.ao[1], seg.sky);
     // Emissive materials stay full-bright (shade LUT bypass), so their
     // own seed light is not reapplied on top.
     if (seg.light.intensity != 0 and world_mod.palette[seg.mat].emissive == 0) {
         var light = seg.light;
         light.intensity = @intCast(@as(u16, light.intensity) * shade.dir_weight[@intFromEnum(light.dir)][@intFromEnum(seg.face)] / 255);
         if (light.intensity != 0) {
-            c0 = shade.applyGlow(c0, light);
-            c1 = shade.applyGlow(c1, light);
+            c0 = shade.applyGlowV(c0, light);
+            c1 = shade.applyGlowV(c1, light);
         }
     }
-    if (params.fog_density <= 0) return .{ c0, c1 };
+    if (params.fog_density <= 0) return .{ shade.packRgb(c0), shade.packRgb(c1) };
     return .{
-        shade.fogStop(seg.mat, seg.t[0], c0, params),
-        shade.fogStop(seg.mat, seg.t[1], c1, params),
+        shade.packRgb(shade.fogStopV(seg.mat, seg.t[0], c0, params)),
+        shade.packRgb(shade.fogStopV(seg.mat, seg.t[1], c1, params)),
     };
 }
 
@@ -324,11 +395,10 @@ fn skyStop(sky_on: bool, sky_y: i32, y: i32) u1 {
     return if (!sky_on or y > sky_y) 1 else 0;
 }
 
-fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList, params: RenderParams) void {
+fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, s_max: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, free: *SpanList, params: RenderParams) void {
     if (free.isEmpty()) return;
     const t0 = @max(t0_in, 1e-4);
     const hf: f32 = @floatFromInt(height);
-    const s_max = hf * 0.5 / f;
     const h_hi = cam_y + @max(s_max * t0, s_max * t1);
     const h_lo = cam_y - @max(s_max * t0, s_max * t1);
     const y_lo: i32 = @max(@as(i32, @intFromFloat(@floor(h_lo))), 0);
@@ -336,6 +406,12 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     if (y_lo > y_hi) return;
     const col = world.columnAt(ix, iz) orelse return;
     const wh: i32 = @intCast(world.h);
+
+    // Faces only ever come from this column's solids, so when the
+    // ray's height window is entirely above the topmost solid (sky
+    // cells, the bulk of long marches) nothing can emit: skip all
+    // neighbor and light setup.
+    if (col.top_solid_y == world_mod.no_solid or y_lo > col.top_solid_y) return;
 
     // Ray position within the cell at entry (a) and exit (b), clamped
     // against float error at boundaries; AO stop sample points.
@@ -384,17 +460,16 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     // the previous DDA cell (the air side of side faces); lacur/lbcur
     // cover the diagonal columns flanking it. All three walk y upward in
     // lockstep with the segment loop, amortized O(1) per voxel.
-    if (has_prev) {
-        if (world.columnAt(px, pz)) |pcol| {
-            ctx.nsky_y = if (pcol.top_solid_y == world_mod.no_solid) -1 else pcol.top_solid_y;
-            ctx.ncur = world_mod.RunCursor.init(pcol.runs, wh, y_lo);
-            if (axis == .x_side) {
-                if (world.columnAt(px, pz - 1)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-                if (world.columnAt(px, pz + 1)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-            } else {
-                if (world.columnAt(px - 1, pz)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-                if (world.columnAt(px + 1, pz)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-            }
+    const pcol: ?*const world_mod.Column = if (has_prev) world.columnAt(px, pz) else null;
+    if (pcol) |pc| {
+        ctx.nsky_y = if (pc.top_solid_y == world_mod.no_solid) -1 else pc.top_solid_y;
+        ctx.ncur = world_mod.RunCursor.init(pc.runs, wh, y_lo);
+        if (axis == .x_side) {
+            if (world.columnAt(px, pz - 1)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+            if (world.columnAt(px, pz + 1)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+        } else {
+            if (world.columnAt(px - 1, pz)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+            if (world.columnAt(px + 1, pz)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
         }
     }
 
@@ -406,21 +481,15 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     // as unlit.
     if (params.light) {
         if (col.light) |lruns| {
-            var total: i32 = 0;
-            for (lruns) |r| total += r.count;
             ctx.light_hi = col.light_base_y;
-            ctx.light_lo = ctx.light_hi - total + 1;
+            ctx.light_lo = col.light_lo;
             ctx.lcur = world_mod.LightCursor.init(lruns, ctx.light_hi + 1, std.math.clamp(y_lo, ctx.light_lo, ctx.light_hi));
         }
-        if (has_prev) {
-            if (world.columnAt(px, pz)) |pcol| {
-                if (pcol.light) |nruns| {
-                    var total: i32 = 0;
-                    for (nruns) |r| total += r.count;
-                    ctx.nlight_hi = pcol.light_base_y;
-                    ctx.nlight_lo = ctx.nlight_hi - total + 1;
-                    ctx.nlcur = world_mod.LightCursor.init(nruns, ctx.nlight_hi + 1, std.math.clamp(y_lo, ctx.nlight_lo, ctx.nlight_hi));
-                }
+        if (pcol) |pc| {
+            if (pc.light) |nruns| {
+                ctx.nlight_hi = pc.light_base_y;
+                ctx.nlight_lo = pc.light_lo;
+                ctx.nlcur = world_mod.LightCursor.init(nruns, ctx.nlight_hi + 1, std.math.clamp(y_lo, ctx.nlight_lo, ctx.nlight_hi));
             }
         }
     }
@@ -543,7 +612,8 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
     }
 
     y = ctx.y_hi;
-    cur = world_mod.RunCursor.init(ctx.col.runs, ctx.wh, ctx.y_hi);
+    // cur already covers y_hi after the upward walk's normal exit —
+    // no fresh cursor scan needed.
     while (y >= ctx.y_lo) {
         const seg_hi = y;
         const seg_lo = @max(cur.lo, ctx.y_lo);
@@ -570,9 +640,20 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
 }
 
 pub fn transpose(dst: []u32, src: []const u32, width: usize, height: usize) void {
-    for (0..width) |x| {
-        for (0..height) |y| {
-            dst[y * width + x] = src[x * height + y];
+    // 16x16 tiled: the naive row-major walk over a column-major source
+    // is a cache-hostile gather (~2x slower at 960x540).
+    const T = 16;
+    var x0: usize = 0;
+    while (x0 < width) : (x0 += T) {
+        var y0: usize = 0;
+        while (y0 < height) : (y0 += T) {
+            const xe = @min(x0 + T, width);
+            const ye = @min(y0 + T, height);
+            for (x0..xe) |x| {
+                for (y0..ye) |y| {
+                    dst[y * width + x] = src[x * height + y];
+                }
+            }
         }
     }
 }

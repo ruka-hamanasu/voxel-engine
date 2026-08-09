@@ -66,7 +66,7 @@ pub fn sideAoStops(n: *const world_mod.RunCursor, la: ?*const world_mod.RunCurso
 }
 
 fn solidW(world: *const World, x: i32, y: i32, z: i32) bool {
-    return world.get(x, y, z) != 0;
+    return world.solidAt(x, y, z);
 }
 
 /// {near, far} AO stops for a horizontal face of column (ix, iz),
