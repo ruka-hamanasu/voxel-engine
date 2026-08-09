@@ -69,6 +69,28 @@ fn solidW(world: *const World, x: i32, y: i32, z: i32) bool {
     return world.solidAt(x, y, z);
 }
 
+/// Any fine voxel solid in coarse layer yc (the two fine heights) of
+/// one fine column.
+fn solidInLayer(world: *const World, x: i32, z: i32, yc: i32) bool {
+    return world.solidAt(x, 2 * yc, z) or world.solidAt(x, 2 * yc + 1, z);
+}
+
+/// sideAoStops for an LOD boundary face, sampled from the single fine
+/// column the ray's entry point backs onto (its lateral flanks fill
+/// the corner roles). Unioning both fronting columns would let a
+/// solid neighbor darken face fragments that front open air.
+pub fn sideAoStopsFine(fine: *const World, sel: [2]i32, flanka: [2]i32, flankb: [2]i32, y: i32, u: f32) [2]f32 {
+    const up = solidInLayer(fine, sel[0], sel[1], y + 1);
+    const dn = solidInLayer(fine, sel[0], sel[1], y - 1);
+    const sa = solidInLayer(fine, flanka[0], flanka[1], y);
+    const sb = solidInLayer(fine, flankb[0], flankb[1], y);
+    const top_a = aoLevel(up, sa, if (up and sa) false else solidInLayer(fine, flanka[0], flanka[1], y + 1));
+    const top_b = aoLevel(up, sb, if (up and sb) false else solidInLayer(fine, flankb[0], flankb[1], y + 1));
+    const bot_a = aoLevel(dn, sa, if (dn and sa) false else solidInLayer(fine, flanka[0], flanka[1], y - 1));
+    const bot_b = aoLevel(dn, sb, if (dn and sb) false else solidInLayer(fine, flankb[0], flankb[1], y - 1));
+    return .{ lerpLevel(top_a, top_b, u), lerpLevel(bot_a, bot_b, u) };
+}
+
 /// {near, far} AO stops for a horizontal face of column (ix, iz),
 /// sampled at hit positions (ua, va) and (ub, vb). yf is the height of
 /// the air block in front of the face (above for top, below for

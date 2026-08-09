@@ -327,5 +327,22 @@ entries here record scope and outcome only.
     confined to fogged distant silhouettes. Final benches (960x540,
     ms/frame, baseline -> LOD): spawn 7.59 -> 5.97, worst view
     13.36 -> 6.05, aerial 7.20 -> 2.27, caves 0.30 -> 0.13; worst
-    view at fogcut 160: 6.24 — longer draw distance than before at
-    half the original frame time.
+     view at fogcut 160: 6.24 — longer draw distance than before at
+     half the original frame time.
+     LOD boundary fix: the handoff no longer splits the coarse voxel
+     straddling lod_dist — lodBoundary snaps it to the entry of the
+     first coarse cell whose center is past lod_dist, so each coarse
+     voxel renders whole, chosen by center distance. The coarse
+     march's first cell emits its back faces uncullled (span claiming
+     resolves occlusion against the fine render in front; culling
+     against the coarse neighbor's union-solidity would punch holes)
+     and shades them from the FINE world: the single fronting fine
+     column the entry point backs onto (side_u selects between the
+     face's two) supplies the sky bit, side-AO occluders, and light
+     sample. Coarse-folded shading was tried first and left a dark
+     seam: union-raised neighbor tops read open-sky faces as
+     cave-dark, and unioning both fronting columns striped AO on
+     voxels whose visible fragment fronted fine air. Regression
+     gates: --lod 0 byte-identical over the 37+37+4 sweep; default
+     mode differences confined to the fogged boundary silhouettes
+     (dark seam band gone at fogcut 160); bench neutral.
