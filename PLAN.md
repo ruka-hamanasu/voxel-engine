@@ -346,3 +346,25 @@ entries here record scope and outcome only.
      gates: --lod 0 byte-identical over the 37+37+4 sweep; default
      mode differences confined to the fogged boundary silhouettes
      (dark seam band gone at fogcut 160); bench neutral.
+15. COMPLETED - Distance-gated shading detail (`--detail`, default 32;
+    0 disables). Cells past detail_dist drop per-voxel AO (neighbor/
+    diagonal cursor setup, sideAoStops/faceAoStops) and the colored
+    light zipper + glow, shading max-AO unlit so each material run
+    collapses to one constant segment per sky half; the analytic sky
+    bit and fog stay. The mode flips at most once per ray (t0 is
+    monotonic), so the branch is hoisted out of the march: renderColumn
+    snaps the split to a cell entry (detailBoundary) and marches a
+    detailed and a simple range, each comptime-specialized through
+    marchRange/processCell/genSegments (the coarse LOD march is simple
+    too); mid-ray starts seed the upstream cell exactly like the LOD
+    handoff. Isolated per-voxel savings (--lod 0, 960x540, ms/frame):
+    worst 10.94 -> 6.31 (-42%), aerial 3.96 -> 2.45, spawn 6.83 ->
+    6.12. The seam is invisible: <=0.3% of pixels differ vs full
+    detail (max delta 24/255), all on heavily fogged terrain; cave/
+    emissive views byte-identical; detail 24 bought nothing and
+    diffed 3x more area. lod_dist default raised 48 -> 64 (the freed
+    budget): final benches vs the milestone-14 baseline (spawn /
+    worst / aerial / worst@fogcut160) 6.29/6.44/2.37/6.39 ->
+    6.01/4.62/1.72/4.57. Regression gates: --detail 0 --lod 48 and
+    --detail 0 --lod 0 byte-identical over the 37+37+4 sweep;
+    default-mode baselines regenerated.

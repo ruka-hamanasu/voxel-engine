@@ -25,7 +25,8 @@ pub fn main(init: std.process.Init) !void {
         \\    --bench <u32>     Render N frames and report ms/frame.
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
-        \\    --lod <f32>       LOD switch distance (default 48; 0 disables the coarse world).
+        \\    --lod <f32>       LOD switch distance (default 64; 0 disables the coarse world).
+        \\    --detail <f32>    Per-voxel shading detail distance (default 48; 0 = full detail everywhere).
         \\    --atten <u8>      Light attenuation.
         \\    --no-light        Disable lighting.
         \\    --no-anim         Disable palette animation.
@@ -108,6 +109,7 @@ pub fn main(init: std.process.Init) !void {
     if (res.args.fog) |d| rparams.fog_density = d;
     if (res.args.fogcut) |co| rparams.fog_cutoff = co;
     if (res.args.lod) |ld| rparams.lod_dist = ld;
+    if (res.args.detail) |dd| rparams.detail_dist = dd;
 
     // Half-resolution far-field world (milestone 16): built once here,
     // incrementally rebuilt from dirty regions on edits.

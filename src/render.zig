@@ -38,10 +38,19 @@ pub const RenderParams = struct {
     /// Fine/coarse march handoff distance. The handoff snaps to the
     /// entry of the first coarse cell whose center is past it
     /// (lodBoundary), and the ray continues in the half-resolution LOD
-    /// world (~77% fogged at the default 48, so the silhouette
+    /// world (80% fogged at the default 64, so the silhouette
     /// overestimate stays hidden). No effect when render's lod is
     /// null.
-    lod_dist: f32 = 48.0,
+    lod_dist: f32 = 64.0,
+    /// Distance past which per-voxel shading detail (AO neighbor
+    /// sampling, the colored-light zipper and glow) is dropped: cells
+    /// beyond it shade with max AO and no light, collapsing each
+    /// material run to one constant segment per sky half. Snapped per
+    /// screen column to a cell entry (detailBoundary) so no cell
+    /// straddles the mode line; the analytic sky bit stays (a cached
+    /// compare, and it keeps cave/silhouette darkness) and fog hides
+    /// the seam. 0 disables (full detail everywhere).
+    detail_dist: f32 = 48.0,
 };
 
 /// Rebuild the shade LUT after a palette mutation (milestone 10 calls
@@ -150,6 +159,16 @@ fn lodBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, lod_dist: f32, limit: f
     return std.math.clamp(t_switch + t_enter, 0.0, limit);
 }
 
+/// Simple-mode split distance, snapped to the entry of the fine DDA
+/// cell containing detail_dist so each cell renders wholly in one
+/// mode. Unlike lodBoundary no center-distance walk is needed: the
+/// containing cell renders simple, so its entry is the split.
+fn detailBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, detail_dist: f32) f32 {
+    const dda = DdaIterator.init(cam_x + dx * detail_dist, cam_z + dz * detail_dist, dx, dz, std.math.inf(f32));
+    const t_enter = @max(prevCross(dda.t_max_x, dda.t_delta_x), prevCross(dda.t_max_z, dda.t_delta_z));
+    return @max(detail_dist + t_enter, 0.0);
+}
+
 pub fn render(fb: []u32, width: usize, height: usize, world: *const World, lod: ?*const World, cam: Camera, params: RenderParams) void {
     std.debug.assert(height <= shade.max_sky_height);
     const fog_on = params.fog_density > 0;
@@ -215,18 +234,43 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lod: ?*const Worl
     // horizon row is the fog color).
     const limit = @min(max_dist, params.fog_cutoff);
     const cfg: MarchCfg = .{ .world = world, .cam_x = cam.x, .cam_y = cam.y, .cam_z = cam.z, .f = f, .s_max = s_max, .dx = dx, .dz = dz };
+    // Shading-detail split (RenderParams.detail_dist): the mode flips
+    // at most once per ray (t0 is monotonic), so the branch is hoisted
+    // out of the march as a range split. limit when disabled or out of
+    // reach, keeping --detail 0 a single detailed march (bit-identical
+    // to the pre-split renderer).
+    const t_detail = if (params.detail_dist > 0 and params.detail_dist < limit)
+        detailBoundary(cam.x, cam.z, dx, dz, params.detail_dist)
+    else
+        limit;
     if (lod) |lw| {
         const t_boundary = lodBoundary(cam.x, cam.z, dx, dz, params.lod_dist, limit);
-        marchRange(fb, height, sx, cfg, 0, t_boundary, &free, params, false);
+        marchFine(fb, height, sx, cfg, t_detail, t_boundary, &free, params);
         if (t_boundary < limit and !free.isEmpty()) {
             const cfg2: MarchCfg = .{ .world = lw, .fine = world, .cam_x = cam.x * 0.5, .cam_y = cam.y * 0.5, .cam_z = cam.z * 0.5, .f = f * 2.0, .s_max = s_max * 0.5, .dx = dx * 0.5, .dz = dz * 0.5 };
-            marchRange(fb, height, sx, cfg2, t_boundary + lod_eps, limit, &free, params, true);
+            if (t_boundary >= t_detail) {
+                marchRange(fb, height, sx, cfg2, t_boundary + lod_eps, limit, &free, params, true, false);
+            } else {
+                marchRange(fb, height, sx, cfg2, t_boundary + lod_eps, limit, &free, params, true, true);
+            }
         }
     } else {
-        marchRange(fb, height, sx, cfg, 0, limit, &free, params, false);
+        marchFine(fb, height, sx, cfg, t_detail, limit, &free, params);
     }
 
     spans.fillSpans(fb, height, sx, &free, 0, @floatFromInt(height), spans.SkySrc{ .sky = sky });
+}
+
+/// Fine march over [0, t_end), split at t_detail into a detailed and
+/// a simple range (both comptime-specialized, so no per-cell mode
+/// check). t_detail >= t_end collapses to the single detailed march.
+fn marchFine(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_detail: f32, t_end: f32, free: *SpanList, params: RenderParams) void {
+    if (t_detail >= t_end) {
+        marchRange(fb, height, sx, cfg, 0, t_end, free, params, false, true);
+        return;
+    }
+    marchRange(fb, height, sx, cfg, 0, t_detail, free, params, false, true);
+    if (!free.isEmpty()) marchRange(fb, height, sx, cfg, t_detail, t_end, free, params, false, false);
 }
 
 /// March cfg's world over absolute ray distances [t_begin, t_end).
@@ -235,18 +279,21 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lod: ?*const Worl
 /// clamp preserves the historical max_dist = 96 semantics: t1 may
 /// overshoot t_end up to 96 (or t_end when that is larger), which only
 /// affects cells straddling the march limit and keeps the --lod 0 path
-/// byte-identical. handoff marks the coarse (LOD) march: its first
-/// cell gets the upstream cell seeded as its previous-cell record, so
-/// its back faces take neighbor AO/sky/light like any other cell, but
-/// no_cull keeps them from being culled against the neighbor's
-/// union-solidity — the fine march in front may have left those spans
-/// open, and culling there would punch holes along the boundary.
-fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, t_end: f32, free: *SpanList, params: RenderParams, handoff: bool) void {
+/// byte-identical. A mid-ray start (t_begin > 0: the coarse LOD march
+/// or the simple shading range) seeds the upstream cell as the first
+/// cell's previous-cell record, so it culls and samples neighbor sky
+/// exactly as in an unsplit march. handoff additionally marks the
+/// coarse (LOD) boundary: its first cell emits back faces with
+/// no_cull — the fine march in front may have left those spans open,
+/// and culling against the coarse neighbor's union-solidity would
+/// punch holes along the boundary. comptime detail selects per-voxel
+/// shading detail (milestone 15); false compiles AO and light away.
+fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, t_end: f32, free: *SpanList, params: RenderParams, handoff: bool, comptime detail: bool) void {
     const world = cfg.world;
     const t_clamp = @max(96.0, t_end);
     var dda = DdaIterator.init(cfg.cam_x + cfg.dx * t_begin, cfg.cam_z + cfg.dz * t_begin, cfg.dx, cfg.dz, t_clamp - t_begin);
     var no_cull = false;
-    if (handoff) {
+    if (t_begin > 0) {
         if (prevCross(dda.t_max_x, dda.t_delta_x) > prevCross(dda.t_max_z, dda.t_delta_z)) {
             dda.px = dda.ix - dda.step_x;
             dda.pz = dda.iz;
@@ -257,7 +304,7 @@ fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, 
             dda.axis = .z_side;
         }
         dda.has_prev = true;
-        no_cull = true;
+        no_cull = handoff;
     }
     while (t_begin + dda.t0 < t_end and !free.isEmpty()) {
         const t0 = t_begin + dda.t0;
@@ -282,7 +329,7 @@ fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, 
                 continue;
             }
         }
-        processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cfg.cam_x, cfg.cam_y, cfg.cam_z, cfg.f, cfg.s_max, cfg.dx, cfg.dz, t0, t1, dda.axis, no_cull, cfg.fine, free, params);
+        processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cfg.cam_x, cfg.cam_y, cfg.cam_z, cfg.f, cfg.s_max, cfg.dx, cfg.dz, t0, t1, dda.axis, no_cull, cfg.fine, free, params, detail);
         no_cull = false;
         dda.advance();
     }
@@ -488,7 +535,7 @@ fn boundaryLight(fine: *const World, sel: [2]i32, y: i32) lighting.LightSample {
     return if (b.intensity > a.intensity) b else a;
 }
 
-fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, s_max: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, no_cull: bool, fine: ?*const World, free: *SpanList, params: RenderParams) void {
+fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, s_max: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, no_cull: bool, fine: ?*const World, free: *SpanList, params: RenderParams, comptime detail: bool) void {
     if (free.isEmpty()) return;
     const t0 = @max(t0_in, 1e-4);
     const hf: f32 = @floatFromInt(height);
@@ -578,17 +625,21 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     // Neighbor occupancy for face culling + side-face AO: ncur covers
     // the previous DDA cell (the air side of side faces); lacur/lbcur
     // cover the diagonal columns flanking it. All three walk y upward in
-    // lockstep with the segment loop, amortized O(1) per voxel.
+    // lockstep with the segment loop, amortized O(1) per voxel. Simple
+    // mode (detail = false) keeps only ncur: culling is geometry, but
+    // the diagonals exist solely for AO.
     const pcol: ?*const world_mod.Column = if (has_prev) world.columnAt(px, pz) else null;
     if (pcol) |pc| {
         ctx.nsky_y = if (pc.top_solid_y == world_mod.no_solid) -1 else pc.top_solid_y;
         ctx.ncur = world_mod.RunCursor.init(pc.runs, wh, y_lo);
-        if (axis == .x_side) {
-            if (world.columnAt(px, pz - 1)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-            if (world.columnAt(px, pz + 1)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-        } else {
-            if (world.columnAt(px - 1, pz)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
-            if (world.columnAt(px + 1, pz)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+        if (detail) {
+            if (axis == .x_side) {
+                if (world.columnAt(px, pz - 1)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px, pz + 1)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+            } else {
+                if (world.columnAt(px - 1, pz)) |c| ctx.lacur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+                if (world.columnAt(px + 1, pz)) |c| ctx.lbcur = world_mod.RunCursor.init(c.runs, wh, y_lo);
+            }
         }
     }
 
@@ -597,8 +648,9 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     // side faces). Both walk y upward in lockstep with the segment
     // loop, initialized clamped into coverage so out-of-coverage bands
     // query as defaults. The params.light toggle treats every column
-    // as unlit.
-    if (params.light) {
+    // as unlit. Simple mode skips the setup, so the genSegments
+    // dispatch below always takes the unlit specialization.
+    if (detail and params.light) {
         if (col.light) |lruns| {
             ctx.light_hi = col.light_base_y;
             ctx.light_lo = col.light_lo;
@@ -614,18 +666,23 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
     }
 
     var sink: SegmentSink = .{ .fb = fb, .height = height, .sx = sx, .free = free, .params = params };
-    if (ctx.lcur != null or ctx.nlcur != null or (ctx.bfine != null and ctx.sky_on)) {
-        genSegments(&ctx, &sink, true);
+    if (!detail) {
+        genSegments(&ctx, &sink, false, false);
+    } else if (ctx.lcur != null or ctx.nlcur != null or (ctx.bfine != null and ctx.sky_on)) {
+        genSegments(&ctx, &sink, true, true);
     } else {
-        genSegments(&ctx, &sink, false);
+        genSegments(&ctx, &sink, false, true);
     }
 }
 
 /// Segment generation: geometry/visibility only, emitting Segment
 /// records front-to-back. All shading decisions live in segmentColor.
 /// comptime lit selects the light-zipper code paths; columns without
-/// light runs compile them away entirely.
-fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
+/// light runs compile them away entirely. comptime detail = false
+/// (cells past detail_dist) drops AO to the max level and runs unlit:
+/// the max-AO accumulation then merges each material run into one
+/// constant segment per sky half, and sky/culling/fog are unaffected.
+fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime detail: bool) void {
     const free = sink.free;
     const top_face: OFace = .py;
     const bottom_face: OFace = .ny;
@@ -645,7 +702,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                 var yy = seg_lo;
                 while (yy <= seg_hi) : (yy += 1) {
                     if (!spans.spanOverlap(free, ctx.row(yy + 1, ctx.t0), ctx.row(yy, ctx.t0))) continue;
-                    const stops = ao.sideAoStopsFine(fine, ctx.bsel, ctx.bflanka, ctx.bflankb, yy, ctx.bu);
+                    const stops: [2]f32 = if (detail) ao.sideAoStopsFine(fine, ctx.bsel, ctx.bflanka, ctx.bflankb, yy, ctx.bu) else .{ 3, 3 };
                     const sky: u1 = if (!ctx.sky_on) 1 else boundarySky(fine, ctx.bsel, yy);
                     sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = if (lit) boundaryLight(fine, ctx.bsel, yy) else .{}, .sky = sky });
                     if (free.isEmpty()) return;
@@ -675,13 +732,15 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                         var yy = sy;
                         while (yy <= e) : (yy += 1) {
                             if (ctx.no_cull) while (yy > n.hi) n.up();
-                            if (ctx.lacur) |*la| {
-                                while (yy > la.hi) la.up();
-                            }
-                            if (ctx.lbcur) |*lb| {
-                                while (yy > lb.hi) lb.up();
-                            }
-                            const stops = ao.sideAoStops(n, ao.optCursor(&ctx.lacur), ao.optCursor(&ctx.lbcur), yy, ctx.side_u);
+                            const stops: [2]f32 = if (detail) stops: {
+                                if (ctx.lacur) |*la| {
+                                    while (yy > la.hi) la.up();
+                                }
+                                if (ctx.lbcur) |*lb| {
+                                    while (yy > lb.hi) lb.up();
+                                }
+                                break :stops ao.sideAoStops(n, ao.optCursor(&ctx.lacur), ao.optCursor(&ctx.lbcur), yy, ctx.side_u);
+                            } else .{ 3, 3 };
                             const lq = ctx.nLightAt(lit, yy);
                             const sky = skyStop(ctx.sky_on, ctx.nsky_y, yy);
                             if (stops[0] == 3 and stops[1] == 3 and (!lit or std.meta.eql(lq.sample, pend_light)) and sky == pend_sky) continue;
@@ -737,7 +796,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                 const r_near = ctx.row(seg_lo, ctx.t0);
                 const r_far = ctx.row(seg_lo, ctx.t1);
                 if (spans.spanOverlap(free, r_near, r_far)) {
-                    const stops = ao.faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_lo - 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
+                    const stops: [2]f32 = if (detail) ao.faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_lo - 1, ctx.ua, ctx.va, ctx.ub, ctx.vb) else .{ 3, 3 };
                     sink.emit(.{ .mat = mat, .face = bottom_face, .r0 = r_near, .r1 = r_far, .t = .{ ctx.t0, ctx.t1 }, .ao = stops, .light = if (lit) lighting.sampleLight(ctx.col, seg_lo - 1) else .{}, .sky = skyStop(ctx.sky_on, ctx.sky_y, seg_lo - 1) });
                     if (free.isEmpty()) return;
                 }
@@ -764,7 +823,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool) void {
                 const r_far = ctx.row(seg_hi + 1, ctx.t1);
                 const r_near = ctx.row(seg_hi + 1, ctx.t0);
                 if (spans.spanOverlap(free, r_far, r_near)) {
-                    const stops = ao.faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_hi + 1, ctx.ua, ctx.va, ctx.ub, ctx.vb);
+                    const stops: [2]f32 = if (detail) ao.faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_hi + 1, ctx.ua, ctx.va, ctx.ub, ctx.vb) else .{ 3, 3 };
                     sink.emit(.{ .mat = cur.mat(), .face = top_face, .r0 = r_far, .r1 = r_near, .t = .{ ctx.t1, ctx.t0 }, .ao = .{ stops[1], stops[0] }, .light = if (lit) lighting.sampleLight(ctx.col, seg_hi + 1) else .{}, .sky = skyStop(ctx.sky_on, ctx.sky_y, seg_hi + 1) });
                     if (free.isEmpty()) return;
                 }
@@ -907,6 +966,18 @@ test "fogged segment converges to the fog color at the cutoff" {
     }
 }
 
+test "detailBoundary snaps the split to the containing cell's entry" {
+    // Axis-aligned +x ray: t=32 lands in cell [35,36) (entry 31.1
+    // along the ray), so the split moves down to the cell entry.
+    try std.testing.expectApproxEqAbs(@as(f32, 31.1), detailBoundary(3.9, 10.5, 1.0, 0.0, 32.0), 1e-3);
+    // t=32 exactly on a cell plane: the plane is the split, and the
+    // same holds with a zero direction component or a negative
+    // direction at an exact-integer position.
+    try std.testing.expectApproxEqAbs(@as(f32, 32.0), detailBoundary(4.0, 10.5, 1.0, 0.0, 32.0), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 32.0), detailBoundary(4.0, 10.0, 0.0, 1.0, 32.0), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.0), detailBoundary(100.0, 10.5, -1.0, 0.0, 32.0), 1e-3);
+}
+
 test "lodBoundary snaps the handoff to the first center-past coarse cell" {
     // Axis-aligned +x ray: coarse cells are 2 t-units wide. The cell
     // holding t=48 has center 47.1 (within lod_dist), so the boundary
@@ -936,7 +1007,7 @@ test "boundary cell back faces are never culled but take neighbor AO" {
     // column is solid over the whole run), leaving the spans open.
     var fb0: [16]u32 = @splat(sentinel);
     var free0 = SpanList.initFull(16);
-    processCell(&fb0, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, false, null, &free0, params);
+    processCell(&fb0, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, false, null, &free0, params, true);
     try std.testing.expectEqualSlices(u32, &@as([16]u32, @splat(sentinel)), &fb0);
 
     // no_cull (the LOD boundary cell): the faces emit, shaded by the
@@ -944,7 +1015,7 @@ test "boundary cell back faces are never culled but take neighbor AO" {
     // upstream column).
     var fb1: [16]u32 = @splat(sentinel);
     var free1 = SpanList.initFull(16);
-    processCell(&fb1, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, null, &free1, params);
+    processCell(&fb1, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, null, &free1, params, true);
     try std.testing.expect(free1.isEmpty() == false);
     const want = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 11.2, .r1 = 12.8, .t = .{ 10, 10 }, .ao = .{ 2, 2 }, .sky = 1 }, params)[0];
     try std.testing.expectEqual(want, fb1[12]);
@@ -973,7 +1044,7 @@ test "boundary cell shades back faces from the fine world in front" {
 
     var fb: [16]u32 = @splat(sentinel);
     var free = SpanList.initFull(16);
-    processCell(&fb, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, &fine, &free, params);
+    processCell(&fb, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, &fine, &free, params, true);
     // Sky-lit, max-AO (nothing solid beside the faces in fine air).
     const want = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 3, 3 }, .sky = 1 }, params)[0];
     try std.testing.expectEqual(want, fb[9]);
@@ -985,6 +1056,37 @@ test "boundary cell shades back faces from the fine world in front" {
     // top (sky 0).
     var fb2: [16]u32 = @splat(sentinel);
     var free2 = SpanList.initFull(16);
-    processCell(&fb2, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, null, &free2, params);
+    processCell(&fb2, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, null, &free2, params, true);
     try std.testing.expectEqual(dark, fb2[9]);
+}
+
+test "simple mode drops AO but claims identical geometry" {
+    var world = try World.init(std.testing.allocator, 4, 8, 4);
+    defer world.deinit();
+    try world.fillBox(1, 2, 1, 2, 6, 2, 3); // current column: solid 2..5
+    try world.fillBox(0, 6, 1, 1, 7, 2, 3); // upstream column: solid 6 only —
+    // darkens the y=5 face's top AO stop in detailed mode without
+    // culling it (the face stays air-backed).
+    const params: RenderParams = .{ .fog_density = 0, .light = false };
+    const sentinel: u32 = 0xdeadbeef;
+
+    var fb_det: [16]u32 = @splat(sentinel);
+    var free_det = SpanList.initFull(16);
+    processCell(&fb_det, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, false, null, &free_det, params, true);
+    var fb_sim: [16]u32 = @splat(sentinel);
+    var free_sim = SpanList.initFull(16);
+    processCell(&fb_sim, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, false, null, &free_sim, params, false);
+
+    // Same spans claimed in both modes (geometry is detail-independent).
+    try std.testing.expectEqual(free_det.len, free_sim.len);
+    try std.testing.expectEqualSlices(@TypeOf(free_det.spans[0]), free_det.spans[0..free_det.len], free_sim.spans[0..free_sim.len]);
+    // Simple mode renders the whole run as one constant max-AO
+    // segment; detailed mode darkens the y=5 gradient rows.
+    const plain = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 9.6, .r1 = 16.0, .t = .{ 10, 10 }, .ao = .{ 3, 3 }, .sky = 1 }, params)[0];
+    try std.testing.expectEqual(plain, fb_sim[10]);
+    try std.testing.expectEqual(plain, fb_sim[14]);
+    try std.testing.expectEqual(plain, fb_det[14]);
+    try std.testing.expect(fb_det[10] != plain);
+    try std.testing.expectEqual(sentinel, fb_sim[9]);
+    try std.testing.expectEqual(sentinel, fb_det[9]);
 }
