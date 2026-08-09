@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseSafe;
 
     const nuklear = b.dependency("nuklear", .{});
+    const clap = b.dependency("clap", .{});
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -14,6 +15,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    exe_mod.addImport("clap", clap.module("clap"));
     exe_mod.linkSystemLibrary("SDL2", .{});
     exe_mod.addIncludePath(nuklear.path(""));
     exe_mod.addIncludePath(nuklear.path("demo/sdl_renderer"));

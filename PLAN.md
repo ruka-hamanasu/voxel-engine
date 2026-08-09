@@ -10,6 +10,8 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 - **Platform layer:** SDL2 (`libsdl2-dev` via apt), used only for window,
   input, and displaying the framebuffer.
 - **UI:** Nuklear
+- **CLI:** zig-clap (0.12.0) for option parsing and `--help` text. Lighting
+  and animation are on by default; `--no-light`/`--no-anim` disable them.
 - **Headless mode:** `--headless` flag renders frames to PPM files so the
   renderer is verifiable without a display.
 

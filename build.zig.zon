@@ -36,6 +36,10 @@
             .url = "https://github.com/Immediate-Mode-UI/Nuklear/archive/0dbc52f86404f9e1f26ce0df3015ed23ff54a726.tar.gz",
             .hash = "N-V-__8AAGJoZQBw_GjGWjfW7aH6q-_hylCLzEuIfcvw-jW3",
         },
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
+            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
+        },
     },
     .paths = .{
         "build.zig",

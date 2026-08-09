@@ -12,88 +12,77 @@ const render = @import("render.zig");
 const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
 const anim = @import("anim.zig");
+const clap = @import("clap");
 
 const window_w = 960;
 const window_h = 540;
 
 pub fn main(init: std.process.Init) !void {
-    const args = init.minimal.args.vector;
-    var headless_path: ?[]const u8 = null;
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help            Display this help and exit.
+        \\    --headless <PATH> Render one frame to a PPM file at PATH and exit (no window).
+        \\    --seed <u64>      World generation seed.
+        \\    --gen <GEN>       World generator: terrain.
+        \\    --cam <CAM>       Camera override as "x,y,z,yaw".
+        \\    --bench <u32>     Render N frames and report ms/frame.
+        \\    --fog <f32>       Fog density override.
+        \\    --fogcut <f32>    Fog cutoff distance override.
+        \\    --atten <u8>      Light attenuation.
+        \\    --no-light        Disable lighting.
+        \\    --no-anim         Disable palette animation.
+        \\    --time <f64>      Animation time in seconds.
+        \\    --width <usize>   Render width (default 480).
+        \\    --height <usize>  Render height (default 270).
+        \\
+    );
+
+    const parsers = comptime .{
+        .PATH = clap.parsers.string,
+        .GEN = clap.parsers.enumeration(gen.Generator),
+        .CAM = clap.parsers.string,
+        .u8 = clap.parsers.int(u8, 10),
+        .u32 = clap.parsers.int(u32, 10),
+        .u64 = clap.parsers.int(u64, 10),
+        .usize = clap.parsers.int(usize, 10),
+        .f32 = clap.parsers.float(f32),
+        .f64 = clap.parsers.float(f64),
+    };
+
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parse(clap.Help, &params, parsers, init.minimal.args, .{
+        .diagnostic = &diag,
+        .allocator = init.gpa,
+    }) catch |err| {
+        try diag.reportToFile(init.io, .stderr(), err);
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0)
+        return clap.helpToFile(init.io, .stdout(), clap.Help, &params, .{});
+
     var opts: gen.Options = .{};
-    var generator: gen.Generator = .terrain;
     var cam_override: ?[4]f32 = null;
-    var bench_frames: u32 = 0;
-    var fog_density: ?f32 = null;
-    var fog_cutoff: ?f32 = null;
-    var light_params: lighting.Params = .{};
-    var light_enabled = true;
-    var anim_enabled = true;
-    var time_s: f64 = 0;
-    var render_w: usize = 480;
-    var render_h: usize = 270;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = std.mem.span(args[i]);
-        if (std.mem.eql(u8, arg, "--headless")) {
-            i += 1;
-            if (i >= args.len) return error.MissingHeadlessPath;
-            headless_path = std.mem.span(args[i]);
-        } else if (std.mem.eql(u8, arg, "--seed")) {
-            i += 1;
-            if (i >= args.len) return error.MissingSeedValue;
-            opts.seed = try std.fmt.parseInt(u64, std.mem.span(args[i]), 10);
-        } else if (std.mem.eql(u8, arg, "--gen")) {
-            i += 1;
-            if (i >= args.len) return error.MissingGeneratorName;
-            generator = std.meta.stringToEnum(gen.Generator, std.mem.span(args[i])) orelse return error.UnknownGenerator;
-        } else if (std.mem.eql(u8, arg, "--cam")) {
-            i += 1;
-            if (i >= args.len) return error.MissingCamValue;
-            var parts = std.mem.splitScalar(u8, std.mem.span(args[i]), ',');
-            var vals: [4]f32 = undefined;
-            for (&vals) |*v| {
-                const part = parts.next() orelse return error.BadCamValue;
-                v.* = try std.fmt.parseFloat(f32, part);
-            }
-            cam_override = vals;
-        } else if (std.mem.eql(u8, arg, "--bench")) {
-            i += 1;
-            if (i >= args.len) return error.MissingBenchValue;
-            bench_frames = try std.fmt.parseInt(u32, std.mem.span(args[i]), 10);
-        } else if (std.mem.eql(u8, arg, "--fog")) {
-            i += 1;
-            if (i >= args.len) return error.MissingFogValue;
-            fog_density = try std.fmt.parseFloat(f32, std.mem.span(args[i]));
-        } else if (std.mem.eql(u8, arg, "--fogcut")) {
-            i += 1;
-            if (i >= args.len) return error.MissingFogcutValue;
-            fog_cutoff = try std.fmt.parseFloat(f32, std.mem.span(args[i]));
-        } else if (std.mem.eql(u8, arg, "--atten")) {
-            i += 1;
-            if (i >= args.len) return error.MissingAttenValue;
-            light_params.attenuation = try std.fmt.parseInt(u8, std.mem.span(args[i]), 10);
-        } else if (std.mem.eql(u8, arg, "--light")) {
-            i += 1;
-            if (i >= args.len) return error.MissingLightValue;
-            light_enabled = (try std.fmt.parseInt(u8, std.mem.span(args[i]), 10)) != 0;
-        } else if (std.mem.eql(u8, arg, "--anim")) {
-            i += 1;
-            if (i >= args.len) return error.MissingAnimValue;
-            anim_enabled = (try std.fmt.parseInt(u8, std.mem.span(args[i]), 10)) != 0;
-        } else if (std.mem.eql(u8, arg, "--time")) {
-            i += 1;
-            if (i >= args.len) return error.MissingTimeValue;
-            time_s = try std.fmt.parseFloat(f64, std.mem.span(args[i]));
-        } else if (std.mem.eql(u8, arg, "--width")) {
-            i += 1;
-            if (i >= args.len) return error.MissingWidthValue;
-            render_w = try std.fmt.parseInt(usize, std.mem.span(args[i]), 10);
-        } else if (std.mem.eql(u8, arg, "--height")) {
-            i += 1;
-            if (i >= args.len) return error.MissingHeightValue;
-            render_h = try std.fmt.parseInt(usize, std.mem.span(args[i]), 10);
+    if (res.args.cam) |cam_str| {
+        var parts = std.mem.splitScalar(u8, cam_str, ',');
+        var vals: [4]f32 = undefined;
+        for (&vals) |*v| {
+            const part = parts.next() orelse return error.BadCamValue;
+            v.* = try std.fmt.parseFloat(f32, part);
         }
+        cam_override = vals;
     }
+    if (res.args.seed) |seed| opts.seed = seed;
+    const generator = res.args.gen orelse .terrain;
+    const headless_path = res.args.headless;
+    const bench_frames = res.args.bench orelse 0;
+    var light_params: lighting.Params = .{};
+    if (res.args.atten) |atten| light_params.attenuation = atten;
+    const light_enabled = res.args.@"no-light" == 0;
+    const anim_enabled = res.args.@"no-anim" == 0;
+    var time_s = res.args.time orelse 0;
+    const render_w = res.args.width orelse 480;
+    const render_h = res.args.height orelse 270;
     if (render_w == 0 or render_h == 0 or render_h > render.max_sky_height)
         return error.BadResolution;
 
@@ -110,8 +99,8 @@ pub fn main(init: std.process.Init) !void {
     render.rebuildShadeLut();
     var rparams: render.RenderParams = .{};
     rparams.light = light_enabled;
-    if (fog_density) |d| rparams.fog_density = d;
-    if (fog_cutoff) |co| rparams.fog_cutoff = co;
+    if (res.args.fog) |d| rparams.fog_density = d;
+    if (res.args.fogcut) |co| rparams.fog_cutoff = co;
 
     var flood_stats: lighting.Stats = .{};
     var flood_ms: f64 = 0;
