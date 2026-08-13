@@ -20,11 +20,14 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 
 ## Scale and world dimensions
 
-- Voxel size: Configurable, probably ~10cm
+- Voxel size: ~10cm (the milestone-23 walking player is 6x16x6 voxels
+  = 0.6x1.6x0.6 m, eye at 14)
 - World height: Configurable
 - Demo world extent: bounded, fully resident (streaming deferred).
-  Tested to 768x1024x768 (~50 MB resident columns across all LOD
-  levels; the flood's scratch is sparse, milestone 17).
+  Default 384x128x384 (milestone 22: height fits 16+-headroom caves
+  under the 0.30h terrain base). Tested to 768x1024x768 (~50 MB
+  resident columns across all LOD levels; the flood's scratch is
+  sparse, milestone 17).
 - Internal render resolution: Configurable
 
 ## Storage
@@ -463,3 +466,23 @@ entries here record scope and outcome only.
      2 MB fb L2 round-trip; est. 4-7% at 960x540, 1-2% at default
      480x270) — was evaluated and deferred: not worth the complexity
      while the frame is compute-bound.
+
+22. COMPLETED - World rescale for a 16-voxel player (walking prep).
+     Default world 192x64x192 -> 384x128x384 so caves with 16+
+     headroom fit under the 0.30h terrain base. Caves: noise /13,/9 ->
+     /24,/36 plus an 8-voxel solid skin under the surface (per-column
+     skin, so sloped terrain still gets skylit slot-canyon breaches —
+     kept, they read as cave entrances); tunnels ~10 wide x 14-28
+     headroom (3056 columns with 20+ in the default world). Crystals
+     2 -> 4 tall. Arches ~3x (27w x 33h x 6 thick, 17x18 opening),
+     density /8192 -> /16384, lenient flatness span (12), lintel
+     world-top clip guard. Spawn eye ground+15, pick_dist 16 -> 32.
+     Consequence: the default world now exceeds the solid_mask h <= 64
+     gate, so AO neighbor sampling takes the run-scan path. Bench
+     (960x540, ms/frame): spawn 6.49, mid-terrain worst 7.17, aerial
+     2.33, cave 2.99 — ~2x the m19 numbers (taller columns, run-scan
+     AO, bigger caverns); 480x270 spawn 3.16. View sweep re-tuned
+     (grid 48/192/336 x y 16/44/80, aerial y 75, cave cams at verified
+     interiors); views_m22[/]_lod0 baselines regenerated, rerun
+     byte-identical. Deferred lever: widen the solid_mask gate (u128
+     or 2 x u64) to restore bit-test AO at h <= 128.

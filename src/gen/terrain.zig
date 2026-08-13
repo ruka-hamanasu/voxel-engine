@@ -36,17 +36,19 @@ fn heightSpan(heights: []const u16, d: usize, x0: usize, z0: usize, wx: usize, w
 
 fn archBox(world: *World, x0: usize, z0: usize, l0: usize, l1: usize, y0: usize, y1: usize, along_x: bool, m: u8) !void {
     if (along_x) {
-        try world.fillBox(x0 + l0, y0, z0, x0 + l1, y1, z0 + 2, m);
+        try world.fillBox(x0 + l0, y0, z0, x0 + l1, y1, z0 + 6, m);
     } else {
-        try world.fillBox(x0, y0, z0 + l0, x0 + 2, y1, z0 + l1, m);
+        try world.fillBox(x0, y0, z0 + l0, x0 + 6, y1, z0 + l1, m);
     }
 }
 
+/// ~3x the pre-milestone-22 arch: a 16-voxel-tall player walks through
+/// the 17-wide x 18-tall opening.
 fn buildArch(world: *World, x0: usize, y0: usize, z0: usize, along_x: bool) !void {
-    try archBox(world, x0, z0, 0, 9, y0 - 1, y0 + 10, along_x, mat.arch);
-    try archBox(world, x0, z0, 2, 7, y0, y0 + 6, along_x, 0);
-    try archBox(world, x0, z0, 3, 6, y0 + 6, y0 + 8, along_x, 0);
-    try archBox(world, x0, z0, 4, 5, y0 + 8, y0 + 9, along_x, 0);
+    try archBox(world, x0, z0, 0, 27, y0 - 3, y0 + 30, along_x, mat.arch);
+    try archBox(world, x0, z0, 5, 22, y0, y0 + 18, along_x, 0);
+    try archBox(world, x0, z0, 8, 19, y0 + 18, y0 + 22, along_x, 0);
+    try archBox(world, x0, z0, 10, 17, y0 + 22, y0 + 26, along_x, 0);
 }
 
 fn farFromLandmarks(landmarks: []const gen.Landmark, x: usize, z: usize, min_dist: i32) bool {
@@ -108,17 +110,22 @@ pub fn generate(allocator: std.mem.Allocator, opts: gen.Options) !gen.Result {
             }
 
             if (n_mask.noise2(xf / 40.0, zf / 40.0) > -0.1) {
+                // Caves scaled for a 16-voxel-tall player (milestone 22):
+                // tunnels ~10 wide x ~14-18 headroom. The 8-voxel solid
+                // skin under the surface keeps caverns from breaching it.
                 var y: usize = 2;
-                while (y + 1 < surface) : (y += 1) {
+                while (y + 9 < surface) : (y += 1) {
                     const yf: f32 = @floatFromInt(y);
-                    const a = n_cave_a.fbm3(xf / 13.0, yf / 9.0, zf / 13.0, 2);
-                    const b = n_cave_b.fbm3(xf / 13.0, yf / 9.0, zf / 13.0, 2);
+                    const a = n_cave_a.fbm3(xf / 24.0, yf / 36.0, zf / 24.0, 2);
+                    const b = n_cave_b.fbm3(xf / 24.0, yf / 36.0, zf / 24.0, 2);
                     if (a * a + b * b < 0.05) dense[y] = 0;
                 }
 
                 y = 3;
-                while (y + 3 < surface) : (y += 1) {
-                    if (dense[y] == 0 and dense[y - 1] != 0 and dense[y + 1] == 0 and dense[y + 2] == 0) {
+                while (y + 5 < surface) : (y += 1) {
+                    if (dense[y] == 0 and dense[y - 1] != 0 and dense[y + 1] == 0 and dense[y + 2] == 0 and
+                        dense[y + 3] == 0 and dense[y + 4] == 0)
+                    {
                         if (rng.random().uintLessThan(u32, 48) == 0) {
                             const crystal = switch (rng.random().uintLessThan(u8, 3)) {
                                 0 => mat.crystal_cyan,
@@ -127,6 +134,8 @@ pub fn generate(allocator: std.mem.Allocator, opts: gen.Options) !gen.Result {
                             };
                             dense[y] = crystal;
                             dense[y + 1] = crystal;
+                            dense[y + 2] = crystal;
+                            dense[y + 3] = crystal;
                         }
                     }
                 }
@@ -139,28 +148,33 @@ pub fn generate(allocator: std.mem.Allocator, opts: gen.Options) !gen.Result {
     var landmarks: std.ArrayList(gen.Landmark) = .empty;
     errdefer landmarks.deinit(allocator);
 
-    const arch_target: usize = @max(2, opts.w * opts.d / 8192);
-    var attempts: usize = 0;
-    while (landmarks.items.len < arch_target and attempts < 128) : (attempts += 1) {
-        const ax = rng.random().intRangeAtMost(usize, 10, opts.w - 22);
-        const az = rng.random().intRangeAtMost(usize, 10, opts.d - 22);
-        const span = heightSpan(heights, opts.d, ax, az, 11, 11);
-        if (span.max - span.min > 3) continue;
-        if (!farFromLandmarks(landmarks.items, ax, az, 18)) continue;
-        const along_x = rng.random().boolean();
-        try buildArch(&world, ax, span.min, az, along_x);
-        try landmarks.append(allocator, .{ .x = @intCast(ax), .y = @intCast(span.min), .z = @intCast(az) });
+    if (opts.w >= 51 and opts.d >= 51) {
+        const arch_target: usize = @max(2, opts.w * opts.d / 16384);
+        var attempts: usize = 0;
+        while (landmarks.items.len < arch_target and attempts < 128) : (attempts += 1) {
+            const ax = rng.random().intRangeAtMost(usize, 10, opts.w - 40);
+            const az = rng.random().intRangeAtMost(usize, 10, opts.d - 40);
+            const span = heightSpan(heights, opts.d, ax, az, 29, 29);
+            // Lenient flatness: legs partially buried in a slope are
+            // fine, an arch split by a ridge is not.
+            if (span.max - span.min > 12) continue;
+            if (span.min + 34 > opts.h) continue; // lintel must not clip the world top
+            if (!farFromLandmarks(landmarks.items, ax, az, 36)) continue;
+            const along_x = rng.random().boolean();
+            try buildArch(&world, ax, span.min, az, along_x);
+            try landmarks.append(allocator, .{ .x = @intCast(ax), .y = @intCast(span.min), .z = @intCast(az) });
+        }
     }
 
     var spawn_x: usize = opts.w / 2;
     var spawn_z: usize = opts.d / 2;
-    attempts = 0;
+    var attempts: usize = 0;
     while (attempts < 128) : (attempts += 1) {
         const sx = rng.random().intRangeAtMost(usize, 6, opts.w - 12);
         const sz = rng.random().intRangeAtMost(usize, 6, opts.d - 12);
         const span = heightSpan(heights, opts.d, sx, sz, 6, 6);
         if (span.max - span.min > 2) continue;
-        if (!farFromLandmarks(landmarks.items, sx, sz, 10)) continue;
+        if (!farFromLandmarks(landmarks.items, sx, sz, 20)) continue;
         spawn_x = sx;
         spawn_z = sz;
         break;
@@ -183,7 +197,10 @@ pub fn generate(allocator: std.mem.Allocator, opts: gen.Options) !gen.Result {
         .world = world,
         .spawn = .{
             .x = @as(f32, @floatFromInt(spawn_x)) + 0.5,
-            .y = spawn_ground + 2.5,
+            // Feet rest on the surface voxel's top face; the eye rides
+            // 14 voxels up (the milestone-23 walking player's eye
+            // height). The min() clamp only binds in tiny test worlds.
+            .y = @min(spawn_ground + 15.0, hf - 1),
             .z = @as(f32, @floatFromInt(spawn_z)) + 0.5,
             .yaw = yaw,
         },
@@ -228,7 +245,7 @@ fn worldsEqual(a: *const World, b: *const World) bool {
     return true;
 }
 
-const test_opts: gen.Options = .{ .seed = 7, .w = 64, .h = 32, .d = 64 };
+const test_opts: gen.Options = .{ .seed = 7, .w = 64, .h = 96, .d = 64 };
 
 test "generation is deterministic per seed" {
     var r1 = try generate(std.testing.allocator, test_opts);
@@ -238,7 +255,7 @@ test "generation is deterministic per seed" {
     try std.testing.expect(worldsEqual(&r1.world, &r2.world));
     try std.testing.expectEqual(r1.spawn, r2.spawn);
 
-    var r3 = try generate(std.testing.allocator, .{ .seed = 8, .w = 64, .h = 32, .d = 64 });
+    var r3 = try generate(std.testing.allocator, .{ .seed = 8, .w = 64, .h = 96, .d = 64 });
     defer r3.deinit(std.testing.allocator);
     try std.testing.expect(!worldsEqual(&r1.world, &r3.world));
 }
@@ -261,8 +278,9 @@ test "caves and arches exist" {
     var underground_air: usize = 0;
     for (0..r.world.w) |x| {
         for (0..r.world.d) |z| {
+            const top: i32 = @intCast(r.world.columnAt(@intCast(x), @intCast(z)).?.top_solid_y);
             var y: i32 = 3;
-            while (y < 9) : (y += 1) {
+            while (y + 4 < top) : (y += 1) {
                 if (r.world.get(@intCast(x), y, @intCast(z)) == 0) underground_air += 1;
             }
         }
@@ -276,8 +294,35 @@ test "caves and arches exist" {
         // one of the +x / +z mid-beam probes is arch material. Probing the
         // opening instead is unreliable — terrain beside the arch can be
         // legitimately lower than the opening.
-        const x_beam = r.world.get(lm.x + 4, lm.y + 9, lm.z) == mat.arch;
-        const z_beam = r.world.get(lm.x, lm.y + 9, lm.z + 4) == mat.arch;
+        const x_beam = r.world.get(lm.x + 13, lm.y + 28, lm.z) == mat.arch;
+        const z_beam = r.world.get(lm.x, lm.y + 28, lm.z + 13) == mat.arch;
         try std.testing.expect(x_beam != z_beam);
     }
+}
+
+test "caves have player-height headroom" {
+    // w/d < 51 disables arches, so every long enclosed air streak is a
+    // cave. The milestone-23 walking player is 16 voxels tall.
+    var r = try generate(std.testing.allocator, .{ .seed = 7, .w = 48, .h = 96, .d = 48 });
+    defer r.deinit(std.testing.allocator);
+    var walkable: usize = 0;
+    for (0..r.world.w) |x| {
+        for (0..r.world.d) |z| {
+            const top: i32 = @intCast(r.world.columnAt(@intCast(x), @intCast(z)).?.top_solid_y);
+            var streak: i32 = 0;
+            var y: i32 = top - 5; // below the surface skin
+            while (y >= 2) : (y -= 1) {
+                if (r.world.get(@intCast(x), y, @intCast(z)) == 0) {
+                    streak += 1;
+                    if (streak >= 16) {
+                        walkable += 1;
+                        break;
+                    }
+                } else {
+                    streak = 0;
+                }
+            }
+        }
+    }
+    try std.testing.expect(walkable > 0);
 }

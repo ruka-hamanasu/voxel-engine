@@ -35,9 +35,9 @@ pub fn main(init: std.process.Init) !void {
         \\    --width <usize>   Render width (default 480).
         \\    --height <usize>  Render height (default 270).
         \\    --scale <u32>     Window scale factor vs render resolution (default 2).
-        \\    --world-w <usize> World width in columns (default 192).
-        \\    --world-h <usize> World height in voxels (default 64, max 65535).
-        \\    --world-d <usize> World depth in columns (default 192).
+        \\    --world-w <usize> World width in columns (default 384).
+        \\    --world-h <usize> World height in voxels (default 128, max 65535).
+        \\    --world-d <usize> World depth in columns (default 384).
         \\
     );
 
@@ -223,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
     var mouse_captured = true;
     var mouse_dx: f32 = 0;
     var place_mat: u8 = 9;
-    const pick_dist: f32 = 16.0;
+    const pick_dist: f32 = 32.0;
 
     const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
     var last_counter = c.SDL_GetPerformanceCounter();

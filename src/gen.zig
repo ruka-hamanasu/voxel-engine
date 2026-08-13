@@ -4,9 +4,9 @@ const Camera = @import("camera.zig").Camera;
 
 pub const Options = struct {
     seed: u64 = 1337,
-    w: usize = 192,
-    h: usize = 64,
-    d: usize = 192,
+    w: usize = 384,
+    h: usize = 128,
+    d: usize = 384,
 };
 
 pub const Landmark = struct {
