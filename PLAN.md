@@ -431,3 +431,35 @@ entries here record scope and outcome only.
      it needs reclaiming: per-column planar-only scale (drops the
      s(row) term, up to ~8% distance error on high rows of distant
      tall geometry).
+20. LOD value benchmark (see TODO.md DONE); not a code change.
+21. COMPLETED - Cache-efficiency investigation (both TODO items).
+     perf hardware counters (perf_event_paranoid lowered to 1) on
+     --bench loops across spawn/worst/aerial/cave at the default world
+     plus 768x1024x768 vista @ fogcut 448 (perf --delay skips the
+     ~51 s gen+flood): L1d miss rate <=0.3%, LLC traffic ~1-3k
+     loads/frame at both scales — the marched working set is
+     cache-resident (the LOD cascade keeps large-world marches inside
+     the small coarse worlds). IPC 3.3-4.35: the march is
+     ALU/branch-bound; branch misses (~112-147k/frame) cost more than
+     all cache traffic combined. Axis asymmetry confirmed (strided
+     X-march at yaw 0: 5.5x the L1 misses of the contiguous Z-march)
+     but <=5% of frame cycles even if fully serialized. A
+     software-prefetch probe (column two cells ahead) regressed 3-5%
+     — miss latency is not the bottleneck, so the deferred 8x8-tiled
+     column-storage lever is ruled out at these scales. Neighbor
+     access per detail cell (the TODO question): pcol is L1-hot from
+     the previous march iteration; X-side AO diagonals sit +/-64 B
+     from pcol in the columns[x*d+z] layout, Z-side diagonals are
+     row-pitch strided; light streams are per-column heap allocations
+     (pointer chase) but too cold to measure. Gbuffer analysis:
+     shading is already per-segment, so a per-pixel gbuffer is a
+     strict regression (more bytes/px, a second full-res pass,
+     per-pixel instead of per-segment shading; AO/light/sky only
+     exist during the march). Full span-record fusion needs a
+     row-sorted 16-cursor merge duplicating GradSrc's fixed-point
+     math to save an L1-local write+read. The viable remnant —
+     16-column strip rendering into a 34 KB L1 scratch with the
+     existing fillSpans + a strip-local transpose (eliminates the
+     2 MB fb L2 round-trip; est. 4-7% at 960x540, 1-2% at default
+     480x270) — was evaluated and deferred: not worth the complexity
+     while the frame is compute-bound.
