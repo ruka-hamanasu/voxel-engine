@@ -65,54 +65,81 @@ pub fn sampleLight(col: *const Column, y: i32) LightSample {
 
 const neighbor_offsets = .{ .{ 1, 0, 0, Dir.px }, .{ -1, 0, 0, Dir.nx }, .{ 0, 1, 0, Dir.py }, .{ 0, -1, 0, Dir.ny }, .{ 0, 0, 1, Dir.pz }, .{ 0, 0, -1, Dir.nz } };
 
-/// Dense per-voxel scratch over a bounded XZ box at full world height;
+/// Sparse per-voxel scratch over a bounded XZ box at full world height;
 /// the flood's working memory. floodAll covers the whole world, relight
-/// only the dirty region expanded by the maximum light reach. Cells the
-/// runs never lit decode as intensity 0 (the material-derived default).
+/// only the dirty region expanded by the maximum light reach. Only lit
+/// cells occupy memory (map value = intensity | color << 8 | dir << 16,
+/// key = world voxel index (x*wd + z)*h + y), so floodAll over a large
+/// world costs memory proportional to the lit volume, not the world
+/// volume. Cells absent from the map decode as intensity 0 (the
+/// material-derived default).
 const Scratch = struct {
     x0: usize,
     z0: usize,
     xd: usize,
     zd: usize,
-    h: usize,
-    intensity: []u8,
-    color: []u8,
-    dirs: []u8,
+    h: usize, // world height (key modulus)
+    wd: usize, // world depth (key stride)
+    map: std.AutoHashMap(u32, u32),
 
-    fn init(allocator: std.mem.Allocator, x0: usize, z0: usize, x1: usize, z1: usize, h: usize) !Scratch {
-        const n = (x1 - x0) * (z1 - z0) * h;
-        const intensity = try allocator.alloc(u8, n);
-        errdefer allocator.free(intensity);
-        @memset(intensity, 0);
-        const color = try allocator.alloc(u8, n);
-        errdefer allocator.free(color);
-        @memset(color, 0);
-        const dirs = try allocator.alloc(u8, n);
-        errdefer allocator.free(dirs);
-        @memset(dirs, @intFromEnum(Dir.none));
-        return .{ .x0 = x0, .z0 = z0, .xd = x1 - x0, .zd = z1 - z0, .h = h, .intensity = intensity, .color = color, .dirs = dirs };
+    fn init(allocator: std.mem.Allocator, x0: usize, z0: usize, x1: usize, z1: usize, world: *const World) Scratch {
+        return .{
+            .x0 = x0,
+            .z0 = z0,
+            .xd = x1 - x0,
+            .zd = z1 - z0,
+            .h = world.h,
+            .wd = world.d,
+            .map = std.AutoHashMap(u32, u32).init(allocator),
+        };
     }
 
-    fn deinit(self: *Scratch, allocator: std.mem.Allocator) void {
-        allocator.free(self.intensity);
-        allocator.free(self.color);
-        allocator.free(self.dirs);
+    fn deinit(self: *Scratch) void {
+        self.map.deinit();
     }
 
-    fn index(self: *const Scratch, x: usize, y: usize, z: usize) usize {
-        return ((x - self.x0) * self.zd + (z - self.z0)) * self.h + y;
+    fn pack(level: u8, color: u8, dir: u8) u32 {
+        return @as(u32, level) | @as(u32, color) << 8 | @as(u32, dir) << 16;
     }
 
-    fn coords(self: *const Scratch, vi: usize) struct { usize, usize, usize } {
-        const y = vi % self.h;
-        const cxz = vi / self.h;
-        return .{ cxz / self.zd + self.x0, y, cxz % self.zd + self.z0 };
+    fn index(self: *const Scratch, x: usize, y: usize, z: usize) u32 {
+        return @intCast((x * self.wd + z) * self.h + y);
+    }
+
+    fn coords(self: *const Scratch, vi: u32) struct { usize, usize, usize } {
+        const h: u32 = @intCast(self.h);
+        const wd: u32 = @intCast(self.wd);
+        const y = vi % h;
+        const cxz = vi / h;
+        return .{ cxz / wd, y, cxz % wd };
+    }
+
+    fn get(self: *const Scratch, vi: u32) LightSample {
+        const v = self.map.get(vi) orelse return .{};
+        return .{
+            .intensity = @truncate(v),
+            .color_id = @truncate(v >> 8),
+            .dir = @enumFromInt(@as(u8, @truncate(v >> 16))),
+        };
+    }
+
+    fn intensity(self: *const Scratch, vi: u32) u8 {
+        return @truncate(self.map.get(vi) orelse 0);
+    }
+
+    fn set(self: *Scratch, vi: u32, level: u8, color: u8, dir: u8) !void {
+        try self.map.put(vi, pack(level, color, dir));
+    }
+
+    fn clear(self: *Scratch, vi: u32) void {
+        _ = self.map.remove(vi);
     }
 };
 
 /// Load the footprint columns' light runs into the scratch (relight
-/// only; floodAll starts from a zeroed scratch).
-fn decodeColumns(world: *World, s: *Scratch) void {
+/// only; floodAll starts from an empty scratch). Zero-intensity
+/// interior runs are not inserted; the map's absence decodes as 0.
+fn decodeColumns(world: *World, s: *Scratch) !void {
     for (s.x0..s.x0 + s.xd) |x| {
         for (s.z0..s.z0 + s.zd) |z| {
             const col = &world.columns[x * world.d + z];
@@ -122,10 +149,8 @@ fn decodeColumns(world: *World, s: *Scratch) void {
                 var y = hi;
                 const lo = hi - @as(i32, run.count) + 1;
                 while (y >= lo) : (y -= 1) {
-                    const vi = s.index(x, @intCast(y), z);
-                    s.intensity[vi] = run.intensity;
-                    s.color[vi] = run.color_id;
-                    s.dirs[vi] = run.dir;
+                    if (run.intensity == 0) continue;
+                    try s.set(s.index(x, @intCast(y), z), run.intensity, run.color_id, run.dir);
                 }
                 hi = lo - 1;
             }
@@ -149,11 +174,9 @@ fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), alloc
                     while (yy >= lo) : (yy -= 1) {
                         if (yy < by0 or yy >= by1) continue;
                         const vi = s.index(x, @intCast(yy), z);
-                        if (params.seed_intensity > s.intensity[vi]) {
-                            s.intensity[vi] = params.seed_intensity;
-                            s.color[vi] = m;
-                            s.dirs[vi] = @intFromEnum(Dir.none);
-                            try queue.append(allocator, @intCast(vi));
+                        if (params.seed_intensity > s.intensity(vi)) {
+                            try s.set(vi, params.seed_intensity, m, @intFromEnum(Dir.none));
+                            try queue.append(allocator, vi);
                         }
                     }
                 }
@@ -171,8 +194,7 @@ fn propagate(world: *const World, s: *Scratch, queue: *std.ArrayList(u32), alloc
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const vi = queue.items[head];
-        const level = s.intensity[vi];
-        const cid = s.color[vi];
+        const cur = s.get(vi);
         const x, const y, const z = s.coords(vi);
         inline for (neighbor_offsets) |off| {
             const nx = @as(i64, @intCast(x)) + off[0];
@@ -185,12 +207,10 @@ fn propagate(world: *const World, s: *Scratch, queue: *std.ArrayList(u32), alloc
                 const nvi = s.index(ux, uy, uz);
                 const nm = world.get(@intCast(nx), @intCast(ny), @intCast(nz));
                 if (nm == 0) {
-                    const cand = level -| params.attenuation;
-                    if (cand > 0 and cand > s.intensity[nvi]) {
-                        s.intensity[nvi] = cand;
-                        s.color[nvi] = cid;
-                        s.dirs[nvi] = @intFromEnum(off[3]);
-                        try queue.append(allocator, @intCast(nvi));
+                    const cand = cur.intensity -| params.attenuation;
+                    if (cand > 0 and cand > s.intensity(nvi)) {
+                        try s.set(nvi, cand, cur.color_id, @intFromEnum(off[3]));
+                        try queue.append(allocator, nvi);
                     }
                 }
             }
@@ -212,29 +232,47 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
             col.light = null;
             col.light_base_y = 0;
             col.light_lo = 0;
-            var top: ?usize = null;
-            var bot: usize = 0;
-            for (0..s.h) |y| {
-                if (s.intensity[s.index(x, y, z)] != 0) {
-                    if (top == null) bot = y;
-                    top = y;
-                }
-            }
-            const hi_y = top orelse continue;
+        }
+    }
+    // Column y-extents of lit cells: value = lo | hi << 16.
+    var extents = std.AutoHashMap(u32, u32).init(allocator);
+    defer extents.deinit();
+    var it = s.map.iterator();
+    while (it.next()) |e| {
+        const y, const ci = blk: {
+            const h: u32 = @intCast(s.h);
+            break :blk .{ e.key_ptr.* % h, e.key_ptr.* / h };
+        };
+        const gop = try extents.getOrPut(ci);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = y | (y << 16);
+        } else {
+            const v = gop.value_ptr.*;
+            gop.value_ptr.* = @min(v & 0xffff, y) | (@max(v >> 16, y) << 16);
+        }
+    }
+    const h32: u32 = @intCast(s.h);
+    for (s.x0..s.x0 + s.xd) |x| {
+        for (s.z0..s.z0 + s.zd) |z| {
+            const ci: u32 = @intCast(x * world.d + z);
+            const ext = extents.get(ci) orelse continue;
+            const col = &world.columns[x * world.d + z];
+            const bot: u32 = ext & 0xffff;
+            const hi_y: u32 = ext >> 16;
             var runs: std.ArrayList(LightRun) = .empty;
             errdefer runs.deinit(allocator);
-            var y: usize = hi_y + 1;
+            var y: u32 = hi_y + 1;
             while (y > bot) {
                 y -= 1;
-                const vi = s.index(x, y, z);
+                const smp = s.get(ci * h32 + y);
                 if (runs.items.len > 0) {
                     const last = &runs.items[runs.items.len - 1];
-                    if (last.color_id == s.color[vi] and last.intensity == s.intensity[vi] and last.dir == s.dirs[vi] and last.count < 255) {
+                    if (last.color_id == smp.color_id and last.intensity == smp.intensity and last.dir == @intFromEnum(smp.dir) and last.count < 255) {
                         last.count += 1;
                         continue;
                     }
                 }
-                try runs.append(allocator, .{ .count = 1, .color_id = s.color[vi], .intensity = s.intensity[vi], .dir = s.dirs[vi] });
+                try runs.append(allocator, .{ .count = 1, .color_id = smp.color_id, .intensity = smp.intensity, .dir = @intFromEnum(smp.dir) });
             }
             const owned = try runs.toOwnedSlice(allocator);
             col.light = owned;
@@ -248,8 +286,8 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
 }
 
 pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !Stats {
-    var s = try Scratch.init(allocator, 0, 0, world.w, world.d, world.h);
-    defer s.deinit(allocator);
+    var s = Scratch.init(allocator, 0, 0, world.w, world.d, world);
+    defer s.deinit();
     var queue: std.ArrayList(u32) = .empty;
     defer queue.deinit(allocator);
     try seedEmissiveBox(world, &s, &queue, allocator, params, 0, 0, 0, world.w, world.h, world.d);
@@ -292,26 +330,26 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
     const x1 = @min(dirty.x1 + reach, world.w);
     const z1 = @min(dirty.z1 + reach, world.d);
 
-    var s = try Scratch.init(allocator, x0, z0, x1, z1, world.h);
-    defer s.deinit(allocator);
-    decodeColumns(world, &s);
+    var s = Scratch.init(allocator, x0, z0, x1, z1, world);
+    defer s.deinit();
+    try decodeColumns(world, &s);
 
     var reseeds: std.ArrayList(u32) = .empty;
     defer reseeds.deinit(allocator);
     var clear_q: std.ArrayList(u64) = .empty;
     defer clear_q.deinit(allocator);
 
-    const none: u8 = @intFromEnum(Dir.none);
     for (dirty.x0..dirty.x1) |x| {
         for (dirty.z0..dirty.z1) |z| {
             for (dirty.y0..dirty.y1) |y| {
                 const vi = s.index(x, y, z);
-                if (s.intensity[vi] == 0) continue;
+                const cur = s.get(vi);
+                if (cur.intensity == 0) continue;
                 const m = world.get(@intCast(x), @intCast(y), @intCast(z));
                 const is_seed = m != 0 and world_mod.palette[m].emissive != 0;
-                const was_seed = s.dirs[vi] == none;
+                const was_seed = cur.dir == .none;
                 const stale = if (is_seed)
-                    !(was_seed and s.color[vi] == m and s.intensity[vi] == params.seed_intensity)
+                    !(was_seed and cur.color_id == m and cur.intensity == params.seed_intensity)
                 else if (m != 0)
                     true
                 else
@@ -325,7 +363,7 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
     defer queue.deinit(allocator);
     try seedEmissiveBox(world, &s, &queue, allocator, params, dirty.x0, dirty.y0, dirty.z0, dirty.x1, dirty.y1, dirty.z1);
     for (reseeds.items) |vi| {
-        if (s.intensity[vi] != 0) try queue.append(allocator, vi);
+        if (s.intensity(vi) != 0) try queue.append(allocator, vi);
     }
     for (dirty.x0..dirty.x1) |x| {
         for (dirty.z0..dirty.z1) |z| {
@@ -336,7 +374,7 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
                     const nz = @as(i64, @intCast(z)) + off[2];
                     if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + s.xd and ny < s.h and nz < s.z0 + s.zd) {
                         const nvi = s.index(@intCast(nx), @intCast(ny), @intCast(nz));
-                        if (s.intensity[nvi] != 0) try queue.append(allocator, @intCast(nvi));
+                        if (s.intensity(nvi) != 0) try queue.append(allocator, nvi);
                     }
                 }
             }
@@ -350,18 +388,17 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
 /// (level << 32 | vi) because cells are zeroed on enqueue but their old
 /// level is still needed when popped to compute the next chain value.
 /// Non-matching lit neighbors are recorded as reflood candidates.
-fn clearChain(s: *Scratch, start: usize, params: Params, reseeds: *std.ArrayList(u32), q: *std.ArrayList(u64), allocator: std.mem.Allocator) !void {
-    const color0 = s.color[start];
-    const level0 = s.intensity[start];
-    s.intensity[start] = 0;
-    s.color[start] = 0;
-    s.dirs[start] = @intFromEnum(Dir.none);
+fn clearChain(s: *Scratch, start: u32, params: Params, reseeds: *std.ArrayList(u32), q: *std.ArrayList(u64), allocator: std.mem.Allocator) !void {
+    const first = s.get(start);
+    const color0 = first.color_id;
+    const level0 = first.intensity;
+    s.clear(start);
     q.clearRetainingCapacity();
     try q.append(allocator, (@as(u64, level0) << 32) | @as(u64, start));
     var head: usize = 0;
     while (head < q.items.len) : (head += 1) {
         const entry = q.items[head];
-        const vi: usize = @intCast(entry & 0xffffffff);
+        const vi: u32 = @intCast(entry & 0xffffffff);
         const level: u8 = @intCast(entry >> 32);
         const cand = level -| params.attenuation;
         if (cand == 0) continue;
@@ -372,14 +409,13 @@ fn clearChain(s: *Scratch, start: usize, params: Params, reseeds: *std.ArrayList
             const nz = @as(i64, @intCast(z)) + off[2];
             if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + s.xd and ny < s.h and nz < s.z0 + s.zd) {
                 const nvi = s.index(@intCast(nx), @intCast(ny), @intCast(nz));
-                if (s.intensity[nvi] != 0) {
-                    if (s.color[nvi] == color0 and s.intensity[nvi] == cand) {
-                        s.intensity[nvi] = 0;
-                        s.color[nvi] = 0;
-                        s.dirs[nvi] = @intFromEnum(Dir.none);
+                const n = s.get(nvi);
+                if (n.intensity != 0) {
+                    if (n.color_id == color0 and n.intensity == cand) {
+                        s.clear(nvi);
                         try q.append(allocator, (@as(u64, cand) << 32) | @as(u64, nvi));
                     } else {
-                        try reseeds.append(allocator, @intCast(nvi));
+                        try reseeds.append(allocator, nvi);
                     }
                 }
             }

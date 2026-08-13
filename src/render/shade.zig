@@ -117,9 +117,14 @@ pub fn rebuildShadeLut() void {
 /// variant: each material's color pre-collapses toward the shared fog
 /// color on a front-loaded curve, so distant hues die before the
 /// geometry fades, killing sub-pixel chromatic shimmer at 480x270.
-/// Emissive materials ride separate row rules: half density, fading
-/// toward a saturated version of their own color (volumetric neon
-/// haze; dormant until milestone 9 flips crystals 9-11).
+/// Emissive materials ride separate row rules: the destination lerps
+/// toward a saturated version of their own color on a half-density
+/// curve (volumetric neon haze) and THEN toward the fog color on the
+/// full-density curve, so the haze tints the mid-range but emissives
+/// still converge to the fog color at the cutoff like everything
+/// else (the unblended haze read as too bright through fog).
+/// fogStopV interpolates between adjacent buckets — plain truncation
+/// left visible bands at the bucket boundaries while moving.
 pub const fog_buckets = 64;
 
 var fog_factor: [fog_buckets]f32 = undefined;
@@ -183,7 +188,8 @@ pub fn buildFogLuts(params: RenderParams) void {
             }
             for (0..fog_buckets) |b| {
                 const t = (@as(f32, @floatFromInt(b)) + 0.5) * params.fog_cutoff / buckets_f;
-                fog_dest[m][b] = lerpColor(entry.rgb, sat, fogCurve(params.fog_density * 0.5, t, params.fog_cutoff));
+                const haze = lerpColor(entry.rgb, sat, fogCurve(params.fog_density * 0.5, t, params.fog_cutoff));
+                fog_dest[m][b] = lerpColor(haze, params.fog_color, fogCurve(params.fog_density, t, params.fog_cutoff));
             }
         } else {
             for (0..fog_buckets) |b| {
@@ -233,13 +239,31 @@ pub fn applyGlow(c: u32, light: lighting.LightSample) u32 {
     return packRgb(applyGlowV(unpackRgb(c), light));
 }
 
-/// Fog one shaded stop: bucket the distance, lerp toward the material's
-/// (pre-collapsed) fog destination. Per-stop so the gradient fill
-/// lerps between fogged endpoints.
+/// Fog both stops of a segment: bucket the distances, lerp toward the
+/// material's (pre-collapsed) fog destination. Per-stop so the
+/// gradient fill lerps between fogged endpoints. LUT entries sit at
+/// bucket centers, so both the factor and the destination interpolate
+/// between the two straddling buckets; the index math runs 2-wide.
+pub fn fogStopsV(mat: u8, ts: [2]f32, cs: [2]V4, params: RenderParams) [2]V4 {
+    const V2 = @Vector(2, f32);
+    const buckets_f: f32 = @floatFromInt(fog_buckets);
+    const u = @min(@max(@as(V2, ts) * @as(V2, @splat(buckets_f / params.fog_cutoff)) - @as(V2, @splat(0.5)), @as(V2, @splat(0.0))), @as(V2, @splat(buckets_f - 1)));
+    const b0v: @Vector(2, u32) = @intFromFloat(u);
+    const fr = u - @as(V2, @floatFromInt(b0v));
+    var out: [2]V4 = undefined;
+    inline for (0..2) |i| {
+        const b0: usize = b0v[i];
+        const b1: usize = @min(b0 + 1, fog_buckets - 1);
+        const factor = fog_factor[b0] + (fog_factor[b1] - fog_factor[b0]) * fr[i];
+        const dest = fog_dest_v4[mat][b0] + (fog_dest_v4[mat][b1] - fog_dest_v4[mat][b0]) * @as(V4, @splat(fr[i]));
+        out[i] = lerpColorV(cs[i], dest, factor);
+    }
+    return out;
+}
+
+/// Fog one shaded stop (scalar wrapper around fogStopsV).
 pub fn fogStopV(mat: u8, t: f32, c: V4, params: RenderParams) V4 {
-    const scale = @as(f32, @floatFromInt(fog_buckets)) / params.fog_cutoff;
-    const b: usize = @intFromFloat(std.math.clamp(t * scale, 0.0, @as(f32, @floatFromInt(fog_buckets - 1))));
-    return lerpColorV(c, fog_dest_v4[mat][b], fog_factor[b]);
+    return fogStopsV(mat, .{ t, t }, .{ c, c }, params)[0];
 }
 
 pub fn fogStop(mat: u8, t: f32, c: u32, params: RenderParams) u32 {
@@ -279,7 +303,7 @@ test "fog lut is monotonic and saturates at the cutoff" {
     try std.testing.expect(@abs(@as(i32, @intCast((near >> 16) & 0xff)) - 0x8c) <= 4);
 }
 
-test "emissive materials fade slower and toward their own color" {
+test "emissive materials fade slower but converge to the fog color" {
     const params: RenderParams = .{};
     defer buildFogLuts(params);
     const saved = world_mod.palette[9];
@@ -290,8 +314,16 @@ test "emissive materials fade slower and toward their own color" {
     // A normal material at the same distance is nearly all fog color...
     const normal = fog_dest[1][mid];
     try std.testing.expect(@abs(@as(i32, @intCast((normal >> 8) & 0xff)) - 0xa6) <= 8);
-    // ...while the emissive crystal keeps its saturated cyan hue.
+    // ...while the emissive crystal still tints the haze cyan...
     const glow = fog_dest[9][mid];
-    try std.testing.expect((glow >> 8) & 0xff > 200);
-    try std.testing.expect(glow & 0xff > 200);
+    try std.testing.expect((glow >> 8) & 0xff > 0xa6 + 10);
+    try std.testing.expect(glow & 0xff > 0xd2 + 5);
+    // ...but converges to the fog color at the cutoff.
+    const far = fog_dest[9][fog_buckets - 1];
+    inline for (0..3) |k| {
+        const sh: u5 = @intCast((2 - k) * 8);
+        const got: i32 = @intCast((far >> sh) & 0xff);
+        const want: i32 = @intCast((params.fog_color >> sh) & 0xff);
+        try std.testing.expect(@abs(got - want) <= 2);
+    }
 }

@@ -12,6 +12,9 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 - **UI:** Nuklear
 - **CLI:** zig-clap (0.12.0) for option parsing and `--help` text. Lighting
   and animation are on by default; `--no-light`/`--no-anim` disable them.
+  `--world-w`/`--world-h`/`--world-d` set the world size (h <= 65535;
+  total volume must stay under 2^32 voxels for the flood's u32 cell
+  keys).
 - **Headless mode:** `--headless` flag renders frames to PPM files so the
   renderer is verifiable without a display.
 
@@ -20,6 +23,8 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 - Voxel size: Configurable, probably ~10cm
 - World height: Configurable
 - Demo world extent: bounded, fully resident (streaming deferred).
+  Tested to 768x1024x768 (~50 MB resident columns across all LOD
+  levels; the flood's scratch is sparse, milestone 17).
 - Internal render resolution: Configurable
 
 ## Storage
@@ -48,7 +53,9 @@ Columns are 64 B (one cache line) and 64-aligned: material run streams of
 march — which touches mostly cold columns — never chases a runs pointer.
 `light_lo` caches the light stream's coverage bottom (written by
 `encodeColumns`), and `solid_mask` (h <= 64 worlds) answers solidity
-queries as a bit test for AO neighbor sampling.
+queries as a bit test for AO neighbor sampling; taller worlds fall
+back to run scans there. The 8x8 `macro_max` grid is u16 (milestone
+16), so the skip works at any height.
 
 Columns are the *logical* unit; they may be grouped (e.g. 8x8) purely as an
 allocation/container detail for cache locality if profiling warrants it. The same groups can later host a per-macro-cell `[min_solid_y, max_solid_y]`
@@ -102,11 +109,17 @@ Palette: `palette_id -> RGB + emissive flag/intensity`. Untextured flat colors.
     (side1, side2, corner). Faces project to vertical screen spans, so AO is
     a cheap vertical 2-stop gradient per span.
   - **Fog:** exponential distance fog applied last, via the 2D fog LUT;
-    doubles as darkness falloff at range. Two variants ride the same LUT:
-    - **Emissive fog curve:** emissive voxels fade slower and toward a
-      saturated version of their own color instead of the fog color,
-      faking volumetric neon haze (separate LUT row; distance + material
-      only, never view-dependent).
+    doubles as darkness falloff at range. The LUT distance is the true
+    radial 3D distance per segment stop — `SegmentSink.emit` rescales
+    the XZ view-plane march parameter by `sqrt(dxz2 + s(row)^2)`
+    (`FogRay`, LOD-invariant since t is march-scale invariant), so fog
+    is stable under pure rotation. Lookups interpolate between the
+    bucket-center entries (no quantization bands). Two variants ride
+    the same LUT:
+    - **Emissive fog curve:** emissive voxels fade slower toward a
+      saturated version of their own color (volumetric neon haze),
+      which then converges to the fog color on the full-density
+      curve so distant emissives don't stay bright through fog.
     - **Low-pass palette fog:** distant colors pre-collapse toward a
       shared macro-color, killing sub-pixel shimmer at 480x270 for free.
   - **Fog glow (rejected, milestone 13):** a per-column fog-glow color
@@ -367,4 +380,54 @@ entries here record scope and outcome only.
     worst / aerial / worst@fogcut160) 6.29/6.44/2.37/6.39 ->
     6.01/4.62/1.72/4.57. Regression gates: --detail 0 --lod 48 and
     --detail 0 --lod 0 byte-identical over the 37+37+4 sweep;
-    default-mode baselines regenerated.
+     default-mode baselines regenerated.
+16. COMPLETED - Large-world plumbing. `--world-w`/`--world-h`/`--world-d`
+     CLI (h <= 65535
+     via the u16 y caches; volume < 2^32 for the flood's u32 cell keys,
+     asserted in World.init). macro_max u8 -> u16 lifts the skip grid's
+     h <= 256 gate; solid_mask keeps its h <= 64 gate (tall worlds take
+     the run-scan AO path). Terrain scales with h (base 0.30h, amp
+     0.16h), so 768x1024x768 mountains reach ~470. Regression: both
+     view sweeps byte-identical to pre-change.
+17. COMPLETED - Sparse lighting scratch. The flood's working memory was
+     3 B/voxel dense over the box (1.8 GB at 768x1024x768); it is now
+     an AutoHashMap(u32 -> packed intensity|color|dir) over lit cells
+     only, so floodAll memory tracks the lit volume, not the world.
+     encodeColumns derives per-column y-extents from the map instead of
+     scanning full height. Default-world output byte-identical;
+     768x1024x768 gen + LOD build + three floods ~51 s (Debug-speed
+     hash ops; parallel gen/flood is a deferred lever).
+18. COMPLETED - LOD cascade + long draw distance. renderColumn
+     generalizes the single fine->coarse handoff to a chain: fine ->
+     1/2-res (--lod) -> 1/4-res (--lod2, default 0 = off), each coarse
+     march's boundary cell shading from the world one level finer (the
+     existing 2x boundary math composes unchanged). lodBoundary takes
+     the level scale. max_dist 256 -> 512. Fog kept at density 0.025
+     (the curve normalizes to the cutoff, so the mid-range barely moves)
+     and 64 buckets (no banding observed at 448). At 768x1024x768 with
+     --fogcut 448 --lod 96 --lod2 192: vista 1.83 ms vs 3.65 ms
+     single-LOD (480x270); LOD2 diffs vs single LOD confined to fogged
+     ridgeline silhouettes (1.3% of pixels). Both regression sweeps
+     byte-identical with --lod2 off; default-world bench neutral.
+     Deferred levers: f64 DDA t_max past ~1000 steps; per-macro min_y
+     for long shallow rays; fog_buckets 128 if banding appears.
+19. COMPLETED - Fog fixes (the three TODO known issues). True radial
+     fog distance: SegmentSink.emit rescales the XZ view-plane t per
+     stop by sqrt(dxz2 + s(row)^2) (FogRay threaded through MarchCfg;
+     valid for the coarse marches unchanged since t is march-scale
+     invariant) — fog bands no longer shift under pure rotation. Fog
+     LUT lookups interpolate between adjacent bucket-center entries
+     (fogStopV -> fogStopsV, supersedes the fog_buckets 128 lever),
+     killing the banding while moving. Emissive fog destination now
+     lerps the half-density haze toward the fog color on the
+     full-density curve, so emissives converge at the cutoff instead
+     of staying bright through fog. Regression: identity path
+     byte-identical over both 37+37+4 sweeps; default-mode baselines
+     regenerated (views_m19[/tmp/opencode]). Bench A/B (this machine,
+     960x540, ms/frame, before -> after): spawn 3.25 -> 3.35, worst
+     view 2.64 -> 2.96, aerial 0.83 -> 0.90, worst@fogcut160
+     2.70 -> 3.10 — the cost is the per-stop LUT interpolation,
+     concentrated in march-bound synthetic views. Deferred lever if
+     it needs reclaiming: per-column planar-only scale (drops the
+     s(row) term, up to ~8% distance error on high rows of distant
+     tall geometry).

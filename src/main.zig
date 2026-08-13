@@ -26,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
         \\    --lod <f32>       LOD switch distance (default 64; 0 disables the coarse world).
+        \\    --lod2 <f32>      Second LOD switch distance, quarter-resolution world (default 0 = disabled).
         \\    --detail <f32>    Per-voxel shading detail distance (default 48; 0 = full detail everywhere).
         \\    --atten <u8>      Light attenuation.
         \\    --no-light        Disable lighting.
@@ -34,6 +35,9 @@ pub fn main(init: std.process.Init) !void {
         \\    --width <usize>   Render width (default 480).
         \\    --height <usize>  Render height (default 270).
         \\    --scale <u32>     Window scale factor vs render resolution (default 2).
+        \\    --world-w <usize> World width in columns (default 192).
+        \\    --world-h <usize> World height in voxels (default 64, max 65535).
+        \\    --world-d <usize> World depth in columns (default 192).
         \\
     );
 
@@ -74,6 +78,11 @@ pub fn main(init: std.process.Init) !void {
         cam_override = vals;
     }
     if (res.args.seed) |seed| opts.seed = seed;
+    if (res.args.@"world-w") |w| opts.w = w;
+    if (res.args.@"world-h") |h| opts.h = h;
+    if (res.args.@"world-d") |d| opts.d = d;
+    if (opts.w == 0 or opts.h == 0 or opts.d == 0 or opts.h > 65535)
+        return error.BadWorldSize;
     const generator = res.args.gen orelse .terrain;
     const headless_path = res.args.headless;
     const bench_frames = res.args.bench orelse 0;
@@ -109,13 +118,21 @@ pub fn main(init: std.process.Init) !void {
     if (res.args.fog) |d| rparams.fog_density = d;
     if (res.args.fogcut) |co| rparams.fog_cutoff = co;
     if (res.args.lod) |ld| rparams.lod_dist = ld;
+    if (res.args.lod2) |ld2| rparams.lod2_dist = ld2;
     if (res.args.detail) |dd| rparams.detail_dist = dd;
 
-    // Half-resolution far-field world (milestone 16): built once here,
-    // incrementally rebuilt from dirty regions on edits.
+    // Half-resolution far-field world (milestone 14 follow-up): built
+    // once here, incrementally rebuilt from dirty regions on edits. The
+    // quarter-resolution level-2 world (--lod2) builds from level 1.
     var lod_world: ?World = if (rparams.lod_dist > 0) try lod_mod.build(allocator, world) else null;
     defer if (lod_world) |*lw| lw.deinit();
     const lod: ?*const World = if (lod_world) |*lw| lw else null;
+    var lod2_world: ?World = if (rparams.lod2_dist > rparams.lod_dist)
+        if (lod_world) |*lw| try lod_mod.build(allocator, lw) else null
+    else
+        null;
+    defer if (lod2_world) |*lw| lw.deinit();
+    const lod2: ?*const World = if (lod2_world) |*lw| lw else null;
 
     var flood_stats: lighting.Stats = .{};
     var flood_ms: f64 = 0;
@@ -124,6 +141,7 @@ pub fn main(init: std.process.Init) !void {
         flood_stats = try lighting.floodAll(world, allocator, light_params);
         flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
         if (lod_world) |*lw| _ = try lighting.floodAll(lw, allocator, light_params);
+        if (lod2_world) |*lw| _ = try lighting.floodAll(lw, allocator, light_params);
     }
     // Generation's dirty extents are fully covered by the initial flood.
     _ = world.takeDirty();
@@ -136,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..bench_frames) |_| {
-            render.render(framebuffer, render_w, render_h, world, lod, cam, rparams);
+            render.render(framebuffer, render_w, render_h, world, lod, lod2, cam, rparams);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -148,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
         std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
-        render.render(framebuffer, render_w, render_h, world, lod, cam, rparams);
+        render.render(framebuffer, render_w, render_h, world, lod, lod2, cam, rparams);
         render.transpose(staging, framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, staging, render_w, render_h);
         return;
@@ -299,6 +317,13 @@ pub fn main(init: std.process.Init) !void {
                 if (light_enabled) {
                     _ = try lighting.relight(lw, allocator, lod_mod.coarseRegion(lw, r), light_params);
                 }
+                if (lod2_world) |*lw2| {
+                    const r1 = lod_mod.coarseRegion(lw, r);
+                    try lod_mod.rebuildRegion(allocator, lw, lw2, r1);
+                    if (light_enabled) {
+                        _ = try lighting.relight(lw2, allocator, lod_mod.coarseRegion(lw2, r1), light_params);
+                    }
+                }
             }
             if (light_enabled) {
                 const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
@@ -313,7 +338,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         rparams.time_s = time_s;
-        render.render(framebuffer, render_w, render_h, world, lod, cam, rparams);
+        render.render(framebuffer, render_w, render_h, world, lod, lod2, cam, rparams);
         render.transpose(staging, framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, staging.ptr, @intCast(render_w * 4)) != 0) {

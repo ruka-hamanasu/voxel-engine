@@ -184,8 +184,9 @@ pub const World = struct {
     /// 8x8-column groups: max top_solid_y of the group (0 when empty),
     /// maintained by setRange/setColumnRuns. Lets the march skip cells
     /// whose height window is entirely above everything solid in the
-    /// group without loading any Column. Valid when h <= 256.
-    macro_max: []u8,
+    /// group without loading any Column. Valid when h fits the u16
+    /// top_solid_y cache (h <= 65535), i.e. always.
+    macro_max: []u16,
     macro_w: usize, // ceil(w/8)
     macro_ok: bool,
     /// Bounding box (half-open) of everything touched by set/fillBox
@@ -230,6 +231,9 @@ pub const World = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, w: usize, h: usize, d: usize) !World {
+        // lighting.zig's sparse scratch keys cells by a u32 voxel index.
+        std.debug.assert(@as(u64, w) * d * h < std.math.maxInt(u32));
+        std.debug.assert(h <= std.math.maxInt(u16)); // u16 y caches
         const macro_w = (w + 7) / 8;
         const macro_d = (d + 7) / 8;
         var world: World = .{
@@ -239,9 +243,9 @@ pub const World = struct {
             .columns = try allocator.alignedAlloc(Column, .@"64", w * d),
             .allocator = allocator,
             .masks_ok = h <= 64,
-            .macro_max = try allocator.alloc(u8, macro_w * macro_d),
+            .macro_max = try allocator.alloc(u16, macro_w * macro_d),
             .macro_w = macro_w,
-            .macro_ok = h <= 256,
+            .macro_ok = h <= std.math.maxInt(u16),
         };
         @memset(world.macro_max, 0);
         errdefer allocator.free(world.macro_max);
@@ -290,7 +294,7 @@ pub const World = struct {
     /// Max solid y of the 8x8 group holding (x, z); null out of the
     /// world (all air: the march may always skip such cells).
     /// Meaningful only when macro_ok.
-    pub fn macroMax(self: *const World, x: i32, z: i32) ?u8 {
+    pub fn macroMax(self: *const World, x: i32, z: i32) ?u16 {
         if (x < 0 or z < 0) return null;
         const mx: usize = @intCast(x >> 3);
         const mz: usize = @intCast(z >> 3);
