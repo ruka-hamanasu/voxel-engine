@@ -527,3 +527,29 @@ entries here record scope and outcome only.
      raise for 100-200m+ draws, then terrain feature scale; chunked
      streaming only if still needed after those — streaming alone
      doesn't extend draw distance (the LOD cascade is the prerequisite).
+25. COMPLETED - N-level LOD cascade. renderColumn's hardcoded
+     fine->lod1->lod2 chain generalizes to a chain of up to max_lods (8)
+     coarse levels, each at 1/2^i resolution: lod_dists[] replaces
+     lod_dist/lod2_dist (defaults {96, 192} — the default chain is
+     unchanged), lodChain lays out a ray's handoffs (first non-
+     increasing distance or a missing world ends the chain), and the
+     march loops over levels with per-range scale/fine/detail selection
+     — the same math the 3-march chain unrolled, so default output is
+     bit-identical (def views byte-identical to views_m24 with no flag
+     pinning; l0f0/lod0 gates unchanged). main builds/floods/rebuilds
+     the world chain in loops; --lod/--lod2 keep their meaning, new
+     --lods N extends the chain by doubling the last handoff. max_dist
+     512 -> 16384 (per-range DDA steps stay bounded at any depth, so
+     f32 t suffices; f64 t_max remains the deferred lever). Bench
+     (480x270, ms/frame): default world neutral (spawn 5.43 -> 5.43).
+     768x1024x768 vista: fogcut 448 -> 4096 costs ~nothing at ground
+     level (1.41 -> 1.39; rays exit the 768-wide world or hit terrain
+     long before the cutoff). 2048x512x2048 at fogcut 2048, where
+     geometry fills the far field: --lods 1 (single coarse level) 30.1,
+     --lods 2 17.8, --lods 5 9.7 — the deep cascade pays 3.1x over
+     single-LOD. lods-5 vs lods-1 diffs: 4% of pixels, all in fogged
+     silhouettes. Note: at density 0.025 everything past ~400 is
+     silhouette-only regardless of cutoff; a lower --fog carries color
+     farther on big worlds (tuning lever, not changed). Deferred:
+     terrain feature scale (hill height & flat areas); chunked
+     streaming only if km-scale is still wanted after that.

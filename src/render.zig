@@ -13,10 +13,15 @@ const Face = shade.Face;
 const OFace = shade.OFace;
 
 pub const hfov: f32 = std.math.pi / 2.0;
-/// March hard cap. The fine world only ever marches to lod_dist; the
-/// coarse (LOD) worlds absorb everything past it, so this sits above
-/// the default fog cutoff with headroom for longer draws.
-pub const max_dist: f32 = 512.0;
+/// March hard cap. The fine world only ever marches to lod_dists[0];
+/// the coarse (LOD) worlds absorb everything past it, so this sits far
+/// above the default fog cutoff with headroom for long draws.
+pub const max_dist: f32 = 16384.0;
+/// Coarse LOD levels supported per render (level i marches at 1/2^i
+/// resolution). Per-range DDA steps stay bounded at any depth — the
+/// range length doubles while the cell size does — so f32 t suffices;
+/// f64 t_max is the deferred lever if ranges ever exceed ~1000 steps.
+pub const max_lods = 8;
 /// Start offset for the coarse march: lodBoundary returns a distance
 /// sitting exactly on a coarse-cell plane, where rounding could floor
 /// the DDA's start position into the upstream cell; an epsilon step
@@ -35,18 +40,14 @@ pub const RenderParams = struct {
     /// the flood-filled light runs; runtime toggle for the L hotkey.
     light: bool = true,
     time_s: f64 = 0.0,
-    /// Fine/coarse march handoff distance. The handoff snaps to the
-    /// entry of the first coarse cell whose center is past it
-    /// (lodBoundary), and the ray continues in the half-resolution LOD
-    /// world (91% fogged at the default 96, so the silhouette
-    /// overestimate stays hidden). No effect when render's lod is
-    /// null.
-    lod_dist: f32 = 96.0,
-    /// Second LOD handoff: past it the ray continues in the
-    /// quarter-resolution world (level 2, built from the level-1
-    /// world). 0 disables the third march range; must exceed lod_dist
-    /// when set.
-    lod2_dist: f32 = 192.0,
+    /// March handoff distances into each coarse LOD level: past
+    /// lod_dists[i] (snapped to a coarse-cell entry by lodBoundary,
+    /// keeping each coarse voxel whole) the ray continues in the
+    /// 1/2^(i+1)-resolution world (91% fogged at the default 96, so the
+    /// silhouette overestimate stays hidden). Must be increasing; the
+    /// first non-increasing entry (0 = disabled) ends the chain, as
+    /// does running out of worlds passed to render.
+    lod_dists: [max_lods]f32 = .{ 96.0, 192.0 } ++ .{0.0} ** (max_lods - 2),
     /// Distance past which per-voxel shading detail (AO neighbor
     /// sampling, the colored-light zipper and glow) is dropped: cells
     /// beyond it shade with max AO and no light, collapsing each
@@ -166,6 +167,25 @@ fn lodBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, lod_dist: f32, limit: f
     return std.math.clamp(t_switch + t_enter, 0.0, limit);
 }
 
+/// LOD chain layout for one ray: handoff distances t_b[1..n] into
+/// coarse levels 1..n (t_b[0] = 0; level i marches lods[i-1]). The
+/// chain ends at the first non-increasing distance (0 = disabled) or
+/// when no world is passed for the level.
+fn lodChain(params: RenderParams, n_worlds: usize, cam_x: f32, cam_z: f32, dx: f32, dz: f32, limit: f32, t_b: *[max_lods + 1]f32) usize {
+    t_b[0] = 0.0;
+    var n: usize = 0;
+    var prev_d: f32 = 0.0;
+    var scale: f32 = 1.0;
+    for (params.lod_dists) |d| {
+        if (d <= prev_d or n >= n_worlds) break;
+        scale *= 0.5;
+        n += 1;
+        t_b[n] = lodBoundary(cam_x, cam_z, dx, dz, d, limit, scale);
+        prev_d = d;
+    }
+    return n;
+}
+
 /// Simple-mode split distance, snapped to the entry of the fine DDA
 /// cell containing detail_dist so each cell renders wholly in one
 /// mode. Unlike lodBoundary no center-distance walk is needed: the
@@ -176,7 +196,7 @@ fn detailBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, detail_dist: f32) f3
     return @max(detail_dist + t_enter, 0.0);
 }
 
-pub fn render(fb: []u32, width: usize, height: usize, world: *const World, lod: ?*const World, lod2: ?*const World, cam: Camera, params: RenderParams) void {
+pub fn render(fb: []u32, width: usize, height: usize, world: *const World, lods: []const *const World, cam: Camera, params: RenderParams) void {
     std.debug.assert(height <= shade.max_sky_height);
     const fog_on = params.fog_density > 0;
     if (fog_on) shade.buildFogLuts(params);
@@ -210,7 +230,7 @@ pub fn render(fb: []u32, width: usize, height: usize, world: *const World, lod: 
         const hx = (@as(f32, @floatFromInt(sx)) + 0.5 - wf * 0.5) / f;
         const dx = fwd[0] + rgt[0] * hx;
         const dz = fwd[1] + rgt[1] * hx;
-        renderColumn(fb, height, world, lod, lod2, cam, f, s_max, sx, dx, dz, sky, params);
+        renderColumn(fb, height, world, lods, cam, f, s_max, sx, dx, dz, sky, params);
     }
 }
 
@@ -241,7 +261,7 @@ const MarchCfg = struct {
     fog: FogRay,
 };
 
-fn renderColumn(fb: []u32, height: usize, world: *const World, lod: ?*const World, lod2: ?*const World, cam: Camera, f: f32, s_max: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
+fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *const World, cam: Camera, f: f32, s_max: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
     var free = SpanList.initFull(@intCast(height));
 
     // March no farther than the fog cutoff: every later hit is fully
@@ -260,31 +280,26 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lod: ?*const Worl
         detailBoundary(cam.x, cam.z, dx, dz, params.detail_dist)
     else
         limit;
-    if (lod) |lw| {
-        const t_b1 = lodBoundary(cam.x, cam.z, dx, dz, params.lod_dist, limit, 0.5);
-        marchFine(fb, height, sx, cfg, t_detail, t_b1, &free, params);
-        if (t_b1 < limit and !free.isEmpty()) {
-            const cfg1: MarchCfg = .{ .world = lw, .fine = world, .cam_x = cam.x * 0.5, .cam_y = cam.y * 0.5, .cam_z = cam.z * 0.5, .f = f * 2.0, .s_max = s_max * 0.5, .dx = dx * 0.5, .dz = dz * 0.5, .fog = fog_ray };
-            const lw2: ?*const World = if (params.lod2_dist > params.lod_dist) lod2 else null;
-            const t_b2 = if (lw2 != null) lodBoundary(cam.x, cam.z, dx, dz, params.lod2_dist, limit, 0.25) else limit;
-            if (t_b1 >= t_detail) {
-                marchRange(fb, height, sx, cfg1, t_b1 + lod_eps, t_b2, &free, params, true, false);
+    var t_b: [max_lods + 1]f32 = undefined;
+    const n = lodChain(params, lods.len, cam.x, cam.z, dx, dz, limit, &t_b);
+    if (n == 0) {
+        marchFine(fb, height, sx, cfg, t_detail, limit, &free, params);
+    } else {
+        marchFine(fb, height, sx, cfg, t_detail, t_b[1], &free, params);
+        var i: usize = 1;
+        var scale: f32 = 0.5;
+        while (i <= n and t_b[i] < limit and !free.isEmpty()) : ({
+            i += 1;
+            scale *= 0.5;
+        }) {
+            const cfg_i: MarchCfg = .{ .world = lods[i - 1], .fine = if (i == 1) world else lods[i - 2], .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
+            const t_end = if (i < n) t_b[i + 1] else limit;
+            if (t_b[i] >= t_detail) {
+                marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, false);
             } else {
-                marchRange(fb, height, sx, cfg1, t_b1 + lod_eps, t_b2, &free, params, true, true);
-            }
-            if (lw2) |w2| {
-                if (t_b2 < limit and !free.isEmpty()) {
-                    const cfg2: MarchCfg = .{ .world = w2, .fine = lw, .cam_x = cam.x * 0.25, .cam_y = cam.y * 0.25, .cam_z = cam.z * 0.25, .f = f * 4.0, .s_max = s_max * 0.25, .dx = dx * 0.25, .dz = dz * 0.25, .fog = fog_ray };
-                    if (t_b2 >= t_detail) {
-                        marchRange(fb, height, sx, cfg2, t_b2 + lod_eps, limit, &free, params, true, false);
-                    } else {
-                        marchRange(fb, height, sx, cfg2, t_b2 + lod_eps, limit, &free, params, true, true);
-                    }
-                }
+                marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, true);
             }
         }
-    } else {
-        marchFine(fb, height, sx, cfg, t_detail, limit, &free, params);
     }
 
     spans.fillSpans(fb, height, sx, &free, 0, @floatFromInt(height), spans.SkySrc{ .sky = sky });
@@ -1034,6 +1049,30 @@ test "lodBoundary snaps the handoff to the first center-past coarse cell" {
     // with an exact-integer start both stay exact.
     try std.testing.expectApproxEqAbs(@as(f32, 48.0), lodBoundary(4.0, 10.0, 0.0, 1.0, 48.0, 96.0, 0.5), 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 48.0), lodBoundary(100.0, 10.5, -1.0, 0.0, 48.0, 96.0, 0.5), 1e-3);
+}
+
+test "lodChain ends at non-increasing distances, missing worlds, and the limit" {
+    var t_b: [max_lods + 1]f32 = undefined;
+    // Default chain with worlds present: two handoffs snapped near
+    // the requested distances (within one coarse cell each).
+    const n = lodChain(.{}, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectApproxEqAbs(@as(f32, 96.0), t_b[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 192.0), t_b[2], 4.0);
+    try std.testing.expect(t_b[1] < t_b[2]);
+    // A 0 entry ends the chain (the --lod2 0 form).
+    const n1 = lodChain(.{ .lod_dists = .{ 96.0, 0.0 } ++ .{0.0} ** (max_lods - 2) }, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);
+    try std.testing.expectEqual(@as(usize, 1), n1);
+    // Non-increasing entries end it too.
+    const n2 = lodChain(.{ .lod_dists = .{ 192.0, 96.0 } ++ .{0.0} ** (max_lods - 2) }, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);
+    try std.testing.expectEqual(@as(usize, 1), n2);
+    // Running out of worlds ends it even with positive distances.
+    try std.testing.expectEqual(@as(usize, 0), lodChain(.{}, 0, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b));
+    try std.testing.expectEqual(@as(usize, 1), lodChain(.{}, 1, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b));
+    // A distance past the march limit clamps the handoff to the limit.
+    const n3 = lodChain(.{ .lod_dists = .{ 96.0, 100000.0 } ++ .{0.0} ** (max_lods - 2) }, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);
+    try std.testing.expectEqual(@as(usize, 2), n3);
+    try std.testing.expectEqual(@as(f32, 448.0), t_b[2]);
 }
 
 test "boundary cell back faces are never culled but take neighbor AO" {

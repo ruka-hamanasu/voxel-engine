@@ -26,8 +26,9 @@ pub fn main(init: std.process.Init) !void {
         \\    --bench <u32>     Render N frames and report ms/frame.
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
-        \\    --lod <f32>       LOD switch distance (default 96; 0 disables the coarse world).
-        \\    --lod2 <f32>      Second LOD switch distance, quarter-resolution world (default 192; 0 disables).
+        \\    --lod <f32>       First LOD switch distance (default 96; 0 disables the coarse worlds).
+        \\    --lod2 <f32>      Second LOD switch distance (default 192; 0 ends the chain there).
+        \\    --lods <u32>      Coarse LOD levels (default: the positive --lod/--lod2 entries); handoffs past --lod2 double.
         \\    --detail <f32>    Per-voxel shading detail distance (default 48; 0 = full detail everywhere).
         \\    --atten <u8>      Light attenuation.
         \\    --no-light        Disable lighting.
@@ -118,22 +119,46 @@ pub fn main(init: std.process.Init) !void {
     rparams.light = light_enabled;
     if (res.args.fog) |d| rparams.fog_density = d;
     if (res.args.fogcut) |co| rparams.fog_cutoff = co;
-    if (res.args.lod) |ld| rparams.lod_dist = ld;
-    if (res.args.lod2) |ld2| rparams.lod2_dist = ld2;
+    if (res.args.lod) |ld| rparams.lod_dists[0] = ld;
+    if (res.args.lod2) |ld2| rparams.lod_dists[1] = ld2;
+    if (res.args.lods) |count| {
+        const want = @min(count, render.max_lods);
+        var n: usize = 0;
+        var prev: f32 = 0;
+        while (n < render.max_lods and rparams.lod_dists[n] > prev) : (n += 1) prev = rparams.lod_dists[n];
+        if (want < n) {
+            for (rparams.lod_dists[want..]) |*d| d.* = 0;
+        } else {
+            while (n < want) : (n += 1) {
+                rparams.lod_dists[n] = prev * 2.0;
+                prev = rparams.lod_dists[n];
+            }
+        }
+    }
     if (res.args.detail) |dd| rparams.detail_dist = dd;
 
-    // Half-resolution far-field world (milestone 14 follow-up): built
-    // once here, incrementally rebuilt from dirty regions on edits. The
-    // quarter-resolution level-2 world (--lod2) builds from level 1.
-    var lod_world: ?World = if (rparams.lod_dist > 0) try lod_mod.build(allocator, world) else null;
-    defer if (lod_world) |*lw| lw.deinit();
-    const lod: ?*const World = if (lod_world) |*lw| lw else null;
-    var lod2_world: ?World = if (rparams.lod2_dist > rparams.lod_dist)
-        if (lod_world) |*lw| try lod_mod.build(allocator, lw) else null
-    else
-        null;
-    defer if (lod2_world) |*lw| lw.deinit();
-    const lod2: ?*const World = if (lod2_world) |*lw| lw else null;
+    // Halved-resolution far-field worlds (milestone 14 follow-up,
+    // generalized to a chain in milestone 25): built once here,
+    // incrementally rebuilt from dirty regions on edits; each level
+    // builds from the world one finer.
+    var lod_worlds: [render.max_lods]?World = @splat(null);
+    defer for (&lod_worlds) |*lw| {
+        if (lw.*) |*w| w.deinit();
+    };
+    var lod_count: usize = 0;
+    {
+        var prev_d: f32 = 0;
+        for (0..render.max_lods) |i| {
+            const d = rparams.lod_dists[i];
+            if (d <= prev_d) break;
+            lod_worlds[i] = try lod_mod.build(allocator, if (i == 0) world else &lod_worlds[i - 1].?);
+            prev_d = d;
+            lod_count += 1;
+        }
+    }
+    var lod_ptrs: [render.max_lods]*const World = undefined;
+    for (0..lod_count) |i| lod_ptrs[i] = &lod_worlds[i].?;
+    const lods: []const *const World = lod_ptrs[0..lod_count];
 
     var flood_stats: lighting.Stats = .{};
     var flood_ms: f64 = 0;
@@ -141,8 +166,7 @@ pub fn main(init: std.process.Init) !void {
         const fstart = std.Io.Clock.Timestamp.now(init.io, .awake);
         flood_stats = try lighting.floodAll(world, allocator, light_params);
         flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
-        if (lod_world) |*lw| _ = try lighting.floodAll(lw, allocator, light_params);
-        if (lod2_world) |*lw| _ = try lighting.floodAll(lw, allocator, light_params);
+        for (0..lod_count) |i| _ = try lighting.floodAll(&lod_worlds[i].?, allocator, light_params);
     }
     // Generation's dirty extents are fully covered by the initial flood.
     _ = world.takeDirty();
@@ -155,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
     if (bench_frames > 0) {
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..bench_frames) |_| {
-            render.render(framebuffer, render_w, render_h, world, lod, lod2, cam, rparams);
+            render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -167,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
         for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
         std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
-        render.render(framebuffer, render_w, render_h, world, lod, lod2, cam, rparams);
+        render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
         render.transpose(staging, framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, staging, render_w, render_h);
         return;
@@ -324,18 +348,16 @@ pub fn main(init: std.process.Init) !void {
         cam = player.camera();
 
         if (world.takeDirty()) |r| {
-            if (lod_world) |*lw| {
-                try lod_mod.rebuildRegion(allocator, world, lw, r);
+            var rr = r;
+            var fine: *const World = world;
+            for (0..lod_count) |i| {
+                const lw = &lod_worlds[i].?;
+                try lod_mod.rebuildRegion(allocator, fine, lw, rr);
                 if (light_enabled) {
-                    _ = try lighting.relight(lw, allocator, lod_mod.coarseRegion(lw, r), light_params);
+                    _ = try lighting.relight(lw, allocator, lod_mod.coarseRegion(lw, rr), light_params);
                 }
-                if (lod2_world) |*lw2| {
-                    const r1 = lod_mod.coarseRegion(lw, r);
-                    try lod_mod.rebuildRegion(allocator, lw, lw2, r1);
-                    if (light_enabled) {
-                        _ = try lighting.relight(lw2, allocator, lod_mod.coarseRegion(lw2, r1), light_params);
-                    }
-                }
+                rr = lod_mod.coarseRegion(lw, rr);
+                fine = lw;
             }
             if (light_enabled) {
                 const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
@@ -350,7 +372,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         rparams.time_s = time_s;
-        render.render(framebuffer, render_w, render_h, world, lod, lod2, cam, rparams);
+        render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
         render.transpose(staging, framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, staging.ptr, @intCast(render_w * 4)) != 0) {
