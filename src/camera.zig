@@ -27,18 +27,21 @@ pub const Camera = struct {
         return .{ @sin(self.yaw), -@cos(self.yaw) };
     }
 
-    pub fn update(self: *Camera, input: Input, dt: f32, w: usize, h: usize, d: usize) void {
+    /// w/d are null for an unbounded world (STREAMING.md): the XZ
+    /// clamps drop out. h stays required — falling out of the sky or
+    /// under the floor is never useful.
+    pub fn update(self: *Camera, input: Input, dt: f32, w: ?usize, h: usize, d: ?usize) void {
         self.yaw = std.math.wrap(self.yaw - input.mouse_dx * sensitivity, std.math.pi);
 
         const v = speed * (if (input.boost) boost_factor else 1.0) * dt;
         const fwd = self.forward();
         const rgt = self.right();
-        const wf: f32 = @floatFromInt(w);
         const hf: f32 = @floatFromInt(h);
-        const df: f32 = @floatFromInt(d);
-        self.x = std.math.clamp(self.x + (fwd[0] * input.forward + rgt[0] * input.strafe) * v, 0, wf);
+        const nx = self.x + (fwd[0] * input.forward + rgt[0] * input.strafe) * v;
+        const nz = self.z + (fwd[1] * input.forward + rgt[1] * input.strafe) * v;
+        self.x = if (w) |bw| std.math.clamp(nx, 0, @as(f32, @floatFromInt(bw))) else nx;
         self.y = std.math.clamp(self.y + input.vertical * v, 0, hf);
-        self.z = std.math.clamp(self.z + (fwd[1] * input.forward + rgt[1] * input.strafe) * v, 0, df);
+        self.z = if (d) |bd| std.math.clamp(nz, 0, @as(f32, @floatFromInt(bd))) else nz;
     }
 };
 

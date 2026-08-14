@@ -322,6 +322,16 @@ pub const World = struct {
         return &self.columns[ux * self.d + uz];
     }
 
+    /// Mutable counterpart to columnAt; the one write path into columns,
+    /// so chunk residency (STREAMING.md) has a single indirection point.
+    pub fn columnAtMut(self: *World, x: i32, z: i32) ?*Column {
+        if (x < 0 or z < 0) return null;
+        const ux: usize = @intCast(x);
+        const uz: usize = @intCast(z);
+        if (ux >= self.w or uz >= self.d) return null;
+        return &self.columns[ux * self.d + uz];
+    }
+
     pub fn setColumnRuns(self: *World, x: usize, z: usize, runs: []MatRun) void {
         std.debug.assert(x < self.w and z < self.d);
         const col = &self.columns[x * self.d + z];

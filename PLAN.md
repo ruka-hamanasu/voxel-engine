@@ -23,7 +23,8 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 - Voxel size: ~10cm (the milestone-23 walking player is 6x16x6 voxels
   = 0.6x1.6x0.6 m, eye at 14)
 - World height: Configurable
-- Demo world extent: bounded, fully resident (streaming deferred).
+- Demo world extent: bounded, fully resident (chunked streaming in
+  progress — status and plan tracked in STREAMING.md).
   Default 384x128x384 (milestone 22: height fits 16+-headroom caves
   under the 0.30h terrain base). Tested to 768x1024x768 (~50 MB
   resident columns across all LOD levels; the flood's scratch is
@@ -527,6 +528,16 @@ entries here record scope and outcome only.
      raise for 100-200m+ draws, then terrain feature scale; chunked
      streaming only if still needed after those — streaming alone
      doesn't extend draw distance (the LOD cascade is the prerequisite).
+26. COMPLETED - Chunked-streaming phase 0 (status and detail tracked
+     in STREAMING.md): byte-identical refactors (World.columnAtMut,
+     box-local flood scratch keys, optional XZ clamp bounds), then
+     position-deterministic worldgen (pure heightAt/genColumn, hash-
+     rolled crystals, per-128x128-region hashed arches stamped into a
+     dense 64x64 Builder tile, ring-search spawn near origin). World
+     layout changed: baselines regenerated as views_m26[/]_lod0, rerun
+     byte-identical; tile-independence pinned by test; startup and
+     frame costs neutral.
+
 25. COMPLETED - N-level LOD cascade. renderColumn's hardcoded
      fine->lod1->lod2 chain generalizes to a chain of up to max_lods (8)
      coarse levels, each at 1/2^i resolution: lod_dists[] replaces

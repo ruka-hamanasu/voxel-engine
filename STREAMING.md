@@ -1,5 +1,25 @@
 # Chunked streaming & JIT terrain generation plan
 
+## Status
+
+- **Phase 0 — DONE** (PLAN.md milestone 26). Accessor indirection
+  (`World.columnAtMut`), box-local flood scratch keys, optional XZ
+  bounds in camera/player clamps: all three verified byte-identical
+  against views_m25[/]_lod0 before worldgen changed. Worldgen is
+  position-deterministic: `Ctx`/`heightAt`/`genColumn` in
+  gen/terrain.zig, hash3-rolled crystals, one arch max per 128x128
+  region (first of 8 hash candidates passing flatness/lintel/bounds
+  wins; candidate origin range is region-local [10, 88] intersected
+  with the bounded world's [10, size-40]), arches stamped into the
+  64x64xh Builder tile pre-encode (tile pipeline = future chunk load),
+  spawn by ring search near origin. Baselines regenerated as
+  views_m26[/]_lod0, rerun byte-identical; tile-independence (64 vs 16)
+  pinned by test. Startup 0.50 -> 0.52 s; benches move only with the
+  new layout.
+- Phase 1 — not started.
+- Phase 2 — not started.
+- Phase 3 — not started.
+
 Decisions (agreed): **unbounded** world; worldgen becomes
 position-deterministic and the default world's feature placement changes
 (view-sweep baselines regenerate); **always chunked** (one world path —

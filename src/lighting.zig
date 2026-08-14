@@ -68,28 +68,30 @@ const neighbor_offsets = .{ .{ 1, 0, 0, Dir.px }, .{ -1, 0, 0, Dir.nx }, .{ 0, 1
 /// Sparse per-voxel scratch over a bounded XZ box at full world height;
 /// the flood's working memory. floodAll covers the whole world, relight
 /// only the dirty region expanded by the maximum light reach. Only lit
-/// cells occupy memory (map value = intensity | color << 8 | dir << 16,
-/// key = world voxel index (x*wd + z)*h + y), so floodAll over a large
-/// world costs memory proportional to the lit volume, not the world
-/// volume. Cells absent from the map decode as intensity 0 (the
-/// material-derived default).
+/// cells occupy memory (map value = intensity | color << 8 | dir << 16),
+/// so floodAll over a large world costs memory proportional to the lit
+/// volume, not the world volume. Cells absent from the map decode as
+/// intensity 0 (the material-derived default).
+///
+/// Keys are BOX-LOCAL: ((x-x0)*zd + (z-z0))*h + y, so the u32 key cap
+/// bounds one flood box (a chunk plus its reach ring once streaming
+/// lands, STREAMING.md), not the world volume.
 const Scratch = struct {
     x0: usize,
     z0: usize,
     xd: usize,
     zd: usize,
     h: usize, // world height (key modulus)
-    wd: usize, // world depth (key stride)
     map: std.AutoHashMap(u32, u32),
 
     fn init(allocator: std.mem.Allocator, x0: usize, z0: usize, x1: usize, z1: usize, world: *const World) Scratch {
+        std.debug.assert(@as(u64, x1 - x0) * (z1 - z0) * world.h < std.math.maxInt(u32));
         return .{
             .x0 = x0,
             .z0 = z0,
             .xd = x1 - x0,
             .zd = z1 - z0,
             .h = world.h,
-            .wd = world.d,
             .map = std.AutoHashMap(u32, u32).init(allocator),
         };
     }
@@ -103,15 +105,15 @@ const Scratch = struct {
     }
 
     fn index(self: *const Scratch, x: usize, y: usize, z: usize) u32 {
-        return @intCast((x * self.wd + z) * self.h + y);
+        return @intCast(((x - self.x0) * self.zd + (z - self.z0)) * self.h + y);
     }
 
     fn coords(self: *const Scratch, vi: u32) struct { usize, usize, usize } {
         const h: u32 = @intCast(self.h);
-        const wd: u32 = @intCast(self.wd);
+        const zd: u32 = @intCast(self.zd);
         const y = vi % h;
         const cxz = vi / h;
-        return .{ cxz / wd, y, cxz % wd };
+        return .{ cxz / zd + self.x0, y, cxz % zd + self.z0 };
     }
 
     fn get(self: *const Scratch, vi: u32) LightSample {
@@ -142,7 +144,7 @@ const Scratch = struct {
 fn decodeColumns(world: *World, s: *Scratch) !void {
     for (s.x0..s.x0 + s.xd) |x| {
         for (s.z0..s.z0 + s.zd) |z| {
-            const col = &world.columns[x * world.d + z];
+            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
             const runs = col.light orelse continue;
             var hi: i32 = col.light_base_y;
             for (runs) |run| {
@@ -164,7 +166,7 @@ fn decodeColumns(world: *World, s: *Scratch) !void {
 fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), allocator: std.mem.Allocator, params: Params, bx0: usize, by0: usize, bz0: usize, bx1: usize, by1: usize, bz1: usize) !void {
     for (bx0..bx1) |x| {
         for (bz0..bz1) |z| {
-            const col = &world.columns[x * world.d + z];
+            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
             var y: i32 = @intCast(world.h - 1);
             for (col.runs) |run| {
                 const m = run.palette_id;
@@ -227,7 +229,7 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
     var stats: Stats = .{};
     for (s.x0..s.x0 + s.xd) |x| {
         for (s.z0..s.z0 + s.zd) |z| {
-            const col = &world.columns[x * world.d + z];
+            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
             if (col.light) |l| allocator.free(l);
             col.light = null;
             col.light_base_y = 0;
@@ -254,9 +256,9 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
     const h32: u32 = @intCast(s.h);
     for (s.x0..s.x0 + s.xd) |x| {
         for (s.z0..s.z0 + s.zd) |z| {
-            const ci: u32 = @intCast(x * world.d + z);
+            const ci: u32 = @intCast((x - s.x0) * s.zd + (z - s.z0));
             const ext = extents.get(ci) orelse continue;
-            const col = &world.columns[x * world.d + z];
+            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
             const bot: u32 = ext & 0xffff;
             const hi_y: u32 = ext >> 16;
             var runs: std.ArrayList(LightRun) = .empty;

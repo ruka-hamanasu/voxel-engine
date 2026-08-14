@@ -21,13 +21,18 @@ pub const Noise = struct {
         return v;
     }
 
-    fn hash2(self: Noise, x: i32, z: i32) u64 {
+    /// Integer-lattice hash behind noise2; also the per-region feature
+    /// roll source (arches, STREAMING.md).
+    pub fn hash2(self: Noise, x: i32, z: i32) u64 {
         const ux: u64 = @bitCast(@as(i64, x));
         const uz: u64 = @bitCast(@as(i64, z));
         return mix(mix(self.seed ^ mix(ux +% 0x9E3779B97F4A7C15)) ^ mix(uz +% 0xC2B2AE3D27D4EB4F));
     }
 
-    fn hash3(self: Noise, x: i32, y: i32, z: i32) u64 {
+    /// Integer-lattice hash behind noise3; also the per-position
+    /// feature roll source (crystals), so placement is independent of
+    /// evaluation order.
+    pub fn hash3(self: Noise, x: i32, y: i32, z: i32) u64 {
         const uy: u64 = @bitCast(@as(i64, y));
         return mix(self.hash2(x, z) ^ mix(uy +% 0x165667B19E3779F9));
     }

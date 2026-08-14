@@ -118,13 +118,14 @@ pub const Player = struct {
         }
 
         // World bounds act as walls/floor/ceiling (solidAt reads OOB
-        // as air).
-        const wf: f32 = @floatFromInt(world.w);
+        // as air). XZ bounds lift for an unbounded world (STREAMING.md;
+        // still always bounded pre-chunking); the Y clamp stays.
         const hf: f32 = @floatFromInt(world.h);
-        const df: f32 = @floatFromInt(world.d);
-        self.x = std.math.clamp(self.x, half_width, wf - half_width);
+        const xb: ?usize = world.w;
+        const zb: ?usize = world.d;
+        if (xb) |bw| self.x = std.math.clamp(self.x, half_width, @as(f32, @floatFromInt(bw)) - half_width);
         self.y = std.math.clamp(self.y, 0, hf - height);
-        self.z = std.math.clamp(self.z, half_width, df - half_width);
+        if (zb) |bd| self.z = std.math.clamp(self.z, half_width, @as(f32, @floatFromInt(bd)) - half_width);
     }
 
     const Axis = enum { x, y, z };
