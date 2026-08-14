@@ -242,7 +242,8 @@ identity regression path).
 ```
 build.zig            # link system SDL2 via pkg-config
 src/main.zig         # SDL init, frame loop, --headless mode, edit picking
-src/world.zig        # columns, material + light RLE streams, edit API, palette
+src/world.zig        # chunk map, columns, material + light RLE streams, edit API, palette
+src/chunk.zig        # chunk load/unload lifecycle (tile pipeline + unload relight)
 src/lighting.zig     # colored flood-fill BFS + incremental relight
 src/render.zig       # march core: render/renderColumn, DdaIterator, CellCtx/genSegments/processCell, segmentColor
 src/render/spans.zig # free-span list + fillSpans/claim/claimGrad, the single pixel-write path
@@ -537,6 +538,20 @@ entries here record scope and outcome only.
      layout changed: baselines regenerated as views_m26[/]_lod0, rerun
      byte-identical; tile-independence pinned by test; startup and
      frame costs neutral.
+27. COMPLETED - Chunked storage (STREAMING.md phase 1; detail tracked
+     there). World.columns -> HashMap(u64, *Chunk) of 64x64-column
+     chunks (256 KB 64-aligned block + per-chunk 8x8 macro_max grid);
+     w/d are ?usize (null = unbounded), bounded worlds eagerly resident.
+     set/fillBox no-op on unloaded columns; lighting decode/seed/encode
+     skip them too. src/chunk.zig: loadChunk (ensureChunk + the staged
+     tile pipeline, i32 tile origins threaded through genTile/emit),
+     unloadChunk (blank materials preserving light runs -> relight ->
+     free). Perf: the per-cell hash lookup regressed the bench ~20%
+     with Wyhash; multiplicative-mix hash + a last-chunk memo behind
+     force-inlined accessors brought it back to parity (spawn 6.79 ->
+     6.72 ms, aerial 3.87 -> 3.93, cave neutral; startup 0.52 -> 0.51).
+     Regression: zig build test green (new chunk residency / load==gen
+     / unload==reflood tests), both m26 view sweeps byte-identical.
 
 25. COMPLETED - N-level LOD cascade. renderColumn's hardcoded
      fine->lod1->lod2 chain generalizes to a chain of up to max_lods (8)

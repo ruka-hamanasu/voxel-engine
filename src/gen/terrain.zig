@@ -226,26 +226,28 @@ fn nearArch(ctx: *const Ctx, bounds: ?[2]usize, x: i32, z: i32, min_dist: i32) b
 /// One arch stamp box, clipped into the dense tile. Geometry identical
 /// to the pre-streaming fillBox arch: 27w x 33h x 6 thick, 17x18
 /// opening stepped to a lintel (a 16-voxel-tall player walks through).
-fn archBox(b: *Builder, tx0: usize, tz0: usize, tw: usize, td: usize, arch: Arch, l0: i32, l1: i32, ry0: i32, ry1: i32, m: u8) void {
+fn archBox(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, arch: Arch, l0: i32, l1: i32, ry0: i32, ry1: i32, m: u8) void {
     const ax0 = if (arch.along_x) arch.x + l0 else arch.x;
     const ax1 = if (arch.along_x) arch.x + l1 else arch.x + 6;
     const az0 = if (arch.along_x) arch.z else arch.z + l0;
     const az1 = if (arch.along_x) arch.z + 6 else arch.z + l1;
-    const cx0: usize = @intCast(@max(ax0, @as(i32, @intCast(tx0))));
-    const cx1: usize = @intCast(@min(ax1, @as(i32, @intCast(tx0 + tw))));
-    const cz0: usize = @intCast(@max(az0, @as(i32, @intCast(tz0))));
-    const cz1: usize = @intCast(@min(az1, @as(i32, @intCast(tz0 + td))));
+    const cx0 = @max(ax0, tx0);
+    const cx1 = @min(ax1, tx0 + @as(i32, @intCast(tw)));
+    const cz0 = @max(az0, tz0);
+    const cz1 = @min(az1, tz0 + @as(i32, @intCast(td)));
     const cy0: usize = @intCast(@max(arch.y + ry0, 0));
     const cy1: usize = @intCast(@min(arch.y + ry1, @as(i32, @intCast(b.world.h))));
     if (cx0 >= cx1 or cy0 >= cy1 or cz0 >= cz1) return;
-    for (cx0..cx1) |x| {
-        for (cz0..cz1) |z| {
-            @memset(b.at(x - tx0, z - tz0)[cy0..cy1], m);
+    var x = cx0;
+    while (x < cx1) : (x += 1) {
+        var z = cz0;
+        while (z < cz1) : (z += 1) {
+            @memset(b.at(@intCast(x - tx0), @intCast(z - tz0))[cy0..cy1], m);
         }
     }
 }
 
-fn stampArch(b: *Builder, tx0: usize, tz0: usize, tw: usize, td: usize, arch: Arch) void {
+fn stampArch(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, arch: Arch) void {
     archBox(b, tx0, tz0, tw, td, arch, 0, 27, -3, 30, mat.arch);
     archBox(b, tx0, tz0, tw, td, arch, 5, 22, 0, 18, 0);
     archBox(b, tx0, tz0, tw, td, arch, 8, 19, 18, 22, 0);
@@ -256,17 +258,18 @@ fn stampArch(b: *Builder, tx0: usize, tz0: usize, tw: usize, td: usize, arch: Ar
 /// arches of the 3x3 region neighborhood, run-encode. This is exactly
 /// what a phase-1 chunk load runs, so chunk gen == whole-world gen.
 /// Regions stamp in ascending (rx, rz) order — overlapping arch
-/// stamps only commute under a fixed order.
-fn genTile(ctx: *const Ctx, b: *Builder, tx0: usize, tz0: usize, tw: usize, td: usize, bounds: ?[2]usize) !void {
+/// stamps only commute under a fixed order. Tile origins are i32 so
+/// negative chunk coords work in the unbounded world.
+pub fn genTile(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
     for (0..tw) |lx| {
         for (0..td) |lz| {
-            genColumn(ctx, @intCast(tx0 + lx), @intCast(tz0 + lz), b.column(lx, lz));
+            genColumn(ctx, tx0 + @as(i32, @intCast(lx)), tz0 + @as(i32, @intCast(lz)), b.column(lx, lz));
         }
     }
-    const rx0 = @divFloor(@as(i32, @intCast(tx0)), region_size) - 1;
-    const rx1 = @divFloor(@as(i32, @intCast(tx0 + tw - 1)), region_size) + 1;
-    const rz0 = @divFloor(@as(i32, @intCast(tz0)), region_size) - 1;
-    const rz1 = @divFloor(@as(i32, @intCast(tz0 + td - 1)), region_size) + 1;
+    const rx0 = @divFloor(tx0, region_size) - 1;
+    const rx1 = @divFloor(tx0 + @as(i32, @intCast(tw - 1)), region_size) + 1;
+    const rz0 = @divFloor(tz0, region_size) - 1;
+    const rz1 = @divFloor(tz0 + @as(i32, @intCast(td - 1)), region_size) + 1;
     var rx = rx0;
     while (rx <= rx1) : (rx += 1) {
         var rz = rz0;
@@ -276,7 +279,7 @@ fn genTile(ctx: *const Ctx, b: *Builder, tx0: usize, tz0: usize, tw: usize, td: 
     }
     for (0..tw) |lx| {
         for (0..td) |lz| {
-            try b.emit(tx0 + lx, tz0 + lz, lx, lz);
+            try b.emit(tx0 + @as(i32, @intCast(lx)), tz0 + @as(i32, @intCast(lz)), lx, lz);
         }
     }
 }
@@ -334,7 +337,7 @@ fn generateTiled(allocator: std.mem.Allocator, opts: gen.Options, tile: usize) !
     while (tx < opts.w) : (tx += tile) {
         var tz: usize = 0;
         while (tz < opts.d) : (tz += tile) {
-            try genTile(&ctx, &builder, tx, tz, @min(tile, opts.w - tx), @min(tile, opts.d - tz), bounds);
+            try genTile(&ctx, &builder, @intCast(tx), @intCast(tz), @min(tile, opts.w - tx), @min(tile, opts.d - tz), bounds);
         }
     }
 
@@ -410,17 +413,21 @@ fn expectCoverage(world: *const World, x: i32, z: i32) !void {
 
 fn worldsEqual(a: *const World, b: *const World) bool {
     if (a.w != b.w or a.h != b.h or a.d != b.d) return false;
-    for (a.columns, b.columns) |ca, cb| {
-        if (ca.runs.len != cb.runs.len) return false;
-        for (ca.runs, cb.runs) |ra, rb| {
-            if (ra.count != rb.count or ra.palette_id != rb.palette_id) return false;
-        }
-        if ((ca.light == null) != (cb.light == null)) return false;
-        if (ca.light) |la| {
-            const lb = cb.light.?;
-            if (ca.light_base_y != cb.light_base_y or la.len != lb.len) return false;
-            for (la, lb) |ra, rb| {
-                if (ra.count != rb.count or ra.color_id != rb.color_id or ra.intensity != rb.intensity) return false;
+    for (0..a.w.?) |x| {
+        for (0..a.d.?) |z| {
+            const ca = a.columnAt(@intCast(x), @intCast(z)).?;
+            const cb = b.columnAt(@intCast(x), @intCast(z)).?;
+            if (ca.runs.len != cb.runs.len) return false;
+            for (ca.runs, cb.runs) |ra, rb| {
+                if (ra.count != rb.count or ra.palette_id != rb.palette_id) return false;
+            }
+            if ((ca.light == null) != (cb.light == null)) return false;
+            if (ca.light) |la| {
+                const lb = cb.light.?;
+                if (ca.light_base_y != cb.light_base_y or la.len != lb.len) return false;
+                for (la, lb) |ra, rb| {
+                    if (ra.count != rb.count or ra.color_id != rb.color_id or ra.intensity != rb.intensity) return false;
+                }
             }
         }
     }
@@ -453,8 +460,8 @@ test "generation is independent of the tile subdivision" {
 test "columns stay covered and terrain in bounds" {
     var r = try generate(std.testing.allocator, test_opts);
     defer r.deinit(std.testing.allocator);
-    for (0..r.world.w) |x| {
-        for (0..r.world.d) |z| {
+    for (0..r.world.w.?) |x| {
+        for (0..r.world.d.?) |z| {
             try expectCoverage(&r.world, @intCast(x), @intCast(z));
             try std.testing.expect(r.world.get(@intCast(x), 0, @intCast(z)) != 0);
         }
@@ -466,8 +473,8 @@ test "caves and arches exist" {
     defer r.deinit(std.testing.allocator);
 
     var underground_air: usize = 0;
-    for (0..r.world.w) |x| {
-        for (0..r.world.d) |z| {
+    for (0..r.world.w.?) |x| {
+        for (0..r.world.d.?) |z| {
             const top: i32 = @intCast(r.world.columnAt(@intCast(x), @intCast(z)).?.top_solid_y);
             var y: i32 = 3;
             while (y + 4 < top) : (y += 1) {
@@ -496,8 +503,8 @@ test "caves have player-height headroom" {
     var r = try generate(std.testing.allocator, .{ .seed = 7, .w = 48, .h = 96, .d = 48 });
     defer r.deinit(std.testing.allocator);
     var walkable: usize = 0;
-    for (0..r.world.w) |x| {
-        for (0..r.world.d) |z| {
+    for (0..r.world.w.?) |x| {
+        for (0..r.world.d.?) |z| {
             const top: i32 = @intCast(r.world.columnAt(@intCast(x), @intCast(z)).?.top_solid_y);
             var streak: i32 = 0;
             var y: i32 = top - 5; // below the surface skin

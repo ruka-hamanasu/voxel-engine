@@ -491,6 +491,7 @@ test {
     _ = lighting;
     _ = anim;
     _ = @import("world.zig");
+    _ = @import("chunk.zig");
     _ = @import("camera.zig");
     _ = @import("player.zig");
 }

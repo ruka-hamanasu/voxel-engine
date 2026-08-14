@@ -1,13 +1,9 @@
 # TODO
 
-- Make the player seem less gigantic - ~~fog distance~~ (DONE, milestone
-  24: default cutoff 96 -> 448 + lod2 on; milestone 25: N-level LOD
-  cascade, --lods N + max_dist 16384 for 100-200m+ draws on big
-  worlds), hill height & flat areas.
-  Chunked streaming only if km-scale is still wanted after terrain
-  feature scale
 - Make the camera able to see the ground in front of the player's "feet"
 - Investigate how we can reduce memory usage & generation time for large maps
+- See if we can use multi-resolution noise algorithms to make LOD
+  generation faster, making LOD an integral part of map generation
 
 # DONE
 
@@ -29,3 +25,9 @@
   cascade is 2.6-3.8x at fogcut 448, lod2 ~2x on top, pays for itself
   even at the default cutoff; fog cutoff remains the cheaper lever
   for short draw distances
+- Make the player seem less gigantic - ~~fog distance~~ (DONE, milestone
+  24: default cutoff 96 -> 448 + lod2 on; milestone 25: N-level LOD
+  cascade, --lods N + max_dist 16384 for 100-200m+ draws on big
+  worlds), hill height & flat areas.
+  Chunked streaming only if km-scale is still wanted after terrain
+  feature scale

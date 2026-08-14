@@ -26,8 +26,8 @@ fn rebuildColumn(lod: *World, fine: *const World, cx: usize, cz: usize, dense: [
     const lh = coarse(fine.h);
     const x0 = 2 * cx;
     const z0 = 2 * cz;
-    const x1 = @min(x0 + 2, fine.w);
-    const z1 = @min(z0 + 2, fine.d);
+    const x1 = @min(x0 + 2, fine.w.?);
+    const z1 = @min(z0 + 2, fine.d.?);
     var yc: usize = 0;
     while (yc < lh) : (yc += 1) {
         // Highest solid fine voxel wins: check the upper fine layer
@@ -65,16 +65,17 @@ fn rebuildColumn(lod: *World, fine: *const World, cx: usize, cz: usize, dense: [
         }
         try runs.append(lod.allocator, .{ .count = 1, .palette_id = mat });
     }
-    lod.setColumnRuns(cx, cz, try runs.toOwnedSlice(lod.allocator));
+    lod.setColumnRuns(@intCast(cx), @intCast(cz), try runs.toOwnedSlice(lod.allocator));
 }
 
+/// Build the coarse world for a bounded fine world.
 pub fn build(allocator: std.mem.Allocator, fine: *const World) !World {
-    var lod = try World.init(allocator, coarse(fine.w), coarse(fine.h), coarse(fine.d));
+    var lod = try World.init(allocator, coarse(fine.w.?), coarse(fine.h), coarse(fine.d.?));
     errdefer lod.deinit();
     const dense = try allocator.alloc(u8, coarse(fine.h));
     defer allocator.free(dense);
-    for (0..lod.w) |cx| {
-        for (0..lod.d) |cz| {
+    for (0..lod.w.?) |cx| {
+        for (0..lod.d.?) |cz| {
             try rebuildColumn(&lod, fine, cx, cz, dense);
         }
     }
@@ -87,8 +88,8 @@ pub fn rebuildRegion(allocator: std.mem.Allocator, fine: *const World, lod: *Wor
     defer allocator.free(dense);
     const cx0 = r.x0 / 2;
     const cz0 = r.z0 / 2;
-    const cx1 = @min(coarse(r.x1), lod.w);
-    const cz1 = @min(coarse(r.z1), lod.d);
+    const cx1 = @min(coarse(r.x1), lod.w.?);
+    const cz1 = @min(coarse(r.z1), lod.d.?);
     for (cx0..cx1) |cx| {
         for (cz0..cz1) |cz| {
             try rebuildColumn(lod, fine, cx, cz, dense);
@@ -103,9 +104,9 @@ pub fn coarseRegion(lod: *const World, r: world_mod.Region) world_mod.Region {
         .x0 = r.x0 / 2,
         .y0 = r.y0 / 2,
         .z0 = r.z0 / 2,
-        .x1 = @min(coarse(r.x1), lod.w),
+        .x1 = @min(coarse(r.x1), lod.w.?),
         .y1 = @min(coarse(r.y1), lod.h),
-        .z1 = @min(coarse(r.z1), lod.d),
+        .z1 = @min(coarse(r.z1), lod.d.?),
     };
 }
 

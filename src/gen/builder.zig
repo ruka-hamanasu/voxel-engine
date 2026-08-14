@@ -42,7 +42,7 @@ pub const Builder = struct {
     }
 
     /// Run-encode tile column (lx, lz) into world column (x, z).
-    pub fn emit(self: *Builder, x: usize, z: usize, lx: usize, lz: usize) !void {
+    pub fn emit(self: *Builder, x: i32, z: i32, lx: usize, lz: usize) !void {
         const dense = self.at(lx, lz);
         var runs: std.ArrayList(world_mod.MatRun) = .empty;
         errdefer runs.deinit(self.allocator);
@@ -77,7 +77,7 @@ test "emit run-encodes dense column" {
     dense[2] = 5;
     try builder.emit(1, 2, 1, 2);
 
-    const col = &world.columns[1 * 4 + 2];
+    const col = world.columnAtMut(1, 2).?;
     try std.testing.expectEqual(3, col.runs.len);
     try std.testing.expectEqual(world_mod.MatRun{ .count = 5, .palette_id = 0 }, col.runs[0]);
     try std.testing.expectEqual(world_mod.MatRun{ .count = 1, .palette_id = 5 }, col.runs[1]);

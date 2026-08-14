@@ -76,6 +76,38 @@ pub const Column = struct {
 
 pub const no_solid = std.math.maxInt(u16);
 
+/// Chunked storage (STREAMING.md phase 1): a chunk is 64x64 columns —
+/// one 256 KB 64-aligned block — plus its own 8x8-cell macro_max grid
+/// (64 columns / 8 = 8 cells per side, so macro cells never straddle
+/// chunks). Per-column light runs stay per-column heap allocations.
+pub const chunk_w = 64;
+const chunk_macro_w = chunk_w / 8;
+
+pub const Chunk = struct {
+    columns: [chunk_w * chunk_w]Column align(64),
+    macro_max: [chunk_macro_w * chunk_macro_w]u16,
+};
+
+/// Hash-map key for the chunk at chunk coords (cx, cz): packed i32
+/// pair. Chunk coord of world column x is x >> 6 (arithmetic shift =
+/// floorDiv for the power-of-two size), so negative coords work.
+pub fn chunkKey(cx: i32, cz: i32) u64 {
+    return (@as(u64, @as(u32, @bitCast(cx))) << 32) | @as(u32, @bitCast(cz));
+}
+
+/// Chunk map with a multiplicative-mix hash: the render march pays a
+/// lookup per cell, and Wyhash (AutoHashMap's default) cost ~20% of
+/// the frame. One multiply mixes the small-int coords into the high
+/// bits the map's capacity mask uses.
+const ChunkMap = std.HashMap(u64, *Chunk, struct {
+    pub fn hash(_: @This(), k: u64) u64 {
+        return k *% 0x9E3779B97F4A7C15;
+    }
+    pub fn eql(_: @This(), a: u64, b: u64) bool {
+        return a == b;
+    }
+}, std.hash_map.default_max_load_percentage);
+
 /// Rebuild a column's solidity bitmask from its material runs.
 /// Caller guarantees h <= 64.
 fn computeMask(runs: []const MatRun, h: usize) u64 {
@@ -174,24 +206,28 @@ pub const Region = struct {
 };
 
 pub const World = struct {
-    w: usize,
+    /// XZ bounds; null = unbounded (both or neither). Bounded worlds
+    /// (all test worlds; the default world until the phase-2 streamer)
+    /// hold every covering chunk resident from init.
+    w: ?usize,
     h: usize,
-    d: usize,
-    columns: []align(64) Column,
+    d: ?usize,
+    chunks: ChunkMap,
     allocator: std.mem.Allocator,
     /// Column.solid_mask is maintained only when h <= 64.
     masks_ok: bool,
-    /// 8x8-column groups: max top_solid_y of the group (0 when empty),
-    /// maintained by setRange/setColumnRuns. Lets the march skip cells
-    /// whose height window is entirely above everything solid in the
-    /// group without loading any Column. Valid when h fits the u16
+    /// The 8x8-group macro_max grids are valid when h fits the u16
     /// top_solid_y cache (h <= 65535), i.e. always.
-    macro_max: []u16,
-    macro_w: usize, // ceil(w/8)
     macro_ok: bool,
     /// Bounding box (half-open) of everything touched by set/fillBox
     /// since the last takeDirty; consumed by milestone 10's relight.
     dirty: ?Region = null,
+    /// Last-lookup memo for the hot accessor path: the render march
+    /// and its AO sampling issue several consecutive lookups per chunk.
+    /// Mutated through the const accessors (World instances are always
+    /// owned mutably); single-threaded.
+    last_key: u64 = 0,
+    last_chunk: ?*Chunk = null,
 
     fn markDirty(self: *World, r: Region) void {
         if (self.dirty) |*cur| {
@@ -230,76 +266,165 @@ pub const World = struct {
         if (old.len > inline_runs_cap) self.allocator.free(old);
     }
 
-    pub fn init(allocator: std.mem.Allocator, w: usize, h: usize, d: usize) !World {
-        // lighting.zig's sparse scratch keys cells by a u32 voxel index.
-        std.debug.assert(@as(u64, w) * d * h < std.math.maxInt(u32));
+    pub fn init(allocator: std.mem.Allocator, w: ?usize, h: usize, d: ?usize) !World {
+        std.debug.assert((w == null) == (d == null)); // both or neither
+        if (w) |bw| {
+            // lighting.zig's sparse scratch keys cells by a u32 voxel index.
+            std.debug.assert(@as(u64, bw) * d.? * h < std.math.maxInt(u32));
+        }
         std.debug.assert(h <= std.math.maxInt(u16)); // u16 y caches
-        const macro_w = (w + 7) / 8;
-        const macro_d = (d + 7) / 8;
         var world: World = .{
             .w = w,
             .h = h,
             .d = d,
-            .columns = try allocator.alignedAlloc(Column, .@"64", w * d),
+            .chunks = ChunkMap.init(allocator),
             .allocator = allocator,
             .masks_ok = h <= 64,
-            .macro_max = try allocator.alloc(u16, macro_w * macro_d),
-            .macro_w = macro_w,
             .macro_ok = h <= std.math.maxInt(u16),
         };
-        @memset(world.macro_max, 0);
-        errdefer allocator.free(world.macro_max);
-        var initialized: usize = 0;
-        errdefer {
-            for (world.columns[0..initialized]) |col| {
-                if (col.runs.len > inline_runs_cap) allocator.free(col.runs);
-                if (col.light) |l| allocator.free(l);
+        errdefer world.deinit();
+        if (w) |bw| {
+            const bd = d.?;
+            var cx: i32 = 0;
+            while (@as(usize, @intCast(cx)) * chunk_w < bw) : (cx += 1) {
+                var cz: i32 = 0;
+                while (@as(usize, @intCast(cz)) * chunk_w < bd) : (cz += 1) {
+                    _ = try world.ensureChunk(cx, cz);
+                }
             }
-            allocator.free(world.columns);
-        }
-        for (world.columns, 0..) |*col, i| {
-            col.* = .{ .runs = &.{} };
-            world.installRuns(col, try allocUniformRuns(allocator, h, 0));
-            initialized = i + 1;
         }
         return world;
     }
 
     pub fn deinit(self: *World) void {
-        for (self.columns) |col| {
+        var it = self.chunks.valueIterator();
+        while (it.next()) |chunk| self.destroyChunk(chunk.*);
+        self.chunks.deinit();
+    }
+
+    inline fn inBounds(self: *const World, x: i32, z: i32) bool {
+        if (self.w) |w| {
+            if (x < 0 or @as(u64, @intCast(x)) >= w) return false;
+        }
+        if (self.d) |d| {
+            if (z < 0 or @as(u64, @intCast(z)) >= d) return false;
+        }
+        return true;
+    }
+
+    /// Allocate and register the chunk at (cx, cz) with uniform-air
+    /// columns (inline runs, no per-column alloc unless h > 2040).
+    /// Idempotent: returns the existing chunk when already resident.
+    pub fn ensureChunk(self: *World, cx: i32, cz: i32) !*Chunk {
+        if (self.w) |w| std.debug.assert(cx >= 0 and @as(u64, @intCast(cx)) * chunk_w < w);
+        if (self.d) |d| std.debug.assert(cz >= 0 and @as(u64, @intCast(cz)) * chunk_w < d);
+        const key = chunkKey(cx, cz);
+        const gop = try self.chunks.getOrPut(key);
+        if (gop.found_existing) return gop.value_ptr.*;
+        errdefer _ = self.chunks.remove(key);
+        const chunk = try self.allocator.create(Chunk);
+        var initialized: usize = 0;
+        errdefer {
+            for (chunk.columns[0..initialized]) |*col| {
+                if (col.runs.len > inline_runs_cap) self.allocator.free(col.runs);
+            }
+            self.allocator.destroy(chunk);
+        }
+        for (&chunk.columns, 0..) |*col, i| {
+            col.* = .{ .runs = &.{} };
+            try self.setAirRuns(col);
+            initialized = i + 1;
+        }
+        @memset(chunk.macro_max[0..], 0);
+        gop.value_ptr.* = chunk;
+        return chunk;
+    }
+
+    /// Remove and free the chunk at (cx, cz); no-op when not resident.
+    pub fn freeChunk(self: *World, cx: i32, cz: i32) void {
+        const kv = self.chunks.fetchRemove(chunkKey(cx, cz)) orelse return;
+        if (self.last_chunk == kv.value) self.last_chunk = null;
+        self.destroyChunk(kv.value);
+    }
+
+    fn destroyChunk(self: *World, chunk: *Chunk) void {
+        for (&chunk.columns) |*col| {
             if (col.runs.len > inline_runs_cap) self.allocator.free(col.runs);
             if (col.light) |l| self.allocator.free(l);
         }
-        self.allocator.free(self.columns);
-        self.allocator.free(self.macro_max);
+        self.allocator.destroy(chunk);
+    }
+
+    /// Blank a chunk's materials to uniform air PRESERVING the light
+    /// runs (unloadChunk's relight needs the stored flood to find the
+    /// orphaned chains). Recomputes the caches and zeroes the macro grid.
+    pub fn blankChunk(self: *World, chunk: *Chunk) !void {
+        for (&chunk.columns) |*col| {
+            try self.setAirRuns(col);
+            col.top_solid_y = no_solid;
+            col.solid_mask = 0;
+        }
+        @memset(chunk.macro_max[0..], 0);
+    }
+
+    /// Install uniform-air material runs on one column; inline unless
+    /// h > 2040. Light runs are the caller's business.
+    fn setAirRuns(self: *World, col: *Column) !void {
+        const n = (self.h + 254) / 255;
+        var heap: []MatRun = &.{};
+        if (n > inline_runs_cap) heap = try allocUniformRuns(self.allocator, self.h, 0);
+        if (col.runs.len > inline_runs_cap) self.allocator.free(col.runs);
+        if (n > inline_runs_cap) {
+            col.runs = heap;
+        } else {
+            var remaining = self.h;
+            for (col.inline_runs[0..n]) |*run| {
+                const count: u8 = @intCast(@min(remaining, 255));
+                run.* = .{ .count = count, .palette_id = 0 };
+                remaining -= count;
+            }
+            col.runs = col.inline_runs[0..n];
+        }
+    }
+
+    /// Chunk holding world column (x, z), or null when not resident.
+    /// Bounds are NOT checked here (the callers do that); the memo is
+    /// keyed on the chunk coords, so out-of-bounds negatives stay safe.
+    inline fn chunkAt(self: *const World, x: i32, z: i32) ?*Chunk {
+        const key = chunkKey(x >> 6, z >> 6);
+        if (self.last_chunk) |lc| {
+            if (self.last_key == key) return lc;
+        }
+        const chunk = self.chunks.get(key) orelse return null;
+        const mut: *World = @constCast(self);
+        mut.last_key = key;
+        mut.last_chunk = chunk;
+        return chunk;
     }
 
     /// Recompute one 8x8 group's max top_solid_y after a column change.
-    fn updateMacro(self: *World, x: usize, z: usize) void {
+    fn updateMacro(self: *World, x: i32, z: i32) void {
         if (!self.macro_ok) return;
-        const mx = x >> 3;
-        const mz = z >> 3;
+        const chunk = self.chunkAt(x, z).?;
+        const lx = (@as(usize, @intCast(x & 63)) >> 3) << 3;
+        const lz = (@as(usize, @intCast(z & 63)) >> 3) << 3;
         var m: u16 = 0;
-        const x1 = @min((mx + 1) * 8, self.w);
-        const z1 = @min((mz + 1) * 8, self.d);
-        for (mx * 8..x1) |cx| {
-            for (mz * 8..z1) |cz| {
-                const top = self.columns[cx * self.d + cz].top_solid_y;
+        for (lx..lx + 8) |cx| {
+            for (lz..lz + 8) |cz| {
+                const top = chunk.columns[cx * chunk_w + cz].top_solid_y;
                 if (top != no_solid and top > m) m = top;
             }
         }
-        self.macro_max[mz * self.macro_w + mx] = @intCast(m);
+        chunk.macro_max[(lz >> 3) * chunk_macro_w + (lx >> 3)] = m;
     }
 
-    /// Max solid y of the 8x8 group holding (x, z); null out of the
-    /// world (all air: the march may always skip such cells).
-    /// Meaningful only when macro_ok.
-    pub fn macroMax(self: *const World, x: i32, z: i32) ?u16 {
-        if (x < 0 or z < 0) return null;
-        const mx: usize = @intCast(x >> 3);
-        const mz: usize = @intCast(z >> 3);
-        if (mx >= self.macro_w or mz >= self.macro_max.len / self.macro_w) return null;
-        return self.macro_max[mz * self.macro_w + mx];
+    /// Max solid y of the 8x8 group holding (x, z); null when out of
+    /// bounds or the chunk is not resident (all air: the march may
+    /// always skip such cells). Meaningful only when macro_ok.
+    pub inline fn macroMax(self: *const World, x: i32, z: i32) ?u16 {
+        if (!self.inBounds(x, z)) return null;
+        const chunk = self.chunkAt(x, z) orelse return null;
+        return chunk.macro_max[@as(usize, @intCast((z & 63) >> 3)) * chunk_macro_w + @as(usize, @intCast((x & 63) >> 3))];
     }
 
     fn allocUniformRuns(allocator: std.mem.Allocator, h: usize, mat: u8) ![]MatRun {
@@ -314,27 +439,22 @@ pub const World = struct {
         return runs;
     }
 
-    pub fn columnAt(self: *const World, x: i32, z: i32) ?*const Column {
-        if (x < 0 or z < 0) return null;
-        const ux: usize = @intCast(x);
-        const uz: usize = @intCast(z);
-        if (ux >= self.w or uz >= self.d) return null;
-        return &self.columns[ux * self.d + uz];
+    pub inline fn columnAt(self: *const World, x: i32, z: i32) ?*const Column {
+        if (!self.inBounds(x, z)) return null;
+        const chunk = self.chunkAt(x, z) orelse return null;
+        return &chunk.columns[@as(usize, @intCast(x & 63)) * chunk_w + @as(usize, @intCast(z & 63))];
     }
 
     /// Mutable counterpart to columnAt; the one write path into columns,
     /// so chunk residency (STREAMING.md) has a single indirection point.
-    pub fn columnAtMut(self: *World, x: i32, z: i32) ?*Column {
-        if (x < 0 or z < 0) return null;
-        const ux: usize = @intCast(x);
-        const uz: usize = @intCast(z);
-        if (ux >= self.w or uz >= self.d) return null;
-        return &self.columns[ux * self.d + uz];
+    pub inline fn columnAtMut(self: *World, x: i32, z: i32) ?*Column {
+        if (!self.inBounds(x, z)) return null;
+        const chunk = self.chunkAt(x, z) orelse return null;
+        return &chunk.columns[@as(usize, @intCast(x & 63)) * chunk_w + @as(usize, @intCast(z & 63))];
     }
 
-    pub fn setColumnRuns(self: *World, x: usize, z: usize, runs: []MatRun) void {
-        std.debug.assert(x < self.w and z < self.d);
-        const col = &self.columns[x * self.d + z];
+    pub fn setColumnRuns(self: *World, x: i32, z: i32, runs: []MatRun) void {
+        const col = self.columnAtMut(x, z).?;
         if (col.light) |l| self.allocator.free(l);
         col.light = null;
         col.light_base_y = 0;
@@ -347,7 +467,7 @@ pub const World = struct {
 
     /// Solidity at (x, y, z) without decoding materials: a single bit
     /// test when masks_ok, run scan otherwise. Matches get(...) != 0.
-    pub fn solidAt(self: *const World, x: i32, y: i32, z: i32) bool {
+    pub inline fn solidAt(self: *const World, x: i32, y: i32, z: i32) bool {
         if (y < 0) return false;
         const uy: usize = @intCast(y);
         if (uy >= self.h) return false;
@@ -356,7 +476,7 @@ pub const World = struct {
         return (col.solid_mask >> @intCast(uy)) & 1 != 0;
     }
 
-    pub fn get(self: *const World, x: i32, y: i32, z: i32) u8 {
+    pub inline fn get(self: *const World, x: i32, y: i32, z: i32) u8 {
         if (y < 0) return 0;
         const uy: usize = @intCast(y);
         if (uy >= self.h) return 0;
@@ -402,8 +522,9 @@ pub const World = struct {
         return result;
     }
 
-    fn setRange(self: *World, x: usize, z: usize, d0: usize, d1: usize, mat: u8) !void {
-        const col = &self.columns[x * self.d + z];
+    /// Returns false (no-op) when the column's chunk is not resident.
+    fn setRange(self: *World, x: i32, z: i32, d0: usize, d1: usize, mat: u8) !bool {
+        const col = self.columnAtMut(x, z) orelse return false;
         var out: std.ArrayList(MatRun) = .empty;
         errdefer out.deinit(self.allocator);
 
@@ -422,6 +543,7 @@ pub const World = struct {
         col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
         if (self.masks_ok) col.solid_mask = computeMask(col.runs, self.h);
         self.updateMacro(x, z);
+        return true;
     }
 
     fn appendRun(out: *std.ArrayList(MatRun), allocator: std.mem.Allocator, mat: u8, count: usize) !void {
@@ -443,28 +565,29 @@ pub const World = struct {
     }
 
     pub fn set(self: *World, x: usize, y: usize, z: usize, mat: u8) !void {
-        const xc = @min(x, self.w - 1);
+        const xc = if (self.w) |w| @min(x, w - 1) else x;
         const yc = @min(y, self.h - 1);
-        const zc = @min(z, self.d - 1);
+        const zc = if (self.d) |d| @min(z, d - 1) else z;
         const depth = self.h - 1 - yc;
-        try self.setRange(xc, zc, depth, depth + 1, mat);
+        if (!try self.setRange(@intCast(xc), @intCast(zc), depth, depth + 1, mat)) return;
         self.markDirty(.{ .x0 = xc, .y0 = yc, .z0 = zc, .x1 = xc + 1, .y1 = yc + 1, .z1 = zc + 1 });
     }
 
     pub fn fillBox(self: *World, x0: usize, y0: usize, z0: usize, x1: usize, y1: usize, z1: usize, mat: u8) !void {
-        const xa = @min(x0, self.w);
+        const xa = if (self.w) |w| @min(x0, w) else x0;
         const ya = @min(y0, self.h);
-        const za = @min(z0, self.d);
-        const xb = @min(x1, self.w);
+        const za = if (self.d) |d| @min(z0, d) else z0;
+        const xb = if (self.w) |w| @min(x1, w) else x1;
         const yb = @min(y1, self.h);
-        const zb = @min(z1, self.d);
+        const zb = if (self.d) |d| @min(z1, d) else z1;
         if (xa >= xb or ya >= yb or za >= zb) return;
+        var any = false;
         for (xa..xb) |x| {
             for (za..zb) |z| {
-                try self.setRange(x, z, self.h - yb, self.h - ya, mat);
+                any = try self.setRange(@intCast(x), @intCast(z), self.h - yb, self.h - ya, mat) or any;
             }
         }
-        self.markDirty(.{ .x0 = xa, .y0 = ya, .z0 = za, .x1 = xb, .y1 = yb, .z1 = zb });
+        if (any) self.markDirty(.{ .x0 = xa, .y0 = ya, .z0 = za, .x1 = xb, .y1 = yb, .z1 = zb });
     }
 
     pub fn buildDemoRoom(allocator: std.mem.Allocator) !World {
@@ -529,7 +652,7 @@ test "fillBox and get" {
 test "set splits and merges runs" {
     var world = try World.init(std.testing.allocator, 8, 8, 8);
     defer world.deinit();
-    const col = &world.columns[2 * 8 + 2];
+    const col = world.columnAtMut(2, 2).?;
     try std.testing.expectEqual(1, col.runs.len);
 
     try world.set(2, 2, 2, 5);
@@ -552,7 +675,7 @@ test "set splits and merges runs" {
 test "runs split at 255" {
     var world = try World.init(std.testing.allocator, 1, 600, 1);
     defer world.deinit();
-    const col = &world.columns[0];
+    const col = world.columnAtMut(0, 0).?;
     try std.testing.expectEqual(3, col.runs.len);
     try std.testing.expectEqual(255, col.runs[0].count);
     try std.testing.expectEqual(255, col.runs[1].count);
@@ -589,7 +712,7 @@ test "set clamps out-of-bounds and edits record dirty extents" {
 test "topSolidY finds the topmost solid voxel and the cache tracks edits" {
     var world = try World.init(std.testing.allocator, 1, 16, 1);
     defer world.deinit();
-    const col = &world.columns[0];
+    const col = world.columnAtMut(0, 0).?;
     try std.testing.expectEqual(null, topSolidY(col, 16));
     try std.testing.expectEqual(no_solid, col.top_solid_y);
     try world.fillBox(0, 3, 0, 1, 7, 1, 5);
@@ -608,9 +731,13 @@ test "light stream storage lifecycle" {
     const allocator = std.testing.allocator;
     var world = try World.init(allocator, 2, 16, 2);
     defer world.deinit();
-    for (world.columns) |col| try std.testing.expect(col.light == null);
+    for (0..2) |x| {
+        for (0..2) |z| {
+            try std.testing.expect(world.columnAt(@intCast(x), @intCast(z)).?.light == null);
+        }
+    }
 
-    const col = &world.columns[1 * 2 + 1];
+    const col = world.columnAtMut(1, 1).?;
     const runs = try allocator.alloc(LightRun, 2);
     runs[0] = .{ .count = 4, .color_id = 1, .intensity = 200, .dir = 6 };
     runs[1] = .{ .count = 3, .color_id = 1, .intensity = 120, .dir = 6 };
@@ -652,7 +779,7 @@ test "run cursor peeks adjacent voxels" {
     var world = try World.init(std.testing.allocator, 1, 16, 1);
     defer world.deinit();
     try world.fillBox(0, 3, 0, 1, 7, 1, 5);
-    const col = &world.columns[0];
+    const col = world.columnAtMut(0, 0).?;
 
     const cur = RunCursor.init(col.runs, 16, 5);
     try std.testing.expectEqual(5, cur.peek(5));
@@ -674,7 +801,7 @@ test "run cursor walks both directions" {
     var world = try World.init(std.testing.allocator, 1, 16, 1);
     defer world.deinit();
     try world.fillBox(0, 3, 0, 1, 7, 1, 5);
-    const col = &world.columns[0];
+    const col = world.columnAtMut(0, 0).?;
 
     var y: i32 = 0;
     var cur = RunCursor.init(col.runs, 16, 0);
@@ -692,4 +819,84 @@ test "run cursor walks both directions" {
         try std.testing.expectEqual(expected, cur.mat());
         if (y > 0 and y == cur.lo) cur.down();
     }
+}
+
+test "bounded init loads all covering chunks; out of bounds reads as air" {
+    var world = try World.init(std.testing.allocator, 80, 16, 80);
+    defer world.deinit();
+    try std.testing.expectEqual(@as(usize, 4), world.chunks.count());
+    try std.testing.expect(world.columnAt(0, 0) != null);
+    try std.testing.expect(world.columnAt(79, 79) != null);
+    try std.testing.expectEqual(@as(?*const Column, null), world.columnAt(80, 0));
+    try std.testing.expectEqual(@as(?*const Column, null), world.columnAt(-1, 0));
+    try std.testing.expectEqual(@as(?u16, null), world.macroMax(80, 0));
+    try std.testing.expectEqual(@as(u8, 0), world.get(79, 3, 79));
+}
+
+test "unbounded world: chunks allocate on demand, missing reads as air" {
+    const allocator = std.testing.allocator;
+    var world = try World.init(allocator, null, 32, null);
+    defer world.deinit();
+    try std.testing.expectEqual(@as(usize, 0), world.chunks.count());
+    try std.testing.expectEqual(@as(?*const Column, null), world.columnAt(0, 0));
+    try std.testing.expectEqual(@as(u8, 0), world.get(5, 3, -100));
+    try std.testing.expectEqual(@as(?u16, null), world.macroMax(0, 0));
+    try std.testing.expect(!world.solidAt(-40, 3, 20));
+
+    const chunk = try world.ensureChunk(-1, 0); // covers x -64..-1, z 0..63
+    try std.testing.expectEqual(@as(usize, 1), world.chunks.count());
+    const col = world.columnAt(-1, 5).?;
+    try std.testing.expectEqual(@as(usize, 1), col.runs.len); // uniform air, inline
+    try std.testing.expectEqual(@as(u8, 0), col.runs[0].palette_id);
+    try std.testing.expect(col.runs.ptr == &col.inline_runs);
+    try std.testing.expectEqual(no_solid, col.top_solid_y);
+    try std.testing.expectEqual(@as(u8, 0), world.get(-1, 7, 5));
+    try std.testing.expectEqual(@as(u16, 0), world.macroMax(-1, 5).?);
+    // ensureChunk is idempotent.
+    try std.testing.expectEqual(chunk, try world.ensureChunk(-1, 0));
+
+    // Writes land through the resident chunk and update the macro grid.
+    world.setColumnRuns(-1, 5, try World.allocUniformRuns(allocator, 32, 3));
+    try std.testing.expectEqual(@as(u8, 3), world.get(-1, 7, 5));
+    try std.testing.expectEqual(@as(u16, 31), world.macroMax(-1, 5).?);
+    // The neighboring unloaded chunk still reads as air.
+    try std.testing.expectEqual(@as(u8, 0), world.get(0, 7, 5));
+
+    world.freeChunk(-1, 0);
+    try std.testing.expectEqual(@as(usize, 0), world.chunks.count());
+    try std.testing.expectEqual(@as(?*const Column, null), world.columnAt(-1, 5));
+}
+
+test "set/fillBox no-op on unloaded columns" {
+    var world = try World.init(std.testing.allocator, null, 16, null);
+    defer world.deinit();
+    try world.set(10, 3, 10, 5);
+    try std.testing.expectEqual(@as(u8, 0), world.get(10, 3, 10));
+    try std.testing.expectEqual(@as(?Region, null), world.dirty);
+    _ = try world.ensureChunk(0, 0);
+    try world.set(10, 3, 10, 5);
+    try std.testing.expectEqual(@as(u8, 5), world.get(10, 3, 10));
+    try std.testing.expect(world.dirty != null);
+}
+
+test "blankChunk resets materials and caches but keeps light runs" {
+    const allocator = std.testing.allocator;
+    var world = try World.init(allocator, 8, 8, 8);
+    defer world.deinit();
+    try world.fillBox(1, 1, 1, 3, 3, 3, 5);
+    const col = world.columnAtMut(2, 2).?;
+    const light = try allocator.alloc(LightRun, 1);
+    light[0] = .{ .count = 4, .color_id = 1, .intensity = 200, .dir = 6 };
+    col.light = light;
+    col.light_base_y = 7;
+    col.light_lo = 4;
+
+    const chunk = world.chunks.get(chunkKey(0, 0)).?;
+    try world.blankChunk(chunk);
+    try std.testing.expectEqual(@as(u8, 0), world.get(2, 2, 2));
+    try std.testing.expectEqual(no_solid, col.top_solid_y);
+    try std.testing.expectEqual(@as(u64, 0), col.solid_mask);
+    try std.testing.expectEqual(@as(u16, 0), world.macroMax(2, 2).?);
+    try std.testing.expectEqual(light, col.light.?);
+    try std.testing.expectEqual(@as(u16, 7), col.light_base_y);
 }

@@ -16,7 +16,14 @@
   views_m26[/]_lod0, rerun byte-identical; tile-independence (64 vs 16)
   pinned by test. Startup 0.50 -> 0.52 s; benches move only with the
   new layout.
-- Phase 1 — not started.
+- **Phase 1 — DONE** (PLAN.md milestone 27). `World.columns` ->
+  `chunks: HashMap(u64, *Chunk)` (64x64-column chunks, packed i32 key,
+  multiplicative-mix hash + last-chunk memo behind the inlined
+  accessors — plain Wyhash cost ~20% of the frame, memo+inline brought
+  the bench back to parity). `w/d` are `?usize`; bounded worlds load
+  all covering chunks at init. `loadChunk`/`unloadChunk` in
+  src/chunk.zig; chunk gen == eager gen and unload-relight == reflood
+  pinned by tests. Both view sweeps byte-identical to views_m26.
 - Phase 2 — not started.
 - Phase 3 — not started.
 
@@ -82,7 +89,15 @@ lost.
    no-ops when the world is unbounded; keep them for bounded test
    worlds.
 
-## Phase 1 — chunked storage (world.zig)
+## Phase 1 — chunked storage (world.zig + chunk.zig)
+
+Decisions: chunk lifecycle (`loadChunk`/`unloadChunk`) lives in a new
+`src/chunk.zig` importing world/lighting/terrain, so world.zig stays
+free of upward imports; the render hot path uses plain AutoHashMap
+lookups (bench A/B decides whether a fast path is warranted). The
+default world stays bounded and fully resident in phase 1 — the
+streamer (item 11/12) flips it to unbounded — so the m26 baselines
+must remain byte-identical.
 
 5. `Chunk`: 64x64 columns (one 256 KB 64-aligned block), its own
    8x8-cell `macro_max` grid, per-column light runs as today. Chunk
@@ -94,10 +109,18 @@ lost.
    through the map; missing = air. `setColumnRuns`/`setRange` operate on
    resident chunks; `set`/`fillBox` clamp/no-op on unloaded columns.
    `init` no longer pre-fills — chunks allocate on demand with uniform
-   air runs (inline, no per-column alloc).
-7. Chunk lifecycle: `loadChunk(cx, cz)` runs the staged tile pipeline
-   (dense fill -> arch stamps -> run-encode); `unloadChunk` (blank +
-   relight + free, see 9).
+   air runs (inline, no per-column alloc). Bounded worlds (all test
+   worlds, and the default until phase 2) eagerly load their covering
+   chunks. Tile origins thread through `genTile`/`Builder.emit` as
+   i32 so negative chunk coords work.
+7. Chunk lifecycle (src/chunk.zig): `loadChunk(cx, cz)` =
+   `World.ensureChunk` + the staged tile pipeline (dense fill ->
+   arch stamps -> run-encode); `unloadChunk` blanks the chunk's
+   materials PRESERVING light runs, `lighting.relight`s the chunk box
+   (the stale-seed clear needs the old runs to find orphan chains into
+   neighbors), then frees (see 9 for the hysteresis context). The 3
+   `columnAtMut(...).?` sites in lighting.zig become `orelse continue`
+   (decode/seed/encode touch resident columns only).
 
 ## Phase 2 — streaming, lighting, LOD
 

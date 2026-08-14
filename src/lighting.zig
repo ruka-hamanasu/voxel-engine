@@ -141,10 +141,12 @@ const Scratch = struct {
 /// Load the footprint columns' light runs into the scratch (relight
 /// only; floodAll starts from an empty scratch). Zero-intensity
 /// interior runs are not inserted; the map's absence decodes as 0.
+/// Unloaded columns (chunk map, STREAMING.md) are skipped — their
+/// absence also decodes as 0.
 fn decodeColumns(world: *World, s: *Scratch) !void {
     for (s.x0..s.x0 + s.xd) |x| {
         for (s.z0..s.z0 + s.zd) |z| {
-            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
+            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
             const runs = col.light orelse continue;
             var hi: i32 = col.light_base_y;
             for (runs) |run| {
@@ -166,7 +168,7 @@ fn decodeColumns(world: *World, s: *Scratch) !void {
 fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), allocator: std.mem.Allocator, params: Params, bx0: usize, by0: usize, bz0: usize, bx1: usize, by1: usize, bz1: usize) !void {
     for (bx0..bx1) |x| {
         for (bz0..bz1) |z| {
-            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
+            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
             var y: i32 = @intCast(world.h - 1);
             for (col.runs) |run| {
                 const m = run.palette_id;
@@ -229,7 +231,7 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
     var stats: Stats = .{};
     for (s.x0..s.x0 + s.xd) |x| {
         for (s.z0..s.z0 + s.zd) |z| {
-            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
+            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
             if (col.light) |l| allocator.free(l);
             col.light = null;
             col.light_base_y = 0;
@@ -258,7 +260,7 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
         for (s.z0..s.z0 + s.zd) |z| {
             const ci: u32 = @intCast((x - s.x0) * s.zd + (z - s.z0));
             const ext = extents.get(ci) orelse continue;
-            const col = world.columnAtMut(@intCast(x), @intCast(z)).?;
+            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
             const bot: u32 = ext & 0xffff;
             const hi_y: u32 = ext >> 16;
             var runs: std.ArrayList(LightRun) = .empty;
@@ -287,12 +289,16 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
     return stats;
 }
 
+/// Full-world flood; bounded worlds only (the chunk streaming path
+/// floods per chunk on load, STREAMING.md phase 2).
 pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !Stats {
-    var s = Scratch.init(allocator, 0, 0, world.w, world.d, world);
+    const w = world.w orelse unreachable;
+    const d = world.d orelse unreachable;
+    var s = Scratch.init(allocator, 0, 0, w, d, world);
     defer s.deinit();
     var queue: std.ArrayList(u32) = .empty;
     defer queue.deinit(allocator);
-    try seedEmissiveBox(world, &s, &queue, allocator, params, 0, 0, 0, world.w, world.h, world.d);
+    try seedEmissiveBox(world, &s, &queue, allocator, params, 0, 0, 0, w, world.h, d);
     try propagate(world, &s, &queue, allocator, params);
     return encodeColumns(world, &s, allocator);
 }
@@ -324,13 +330,13 @@ pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !St
 /// differs. Both are valid fixpoints.
 pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Region, params: Params) !Stats {
     const reach: usize = if (params.attenuation == 0)
-        @max(world.w, @max(world.h, world.d))
+        @max(world.w orelse unreachable, @max(world.h, world.d orelse unreachable))
     else
         params.seed_intensity / params.attenuation;
     const x0 = dirty.x0 -| reach;
     const z0 = dirty.z0 -| reach;
-    const x1 = @min(dirty.x1 + reach, world.w);
-    const z1 = @min(dirty.z1 + reach, world.d);
+    const x1 = if (world.w) |w| @min(dirty.x1 + reach, w) else dirty.x1 + reach;
+    const z1 = if (world.d) |d| @min(dirty.z1 + reach, d) else dirty.z1 + reach;
 
     var s = Scratch.init(allocator, x0, z0, x1, z1, world);
     defer s.deinit();
@@ -558,7 +564,11 @@ test "world without emissive materials keeps null light" {
     const stats = try floodAll(&world, std.testing.allocator, .{});
     try std.testing.expectEqual(@as(usize, 0), stats.lit_columns);
     try std.testing.expectEqual(@as(usize, 0), stats.runs);
-    for (world.columns) |col| try std.testing.expect(col.light == null);
+    for (0..4) |x| {
+        for (0..4) |z| {
+            try std.testing.expect(world.columnAt(@intCast(x), @intCast(z)).?.light == null);
+        }
+    }
 }
 
 test "reflood frees and replaces previous light runs" {
@@ -569,7 +579,11 @@ test "reflood frees and replaces previous light runs" {
     try std.testing.expect(world.columnAt(1, 1).?.light != null);
     try world.set(1, 4, 1, 1);
     _ = try floodAll(&world, std.testing.allocator, .{});
-    for (world.columns) |col| try std.testing.expect(col.light == null);
+    for (0..3) |x| {
+        for (0..3) |z| {
+            try std.testing.expect(world.columnAt(@intCast(x), @intCast(z)).?.light == null);
+        }
+    }
 }
 
 /// Relight verification: intensity and color match a full reflood
@@ -581,8 +595,8 @@ fn expectEquivalent(a: *const World, b: *const World) !void {
     try std.testing.expectEqual(a.w, b.w);
     try std.testing.expectEqual(a.h, b.h);
     try std.testing.expectEqual(a.d, b.d);
-    for (0..a.w) |x| {
-        for (0..a.d) |z| {
+    for (0..a.w.?) |x| {
+        for (0..a.d.?) |z| {
             const ca = a.columnAt(@intCast(x), @intCast(z)).?;
             const cb = b.columnAt(@intCast(x), @intCast(z)).?;
             for (0..a.h) |y| {
@@ -600,8 +614,8 @@ fn expectEquivalent(a: *const World, b: *const World) !void {
 /// cell is a dir-less seed). Holds for any valid fixpoint, floodAll or
 /// relight, independent of tie-break order.
 fn expectDirsValid(world: *const World, params: Params) !void {
-    for (0..world.w) |x| {
-        for (0..world.d) |z| {
+    for (0..world.w.?) |x| {
+        for (0..world.d.?) |z| {
             const col = world.columnAt(@intCast(x), @intCast(z)).?;
             for (0..world.h) |y| {
                 const s = sampleLight(col, @intCast(y));
