@@ -26,8 +26,8 @@ pub fn main(init: std.process.Init) !void {
         \\    --bench <u32>     Render N frames and report ms/frame.
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
-        \\    --lod <f32>       LOD switch distance (default 64; 0 disables the coarse world).
-        \\    --lod2 <f32>      Second LOD switch distance, quarter-resolution world (default 0 = disabled).
+        \\    --lod <f32>       LOD switch distance (default 96; 0 disables the coarse world).
+        \\    --lod2 <f32>      Second LOD switch distance, quarter-resolution world (default 192; 0 disables).
         \\    --detail <f32>    Per-voxel shading detail distance (default 48; 0 = full detail everywhere).
         \\    --atten <u8>      Light attenuation.
         \\    --no-light        Disable lighting.

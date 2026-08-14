@@ -304,7 +304,9 @@ test "fog lut is monotonic and saturates at the cutoff" {
 }
 
 test "emissive materials fade slower but converge to the fog color" {
-    const params: RenderParams = .{};
+    // Pinned cutoff: the mid-bucket expectations assume the old 96,
+    // where a mid-distance emissive still tints the haze visibly.
+    const params: RenderParams = .{ .fog_cutoff = 96.0 };
     defer buildFogLuts(params);
     const saved = world_mod.palette[9];
     defer world_mod.palette[9] = saved;

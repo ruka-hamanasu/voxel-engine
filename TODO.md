@@ -1,6 +1,9 @@
 # TODO
 
-- Make the player seem less gigantic - fog distance, hill height & flat areas, etc
+- Make the player seem less gigantic - ~~fog distance~~ (DONE, milestone
+  24: default cutoff 96 -> 448 + lod2 on), hill height & flat areas.
+  Next lever for longer draws: N-level LOD cascade + max_dist raise
+  (target 1024-2048); chunked streaming only after that, if at all
 - Make the camera able to see the ground in front of the player's "feet"
 - Investigate how we can reduce memory usage & generation time for large maps
 

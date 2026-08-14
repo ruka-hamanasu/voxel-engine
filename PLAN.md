@@ -507,3 +507,23 @@ entries here record scope and outcome only.
      m22 sweeps byte-identical. Tests: wall stop, 4-vs-5 auto-step,
      jump apex, ceiling clamp, fly collision, noclip passthrough,
      unstick, place-guard.
+24. COMPLETED - Long default draw distance (the fog half of the TODO
+     "player seems gigantic" item; 10 cm voxels made the old 96 cutoff
+     ~6 body heights of visibility). RenderParams defaults -> fog_cutoff
+     96 -> 448, lod_dist 64 -> 96, lod2_dist 0 -> 192 (the milestone-18
+     tested vista config); fog_density 0.025 kept (the curve normalizes
+     to the cutoff, so the near/mid look barely moves: 91% fogged at the
+     old cutoff distance instead of 100%). In the 384-wide default world
+     terrain past ~190 is already >99% fogged, so the world edge stays
+     hidden. The emissive fog test pins fog_cutoff 96 (its mid-bucket
+     expectations assume it). Regression: views.sh l0f0 mode and all of
+     views_lod0.sh pin the old values (fogcut 96 / lod 64 / lod2 0), both
+     byte-identical to views_m22[/]_lod0; def baselines regenerated
+     (views_m24[/tmp/opencode]). Bench (960x540, ms/frame, old defaults
+     -> new on the same binary — the only shipped change is the default
+     constants): spawn 6.41 -> 10.65, aerial 2.35 -> 7.38 (the aerial
+     now sees the whole world), cave 1.72 -> 1.84; 480x270 spawn 3.16
+     -> 5.43. Deferred (agreed order): N-level LOD cascade + max_dist
+     raise for 100-200m+ draws, then terrain feature scale; chunked
+     streaming only if still needed after those — streaming alone
+     doesn't extend draw distance (the LOD cascade is the prerequisite).

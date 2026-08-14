@@ -14,8 +14,8 @@ const OFace = shade.OFace;
 
 pub const hfov: f32 = std.math.pi / 2.0;
 /// March hard cap. The fine world only ever marches to lod_dist; the
-/// coarse (LOD) worlds absorb everything past it, so this can sit far
-/// above the default fog cutoff.
+/// coarse (LOD) worlds absorb everything past it, so this sits above
+/// the default fog cutoff with headroom for longer draws.
 pub const max_dist: f32 = 512.0;
 /// Start offset for the coarse march: lodBoundary returns a distance
 /// sitting exactly on a coarse-cell plane, where rounding could floor
@@ -29,7 +29,7 @@ pub const max_sky_height = shade.max_sky_height;
 /// processCell. fog_* went live in milestone 8, light in milestone 9.
 pub const RenderParams = struct {
     fog_density: f32 = 0.025,
-    fog_cutoff: f32 = 96.0,
+    fog_cutoff: f32 = 448.0,
     fog_color: u32 = 0x8ea6d2, // horizon-row sky color
     /// false = treat every column as unlit (identity tint), ignoring
     /// the flood-filled light runs; runtime toggle for the L hotkey.
@@ -38,15 +38,15 @@ pub const RenderParams = struct {
     /// Fine/coarse march handoff distance. The handoff snaps to the
     /// entry of the first coarse cell whose center is past it
     /// (lodBoundary), and the ray continues in the half-resolution LOD
-    /// world (80% fogged at the default 64, so the silhouette
+    /// world (91% fogged at the default 96, so the silhouette
     /// overestimate stays hidden). No effect when render's lod is
     /// null.
-    lod_dist: f32 = 64.0,
+    lod_dist: f32 = 96.0,
     /// Second LOD handoff: past it the ray continues in the
     /// quarter-resolution world (level 2, built from the level-1
     /// world). 0 disables the third march range; must exceed lod_dist
     /// when set.
-    lod2_dist: f32 = 0.0,
+    lod2_dist: f32 = 192.0,
     /// Distance past which per-voxel shading detail (AO neighbor
     /// sampling, the colored-light zipper and glow) is dropped: cells
     /// beyond it shade with max AO and no light, collapsing each
