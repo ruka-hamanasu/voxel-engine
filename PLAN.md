@@ -221,13 +221,20 @@ case it is ever revisited.
 
 ## Interaction
 
-Fly camera (WASD + Space/Ctrl, Shift boost) with yaw-only mouse look;
-Tab toggles mouse capture. Left/right click removes/places a cycling
-crystal: captured clicks pick through the center crosshair, uncaptured
-clicks through the cursor pixel. Picking maps any screen pixel to its
-fixed-vertical-slope ray (`pickPixel` in main.zig), so ground below the
-horizon and ceilings are clickable. Edits trigger `lighting.relight` on
-the next frame; `L` toggles lighting (the identity regression path).
+Three movement states (`src/player.zig`): **walk** (gravity, Space
+jump, auto-step up to 4 voxels, ground snap on descents), **fly**
+(Space/Ctrl vertical, same AABB collision, no auto-step), and
+**noclip** (no collision; the milestone-4 fly camera). `G` toggles
+walk/fly, `N` toggles noclip; default is walk. The body is a 6x16x6
+AABB (eye at 14) with axis-separated collision against
+`World.solidAt`; edits refuse placement into the body. Yaw-only mouse
+look; Tab toggles mouse capture. Left/right click removes/places a
+cycling crystal: captured clicks pick through the center crosshair,
+uncaptured clicks through the cursor pixel. Picking maps any screen
+pixel to its fixed-vertical-slope ray (`pickPixel` in main.zig), so
+ground below the horizon and ceilings are clickable. Edits trigger
+`lighting.relight` on the next frame; `L` toggles lighting (the
+identity regression path).
 
 ## File layout
 
@@ -240,7 +247,8 @@ src/render.zig       # march core: render/renderColumn, DdaIterator, CellCtx/gen
 src/render/spans.zig # free-span list + fillSpans/claim/claimGrad, the single pixel-write path
 src/render/ao.zig    # fake-AO math: aoLevel, side/face stops, neighbor-cursor helpers
 src/render/shade.zig # shading tables: shade LUT, fog LUTs, dir_weight, applyGlow/fogStop, sky
-src/camera.zig       # yaw-only camera, WASD + mouse input
+src/camera.zig       # yaw-only camera, noclip move math, Input
+src/player.zig       # walk/fly/noclip player, AABB collision + auto-step
 src/anim.zig         # emissive palette pulse (time-driven, identity at t=0)
 src/gen.zig          # generator facade: Options/Result/Landmark, Generator enum dispatch
 src/gen/noise.zig    # seeded value noise + fBm (shared by generators)
@@ -486,3 +494,16 @@ entries here record scope and outcome only.
      interiors); views_m22[/]_lod0 baselines regenerated, rerun
      byte-identical. Deferred lever: widen the solid_mask gate (u128
      or 2 x u64) to restore bit-test AO at h <= 128.
+23. COMPLETED - Walking (src/player.zig). Three movement states: walk
+     (gravity 98 vox/s^2, Space jump apex ~12 vox, auto-step 4, ground
+     snap on descents), fly (collides, no auto-step), noclip
+     (Camera.update unchanged). G toggles walk/fly, N noclip; default
+     walk. Axis-separated AABB collision scans the body's overlapped
+     voxels via solidAt (a few hundred bit tests/frame, unmeasurable
+     vs the render); an embedded body escapes forward rather than
+     clamping backward. Fly/noclip speed 4 -> 30 vox/s for the 384^2
+     world. The place-guard tests the full body box (overlapsVoxel)
+     instead of the camera column. Headless rendering untouched: both
+     m22 sweeps byte-identical. Tests: wall stop, 4-vs-5 auto-step,
+     jump apex, ceiling clamp, fly collision, noclip passthrough,
+     unstick, place-guard.

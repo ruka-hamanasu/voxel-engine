@@ -1,5 +1,7 @@
 # TODO
 
+- Make the player seem less gigantic - fog distance, hill height & flat areas, etc
+- Make the camera able to see the ground in front of the player's "feet"
 - Investigate how we can reduce memory usage & generation time for large maps
 
 # DONE

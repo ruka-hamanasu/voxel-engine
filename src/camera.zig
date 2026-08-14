@@ -15,7 +15,8 @@ pub const Camera = struct {
     yaw: f32,
 
     pub const sensitivity: f32 = 0.003;
-    pub const speed: f32 = 4.0;
+    /// Fly/noclip speed in voxels/s (walk speed lives in player.zig).
+    pub const speed: f32 = 30.0;
     pub const boost_factor: f32 = 4.0;
 
     pub fn forward(self: Camera) [2]f32 {
@@ -43,8 +44,8 @@ pub const Camera = struct {
 
 test "update moves forward and clamps to bounds" {
     var cam = Camera{ .x = 1, .y = 1, .z = 1, .yaw = 0 };
-    cam.update(.{ .forward = 1 }, 0.5, 8, 8, 8);
-    try std.testing.expectApproxEqAbs(3.0, cam.x, 1e-5);
+    cam.update(.{ .forward = 1 }, 0.05, 8, 8, 8);
+    try std.testing.expectApproxEqAbs(2.5, cam.x, 1e-5);
     try std.testing.expectApproxEqAbs(1.0, cam.z, 1e-5);
 
     cam.update(.{ .forward = 1, .boost = true }, 1.0, 8, 8, 8);

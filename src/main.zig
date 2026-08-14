@@ -8,6 +8,7 @@ const c = @cImport({
 const Input = @import("camera.zig").Input;
 const World = @import("world.zig").World;
 const Camera = @import("camera.zig").Camera;
+const Player = @import("player.zig").Player;
 const render = @import("render.zig");
 const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
@@ -225,6 +226,10 @@ pub fn main(init: std.process.Init) !void {
     var place_mat: u8 = 9;
     const pick_dist: f32 = 32.0;
 
+    var player = Player.fromCamera(cam);
+    player.unstick(world);
+    cam = player.camera();
+
     const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
     var last_counter = c.SDL_GetPerformanceCounter();
     var fps: f64 = 0;
@@ -249,6 +254,14 @@ pub fn main(init: std.process.Init) !void {
                     } else if (event.key.keysym.sym == c.SDLK_l) {
                         rparams.light = !rparams.light;
                         std.log.info("light {s}", .{if (rparams.light) "on" else "off"});
+                    } else if (event.key.keysym.sym == c.SDLK_g) {
+                        player.mode = if (player.mode == .walk) .fly else .walk;
+                        player.vy = 0;
+                        std.log.info("mode {s}", .{@tagName(player.mode)});
+                    } else if (event.key.keysym.sym == c.SDLK_n) {
+                        player.noclip = !player.noclip;
+                        if (!player.noclip) player.unstick(world);
+                        std.log.info("noclip {s}", .{if (player.noclip) "on" else "off"});
                     } else if (event.key.keysym.sym == c.SDLK_TAB) {
                         mouse_captured = !mouse_captured;
                         _ = c.SDL_SetRelativeMouseMode(if (mouse_captured) c.SDL_TRUE else c.SDL_FALSE);
@@ -275,9 +288,7 @@ pub fn main(init: std.process.Init) !void {
                             if (left) {
                                 try world.set(pick.hit[0], pick.hit[1], pick.hit[2], 0);
                             } else if (pick.place) |p| {
-                                const cam_ix: usize = @intFromFloat(@floor(cam.x));
-                                const cam_iz: usize = @intFromFloat(@floor(cam.z));
-                                if (p[0] != cam_ix or p[2] != cam_iz) {
+                                if (!player.overlapsVoxel(p[0], p[1], p[2])) {
                                     try world.set(p[0], p[1], p[2], place_mat);
                                     place_mat = if (place_mat == 11) 9 else place_mat + 1;
                                 }
@@ -309,7 +320,8 @@ pub fn main(init: std.process.Init) !void {
         if (keys[c.SDL_SCANCODE_SPACE] != 0) input.vertical += 1;
         if (keys[c.SDL_SCANCODE_LCTRL] != 0) input.vertical -= 1;
         input.boost = keys[c.SDL_SCANCODE_LSHIFT] != 0;
-        cam.update(input, @floatCast(dt), world.w, world.h, world.d);
+        player.update(world, input, @floatCast(dt));
+        cam = player.camera();
 
         if (world.takeDirty()) |r| {
             if (lod_world) |*lw| {
@@ -458,6 +470,7 @@ test {
     _ = anim;
     _ = @import("world.zig");
     _ = @import("camera.zig");
+    _ = @import("player.zig");
 }
 
 test "pickPixel hits the voxel under the pixel" {
