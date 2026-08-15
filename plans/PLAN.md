@@ -658,3 +658,22 @@ entries here record scope and outcome only.
      default world 14.33 -> 16.55 (h 128 -> 256). Startup (gen +
      warmup + 1 frame) 2.5 -> 4.5 s: the doubled height doubles the
      dense fill and the cave scan runs to the mountain surface.
+
+32. COMPLETED - Threaded render pool (DISTANCE.md D1). render.zig's
+     free render/transpose became a Renderer struct owning pool.zig's
+     persistent pool (3 std.Thread workers + main participates,
+     spawned at startup; workers sleep on an std.Io.Condition between
+     jobs and grab work items via an atomic counter). render
+     dispatches 32-column strips, transpose 16-row tile bands; writes
+     are disjoint per item, so output stays byte-identical (verified:
+     all four sweeps vs views_m31* identical). The World chunk-lookup
+     memo is sharded per pool participant (cache-line-padded slots
+     indexed by a threadlocal memo_slot the workers set at spawn);
+     freeChunk now clears every shard. Two-phase pool start: workers
+     hold a back-pointer, so the Pool/Renderer must not move after
+     start. Gates: zig build test green; bench (ms/frame, pre -> D1):
+     pinned 384x128x384 13.46 -> 4.47 (3.0x), default 480x270 16.0 ->
+     4.89 (3.3x), walk 960x540 21.9 -> 12.4 (1.8x; streamer update
+     inside the timed loop bounds it), spawn 960x540 31.4 -> 9.23
+     (3.4x). Machine: 20 cores, so ratios are representative of the
+     4-core target; absolute ms will differ there.

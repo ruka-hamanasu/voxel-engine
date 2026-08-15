@@ -5,6 +5,7 @@ const lighting = @import("lighting.zig");
 const spans = @import("render/spans.zig");
 const ao = @import("render/ao.zig");
 const shade = @import("render/shade.zig");
+const pool_mod = @import("pool.zig");
 
 const World = world_mod.World;
 const Camera = camera_mod.Camera;
@@ -225,43 +226,127 @@ fn detailBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, detail_dist: f32) f3
     return @max(detail_dist + t_enter, 0.0);
 }
 
-pub fn render(fb: []u32, width: usize, height: usize, world: *const World, lods: []const *const World, cam: Camera, params: RenderParams) void {
-    std.debug.assert(height <= shade.max_sky_height);
-    const fog_on = params.fog_density > 0;
-    if (fog_on) shade.buildFogLuts(params);
+/// Renderer instance owning the persistent worker pool
+/// (plans/DISTANCE.md D1). render/transpose split into disjoint work
+/// items grabbed via the pool's atomic counter; writes are
+/// column/tile-disjoint with no cross-item state, so pooled output is
+/// byte-identical to the inline zero-worker path. The shade/fog/palette
+/// LUTs stay module-global, written on the main thread before dispatch.
+pub const Renderer = struct {
+    pool: pool_mod.Pool = .{},
 
-    var sky_buf: [shade.max_sky_height]u32 = undefined;
-    const sky = sky_buf[0..height];
-    for (sky, 0..) |*px, row| px.* = shade.skyColor(row, height);
-    if (fog_on) {
-        // Blend the sky toward the fog color around the horizon row
-        // (always height/2: yaw-only camera) so geometry fogged out at
-        // the cutoff meets the backdrop seamlessly.
-        const hf: f32 = @floatFromInt(height);
-        const horizon = hf * 0.5;
-        const band = hf * 0.25;
-        for (sky, 0..) |*px, row| {
-            const w = 1.0 - @abs(@as(f32, @floatFromInt(row)) + 0.5 - horizon) / band;
-            if (w > 0) px.* = shade.lerpColor(px.*, params.fog_color, w);
+    /// Spawn worker_count render threads (pool_workers for the full
+    /// pool); never started, the renderer runs inline single-threaded.
+    /// Two-phase: the Renderer must not move after start (the pool's
+    /// workers hold a back-pointer).
+    pub fn start(self: *Renderer, worker_count: usize) !void {
+        try self.pool.start(worker_count);
+    }
+
+    pub fn deinit(self: *Renderer) void {
+        self.pool.deinit();
+    }
+
+    pub fn render(self: *Renderer, fb: []u32, width: usize, height: usize, world: *const World, lods: []const *const World, cam: Camera, params: RenderParams) void {
+        std.debug.assert(height <= shade.max_sky_height);
+        const fog_on = params.fog_density > 0;
+        if (fog_on) shade.buildFogLuts(params);
+
+        var sky_buf: [shade.max_sky_height]u32 = undefined;
+        const sky = sky_buf[0..height];
+        for (sky, 0..) |*px, row| px.* = shade.skyColor(row, height);
+        if (fog_on) {
+            // Blend the sky toward the fog color around the horizon row
+            // (always height/2: yaw-only camera) so geometry fogged out at
+            // the cutoff meets the backdrop seamlessly.
+            const hf: f32 = @floatFromInt(height);
+            const horizon = hf * 0.5;
+            const band = hf * 0.25;
+            for (sky, 0..) |*px, row| {
+                const w = 1.0 - @abs(@as(f32, @floatFromInt(row)) + 0.5 - horizon) / band;
+                if (w > 0) px.* = shade.lerpColor(px.*, params.fog_color, w);
+            }
+        }
+
+        const wf: f32 = @floatFromInt(width);
+        const hf0: f32 = @floatFromInt(height);
+        const f = (wf * 0.5) / @tan(hfov * 0.5);
+        // Vertical half-window slope (rows per unit XZ distance), hoisted
+        // out of the per-cell window math.
+        const s_max = hf0 * 0.5 / f;
+
+        const job: ColumnJob = .{ .fb = fb, .width = width, .height = height, .world = world, .lods = lods, .cam = cam, .f = f, .s_max = s_max, .sky = sky, .params = params };
+        self.pool.run(&job, ColumnJob.run, (width + ColumnJob.strip - 1) / ColumnJob.strip);
+    }
+
+    pub fn transpose(self: *Renderer, dst: []u32, src: []const u32, width: usize, height: usize) void {
+        const job: TransposeJob = .{ .dst = dst, .src = src, .width = width, .height = height };
+        self.pool.run(&job, TransposeJob.run, (height + TransposeJob.T - 1) / TransposeJob.T);
+    }
+};
+
+/// Full pool worker count: 3 workers + the participating main thread,
+/// sized for the 4-core D1 target.
+pub const pool_workers = pool_mod.max_participants - 1;
+
+/// Screen-column strip job: item i renders columns
+/// [i*strip, i*strip+strip). The march state is stack-local per column
+/// and fb strips are disjoint, so items never interact.
+const ColumnJob = struct {
+    /// Strip width in screen columns: small enough to balance
+    /// sky-cheap vs terrain-heavy columns across participants.
+    const strip = 32;
+
+    fb: []u32,
+    width: usize,
+    height: usize,
+    world: *const World,
+    lods: []const *const World,
+    cam: Camera,
+    f: f32,
+    s_max: f32,
+    sky: []const u32,
+    params: RenderParams,
+
+    fn run(self: *const ColumnJob, item: usize) void {
+        const x0 = item * strip;
+        const x1 = @min(x0 + strip, self.width);
+        const wf: f32 = @floatFromInt(self.width);
+        const fwd = self.cam.forward();
+        const rgt = self.cam.right();
+        for (x0..x1) |sx| {
+            const hx = (@as(f32, @floatFromInt(sx)) + 0.5 - wf * 0.5) / self.f;
+            const dx = fwd[0] + rgt[0] * hx;
+            const dz = fwd[1] + rgt[1] * hx;
+            renderColumn(self.fb, self.height, self.world, self.lods, self.cam, self.f, self.s_max, sx, dx, dz, self.sky, self.params);
         }
     }
+};
 
-    const wf: f32 = @floatFromInt(width);
-    const hf0: f32 = @floatFromInt(height);
-    const f = (wf * 0.5) / @tan(hfov * 0.5);
-    // Vertical half-window slope (rows per unit XZ distance), hoisted
-    // out of the per-cell window math.
-    const s_max = hf0 * 0.5 / f;
-    const fwd = cam.forward();
-    const rgt = cam.right();
+/// Transpose row-band job: item i transposes tile rows
+/// [i*T, i*T+T) x [0, width) — disjoint dst bands.
+const TransposeJob = struct {
+    const T = 16;
 
-    for (0..width) |sx| {
-        const hx = (@as(f32, @floatFromInt(sx)) + 0.5 - wf * 0.5) / f;
-        const dx = fwd[0] + rgt[0] * hx;
-        const dz = fwd[1] + rgt[1] * hx;
-        renderColumn(fb, height, world, lods, cam, f, s_max, sx, dx, dz, sky, params);
+    dst: []u32,
+    src: []const u32,
+    width: usize,
+    height: usize,
+
+    fn run(self: *const TransposeJob, item: usize) void {
+        const y0 = item * T;
+        const ye = @min(y0 + T, self.height);
+        var x0: usize = 0;
+        while (x0 < self.width) : (x0 += T) {
+            const xe = @min(x0 + T, self.width);
+            for (x0..xe) |x| {
+                for (y0..ye) |y| {
+                    self.dst[y * self.width + x] = self.src[x * self.height + y];
+                }
+            }
+        }
     }
-}
+};
 
 /// Per-column ray frame for true radial fog distance: the FINE
 /// march's squared XZ direction length (1 + hx^2) and reciprocal
@@ -919,25 +1004,6 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
     }
 }
 
-pub fn transpose(dst: []u32, src: []const u32, width: usize, height: usize) void {
-    // 16x16 tiled: the naive row-major walk over a column-major source
-    // is a cache-hostile gather (~2x slower at 960x540).
-    const T = 16;
-    var x0: usize = 0;
-    while (x0 < width) : (x0 += T) {
-        var y0: usize = 0;
-        while (y0 < height) : (y0 += T) {
-            const xe = @min(x0 + T, width);
-            const ye = @min(y0 + T, height);
-            for (x0..xe) |x| {
-                for (y0..ye) |y| {
-                    dst[y * width + x] = src[x * height + y];
-                }
-            }
-        }
-    }
-}
-
 pub fn writePpm(io: std.Io, allocator: std.mem.Allocator, path: []const u8, pixels: []const u32, width: usize, height: usize) !void {
     const header = try std.fmt.allocPrint(allocator, "P6\n{} {}\n255\n", .{ width, height });
     defer allocator.free(header);
@@ -956,6 +1022,7 @@ test {
     _ = spans;
     _ = ao;
     _ = shade;
+    _ = pool_mod;
 }
 
 test "fog disabled leaves segment colors untouched" {

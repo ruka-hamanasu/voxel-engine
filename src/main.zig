@@ -125,6 +125,12 @@ pub fn main(init: std.process.Init) !void {
     const staging = try allocator.alloc(u32, render_w * render_h);
     defer allocator.free(staging);
 
+    // Persistent render pool (plans/DISTANCE.md D1): created once at
+    // startup, shared by bench/headless/interactive renders.
+    var rnd: render.Renderer = .{};
+    try rnd.start(render.pool_workers);
+    defer rnd.deinit();
+
     // World setup: bounded test world (eager gen + floodAll + eager
     // LOD build) when --world-w/d are given, else the unbounded world
     // driven by the chunk streamer (plans/STREAMING.md phase 2).
@@ -263,7 +269,7 @@ pub fn main(init: std.process.Init) !void {
                 };
                 if (streamer) |*st| try st.update(cam);
             }
-            render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
+            rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -277,8 +283,8 @@ pub fn main(init: std.process.Init) !void {
         for (landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
         if (bounded) std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
-        render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
-        render.transpose(staging, framebuffer, render_w, render_h);
+        rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
+        rnd.transpose(staging, framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, staging, render_w, render_h);
         return;
     }
@@ -472,8 +478,8 @@ pub fn main(init: std.process.Init) !void {
         }
 
         rparams.time_s = time_s;
-        render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
-        render.transpose(staging, framebuffer, render_w, render_h);
+        rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
+        rnd.transpose(staging, framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, staging.ptr, @intCast(render_w * 4)) != 0) {
             std.log.err("SDL_UpdateTexture: {s}", .{c.SDL_GetError()});

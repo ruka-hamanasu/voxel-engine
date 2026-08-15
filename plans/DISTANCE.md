@@ -31,14 +31,18 @@ tier (D3) the centerpiece rather than an optional lever.
 
 ### D1. Threaded render pool
 
-Persistent `std.Thread` pool (3 workers + main participates, created at
-startup). `render` dispatches strips of screen columns; `transpose` is
-tiled-parallel too. Deterministic static partitioning, disjoint fb
-writes => output stays byte-identical.
+The renderer becomes a `Renderer` struct (render.zig) owning a
+persistent pool (pool.zig: 3 `std.Thread` workers + main participates,
+created at startup). `render` dispatches contiguous strips of screen
+columns grabbed via an atomic strip counter (better load balance than
+static 4-way splits on sky/terrain-split views); `transpose` is
+tiled-parallel the same way. Writes are column/tile-disjoint with no
+cross-strip state, so output stays byte-identical. A zero-worker
+`Renderer` runs inline (test path).
 
-- Fix the `World.last_key/last_chunk` memo: per-thread shard or
-  thread-local; the single-threaded assumption is documented at
-  world.zig.
+- Fix the `World.last_key/last_chunk` memo: shard it to one slot per
+  pool participant, indexed by a `threadlocal` slot id the pool sets
+  (world.zig). No accessor call-site changes.
 - `buildFogLuts`, palette anim, and `rebuildShadeLut` stay on the main
   thread before dispatch (they already run pre-render).
 - Gates: `zig build test`; all four PPM sweeps byte-identical

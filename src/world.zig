@@ -225,12 +225,30 @@ pub const World = struct {
     /// Bounding box (half-open) of everything touched by set/fillBox
     /// since the last takeDirty; consumed by milestone 10's relight.
     dirty: ?Region = null,
-    /// Last-lookup memo for the hot accessor path: the render march
-    /// and its AO sampling issue several consecutive lookups per chunk.
-    /// Mutated through the const accessors (World instances are always
-    /// owned mutably); single-threaded.
-    last_key: u64 = 0,
-    last_chunk: ?*Chunk = null,
+/// Last-lookup memo for the hot accessor path: the render march
+/// and its AO sampling issue several consecutive lookups per chunk.
+/// Mutated through the const accessors (World instances are always
+/// owned mutably). Sharded one slot per render-pool participant
+/// (plans/DISTANCE.md D1) — threads render concurrently, each using
+/// its own slot via memo_slot, so shards never race. Slot padding
+/// keeps one thread's shard writes off the others' cache lines.
+memo: [memo_slots]Memo = @splat(.{}),
+
+/// Render-pool participant index selecting the memo shard: the main
+/// thread keeps 0; pool workers set their own at spawn (pool.zig).
+pub threadlocal var memo_slot: usize = 0;
+
+/// Memo shard count, sized to the D1 render pool (main + 3 workers).
+pub const memo_slots = 4;
+
+/// Padded to its own cache line: concurrent render threads hold
+/// adjacent shards, and a shard write (chunk crossing) must not
+/// invalidate the other participants' lines.
+const Memo = struct {
+    key: u64 = 0,
+    chunk: ?*Chunk = null,
+    _pad: [48]u8 = @splat(0),
+};
 
     fn markDirty(self: *World, r: Region) void {
         if (self.dirty) |*cur| {
@@ -346,7 +364,9 @@ pub const World = struct {
     /// Remove and free the chunk at (cx, cz); no-op when not resident.
     pub fn freeChunk(self: *World, cx: i32, cz: i32) void {
         const kv = self.chunks.fetchRemove(chunkKey(cx, cz)) orelse return;
-        if (self.last_chunk == kv.value) self.last_chunk = null;
+        for (&self.memo) |*m| {
+            if (m.chunk == kv.value) m.chunk = null;
+        }
         self.destroyChunk(kv.value);
     }
 
@@ -395,13 +415,14 @@ pub const World = struct {
     /// keyed on the chunk coords, so out-of-bounds negatives stay safe.
     inline fn chunkAt(self: *const World, x: i32, z: i32) ?*Chunk {
         const key = chunkKey(x >> 6, z >> 6);
-        if (self.last_chunk) |lc| {
-            if (self.last_key == key) return lc;
+        const m = &self.memo[memo_slot];
+        if (m.chunk) |lc| {
+            if (m.key == key) return lc;
         }
         const chunk = self.chunks.get(key) orelse return null;
         const mut: *World = @constCast(self);
-        mut.last_key = key;
-        mut.last_chunk = chunk;
+        mut.memo[memo_slot].key = key;
+        mut.memo[memo_slot].chunk = chunk;
         return chunk;
     }
 
