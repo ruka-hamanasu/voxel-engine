@@ -1,7 +1,7 @@
 const std = @import("std");
 const world_mod = @import("../world.zig");
 
-/// Dense-tile generation scratch (STREAMING.md phase 0): generation
+/// Dense-tile generation scratch (plans/STREAMING.md phase 0): generation
 /// fills a tw x td x h tile of dense voxels, stamps cross-tile features
 /// (arches) into it, then run-encodes every column. Column-major
 /// layout ((lx*td + lz)*h + y) matches the world's column order.

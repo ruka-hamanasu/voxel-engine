@@ -118,7 +118,7 @@ pub const Player = struct {
         }
 
         // World bounds act as walls/floor/ceiling (solidAt reads OOB
-        // as air). XZ bounds lift for an unbounded world (STREAMING.md;
+        // as air). XZ bounds lift for an unbounded world (plans/STREAMING.md;
         // still always bounded pre-chunking); the Y clamp stays.
         const hf: f32 = @floatFromInt(world.h);
         const xb: ?usize = world.w;

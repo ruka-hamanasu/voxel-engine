@@ -8,7 +8,7 @@ const encodeDenseColumn = @import("gen/builder.zig").encodeDenseColumn;
 const World = world_mod.World;
 const chunk_w = world_mod.chunk_w;
 
-/// Chunk lifecycle (STREAMING.md phase 1). Kept out of world.zig so
+/// Chunk lifecycle (plans/STREAMING.md phase 1). Kept out of world.zig so
 /// the storage layer needs no upward imports: loadChunk drives the
 /// terrain tile pipeline, unloadChunk drives a lighting relight.
 
@@ -44,7 +44,7 @@ pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: 
 /// Finishing step of a (possibly frame-sliced) chunk load: register
 /// the chunk, run-encode the dense tile into it, and flood the chunk
 /// box. The streamer fills the builder tile over several frames, then
-/// commits in one step (STREAMING.md phase 2).
+/// commits in one step (plans/STREAMING.md phase 2).
 pub fn commitChunk(world: *World, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params) !void {
     _ = try world.ensureChunk(cx, cz);
     var tw: usize = chunk_w;
@@ -100,7 +100,7 @@ pub fn levelDims(fine_h: usize, level: u32) struct { side: usize, h: usize } {
     return .{ .side = @as(usize, chunk_w) >> shift, .h = (fine_h + (@as(usize, 1) << shift) - 1) >> shift };
 }
 
-/// Coarse-LOD chunk load (STREAMING.md phase 2 item 10): the chunk's
+/// Coarse-LOD chunk load (plans/STREAMING.md phase 2 item 10): the chunk's
 /// 64x64 coarse columns are synthesized from position-deterministic
 /// fine generation (genColumn + arch stamps over the 64*2^level-wide
 /// fine footprint, tiled through fine_builder) and downsampled through
@@ -200,7 +200,7 @@ pub fn synthCoarseColumn(ctx: *const terrain.Ctx, arches: []const terrain.Arch, 
 
 /// Re-synthesize from generation the resident coarse columns covering
 /// a fine-coords region — a fine chunk unload drops its edits, and the
-/// coarse tiers must follow (STREAMING.md phase 2). Skips non-resident
+/// coarse tiers must follow (plans/STREAMING.md phase 2). Skips non-resident
 /// coarse columns; finishes with a coarse relight when light params
 /// are passed (kept light runs let the stale-clear pass find chains
 /// from the previous content). grid/pyr/col/arches are caller scratch.

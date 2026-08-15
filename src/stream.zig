@@ -10,7 +10,7 @@ const Camera = @import("camera.zig").Camera;
 const World = world_mod.World;
 const chunk_w = world_mod.chunk_w;
 
-/// Chunk streamer (STREAMING.md phase 2 item 11): keeps a per-level
+/// Chunk streamer (plans/STREAMING.md phase 2 item 11): keeps a per-level
 /// Chebyshev disc of chunks resident around the camera — level i's
 /// radius = its max render distance (the handoff into level i+1, or
 /// the fog cutoff for the last level) in level voxels plus a small

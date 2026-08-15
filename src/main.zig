@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
     if (cam_to != null and res.args.bench == null) return error.CamToRequiresBench;
     if (res.args.seed) |seed| opts.seed = seed;
     // --world-w/--world-d are optional test bounds: both or neither.
-    // Neither gives the unbounded streamed world (STREAMING.md).
+    // Neither gives the unbounded streamed world (plans/STREAMING.md).
     if ((res.args.@"world-w" == null) != (res.args.@"world-d" == null))
         return error.BadWorldSize;
     const bounded = res.args.@"world-w" != null;
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
 
     // World setup: bounded test world (eager gen + floodAll + eager
     // LOD build) when --world-w/d are given, else the unbounded world
-    // driven by the chunk streamer (STREAMING.md phase 2).
+    // driven by the chunk streamer (plans/STREAMING.md phase 2).
     var result: ?gen.Result = null;
     defer if (result) |*r| r.deinit(allocator);
     var owned_world: ?World = null;
@@ -231,7 +231,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Synchronous streamer warm-up around the camera: headless/bench
     // output and the first interactive frames all see the full
-    // resident set (STREAMING.md phase 2 decision).
+    // resident set (plans/STREAMING.md phase 2 decision).
     if (streamer) |*st| {
         const wstart = std.Io.Clock.Timestamp.now(init.io, .awake);
         try st.runToCompletion(cam);
@@ -246,7 +246,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (bench_frames > 0) {
         // --cam-to walks the camera along a straight path over the
-        // bench frames (chunk-boundary streaming bench, STREAMING.md
+        // bench frames (chunk-boundary streaming bench, plans/STREAMING.md
         // phase 3): the streamer runs under the default per-frame
         // budget inside the timed loop, as in interactive play.
         const cam_start = cam;

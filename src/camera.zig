@@ -27,7 +27,7 @@ pub const Camera = struct {
         return .{ @sin(self.yaw), -@cos(self.yaw) };
     }
 
-    /// w/d are null for an unbounded world (STREAMING.md): the XZ
+    /// w/d are null for an unbounded world (plans/STREAMING.md): the XZ
     /// clamps drop out. h stays required — falling out of the sky or
     /// under the floor is never useful.
     pub fn update(self: *Camera, input: Input, dt: f32, w: ?usize, h: usize, d: ?usize) void {

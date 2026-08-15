@@ -20,7 +20,7 @@ pub const mat = struct {
 };
 
 /// Tile width/depth of the staged generation pipeline; origin-aligned
-/// so a chunked load (STREAMING.md phase 1, same 64-column chunk)
+/// so a chunked load (plans/STREAMING.md phase 1, same 64-column chunk)
 /// regenerates exactly the whole-world tiling.
 pub const tile_size = 64;
 
@@ -31,7 +31,7 @@ pub const tile_size = 64;
 pub const region_size = 128;
 const arch_candidates = 8;
 
-/// Position-deterministic generation context (STREAMING.md phase 0):
+/// Position-deterministic generation context (plans/STREAMING.md phase 0):
 /// everything a column, tile, or arch query needs, derived from the
 /// seed and world height alone. No mutable state, so results never
 /// depend on evaluation order — per-chunk gen equals whole-world gen.
@@ -78,7 +78,7 @@ const Span = struct { min: u16, max: u16 };
 
 /// Topmost solid y of the heightfield at (x, z). Pure, so arches and
 /// spawn compute flatness spans on the fly and any chunk/tile/LOD
-/// synthesis path regenerates the same surface. Biome split (WORLDGEN.md):
+/// synthesis path regenerates the same surface. Biome split (plans/WORLDGEN.md):
 /// a plains-biased continentality mask lerps flat plains into ridged
 /// mountains, so relief is small on the plains and towers in the ranges.
 pub fn heightAt(ctx: *const Ctx, x: i32, z: i32) u16 {
@@ -108,7 +108,7 @@ fn heightSpanAt(ctx: *const Ctx, x0: i32, z0: i32, wx: usize, wz: usize) Span {
 }
 
 /// Heightfield strata only — no caves or crystals. Coarse-LOD
-/// synthesis uses this (the ~10x cheaper approx lever, STREAMING.md):
+/// synthesis uses this (the ~10x cheaper approx lever, plans/STREAMING.md):
 /// the 8-voxel skin keeps caves sub-surface, so coarse column tops
 /// (and every above-ground silhouette) match exact synthesis, and the
 /// interior voids it fills are invisible past the fog.
@@ -316,7 +316,7 @@ fn stampArch(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, arch: Arch) 
 
 /// Apply every arch box covering column (x, z) — the per-column
 /// counterpart of stampArch for column-granular synthesis (coarse-LOD
-/// repair, STREAMING.md phase 2).
+/// repair, plans/STREAMING.md phase 2).
 pub fn archOverlayColumn(arches: []const Arch, h: usize, x: i32, z: i32, dense: []u8) void {
     for (arches) |arch| {
         for (archBoxes(arch, h)) |box| {
@@ -328,7 +328,7 @@ pub fn archOverlayColumn(arches: []const Arch, h: usize, x: i32, z: i32, dense: 
 
 /// Fill stage of the staged per-tile pipeline: dense-fill columns
 /// [col0, col1) in linear (lx*td + lz) order — column-ranged so the
-/// streamer can budget the fill across frames (STREAMING.md phase 2).
+/// streamer can budget the fill across frames (plans/STREAMING.md phase 2).
 /// caves=false selects the approx coarse-LOD synthesis (genColumnFast).
 pub fn genTileFill(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, td: usize, col0: usize, col1: usize, caves: bool) void {
     for (col0..col1) |ci| {
@@ -352,7 +352,7 @@ pub fn genTileArches(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize
 }
 
 /// Dense stage of the staged per-tile pipeline: fill + arch stamps.
-/// No world writes — coarse-LOD synthesis (STREAMING.md phase 2)
+/// No world writes — coarse-LOD synthesis (plans/STREAMING.md phase 2)
 /// consumes the dense tile directly. Tile origins are i32 so negative
 /// chunk coords work in the unbounded world.
 pub fn genTileDense(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
@@ -413,7 +413,7 @@ fn findSpawn(ctx: *const Ctx, bounds: ?[2]usize) struct { i32, i32 } {
 pub const SpawnPoint = struct { cam: Camera, landmarks: []gen.Landmark };
 
 /// Spawn camera + landmark list without generating a world
-/// (STREAMING.md phase 2: the unbounded default world never generates
+/// (plans/STREAMING.md phase 2: the unbounded default world never generates
 /// eagerly). Landmarks = the arches of the regions near spawn
 /// (headless debug logging + spawn yaw); bounds = null for the
 /// unbounded world.

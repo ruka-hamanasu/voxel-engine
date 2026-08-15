@@ -76,7 +76,7 @@ pub const Column = struct {
 
 pub const no_solid = std.math.maxInt(u16);
 
-/// Chunked storage (STREAMING.md phase 1): a chunk is 64x64 columns —
+/// Chunked storage (plans/STREAMING.md phase 1): a chunk is 64x64 columns —
 /// one 256 KB 64-aligned block — plus its own 8x8-cell macro_max grid
 /// (64 columns / 8 = 8 cells per side, so macro cells never straddle
 /// chunks). Per-column light runs stay per-column heap allocations.
@@ -197,7 +197,7 @@ pub const RunCursor = CursorFor(MatRun);
 pub const LightCursor = CursorFor(LightRun);
 
 /// Half-open edit/extent box. Signed (i32) so unbounded-world chunk
-/// boxes and dirty regions at negative coords work (STREAMING.md
+/// boxes and dirty regions at negative coords work (plans/STREAMING.md
 /// phase 2); y is always within [0, h] after clamping.
 pub const Region = struct {
     x0: i32,
@@ -449,7 +449,7 @@ pub const World = struct {
     }
 
     /// Mutable counterpart to columnAt; the one write path into columns,
-    /// so chunk residency (STREAMING.md) has a single indirection point.
+    /// so chunk residency (plans/STREAMING.md) has a single indirection point.
     pub inline fn columnAtMut(self: *World, x: i32, z: i32) ?*Column {
         if (!self.inBounds(x, z)) return null;
         const chunk = self.chunkAt(x, z) orelse return null;
@@ -507,7 +507,7 @@ pub const World = struct {
 
     /// Material at (x, y, z), or null when the column's chunk is not
     /// resident. The lighting flood confines propagation to resident
-    /// cells (STREAMING.md phase 2): no stored chain can then route
+    /// cells (plans/STREAMING.md phase 2): no stored chain can then route
     /// through an unloaded chunk, so a chunk load invalidates no
     /// existing light and floods as a pure add pass.
     pub inline fn getResident(self: *const World, x: i32, y: i32, z: i32) ?u8 {

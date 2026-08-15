@@ -75,7 +75,7 @@ const neighbor_offsets = .{ .{ 1, 0, 0, Dir.px }, .{ -1, 0, 0, Dir.nx }, .{ 0, 1
 ///
 /// Keys are BOX-LOCAL: ((x-x0)*zd + (z-z0))*h + y, so the u32 key cap
 /// bounds one flood box (a chunk plus its reach ring once streaming
-/// lands, STREAMING.md), not the world volume. Origins are i32 so
+/// lands, plans/STREAMING.md), not the world volume. Origins are i32 so
 /// chunk boxes at negative coords work in the unbounded world.
 ///
 /// The map uses a multiplicative-mix hash (the ChunkMap trick): box-
@@ -160,7 +160,7 @@ const Scratch = struct {
 /// Load the footprint columns' light runs into the scratch (relight
 /// only; floodAll starts from an empty scratch). Zero-intensity
 /// interior runs are not inserted; the map's absence decodes as 0.
-/// Unloaded columns (chunk map, STREAMING.md) are skipped — their
+/// Unloaded columns (chunk map, plans/STREAMING.md) are skipped — their
 /// absence also decodes as 0.
 fn decodeColumns(world: *World, s: *Scratch) !void {
     var x = s.x0;
@@ -217,7 +217,7 @@ fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), alloc
 /// non-increasing level order, so the first write to a cell is the
 /// brightest and strict `>` makes ties resolve to the earliest seed
 /// (deterministic). Solid neighbors are terminal and record nothing.
-/// Non-resident columns (chunk map, STREAMING.md) are terminal too:
+/// Non-resident columns (chunk map, plans/STREAMING.md) are terminal too:
 /// confining propagation to resident cells means no stored chain can
 /// route through an unloaded chunk, so chunk loads never invalidate
 /// existing light (chunk.loadChunk floods as a pure add pass), and
@@ -320,7 +320,7 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
 }
 
 /// Full-world flood; bounded worlds only (the chunk streaming path
-/// floods per chunk on load, STREAMING.md phase 2).
+/// floods per chunk on load, plans/STREAMING.md phase 2).
 pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !Stats {
     const w: i32 = @intCast(world.w orelse unreachable);
     const d: i32 = @intCast(world.d orelse unreachable);
@@ -382,7 +382,7 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
     // The stale scan only acts on cells with decoded light, so it
     // iterates the scratch map (the lit cells) filtered to the dirty
     // region, not the region's half-million cells (chunk loads,
-    // STREAMING.md phase 2). Start cells are collected first —
+    // plans/STREAMING.md phase 2). Start cells are collected first —
     // clearChain mutates the map.
     if (s.map.count() != 0) {
         var starts: std.ArrayList(u32) = .empty;
@@ -415,7 +415,7 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
     for (reseeds.items) |vi| {
         if (s.intensity(vi) != 0) try queue.append(allocator, vi);
     }
-    // Fast path (the common chunk load, STREAMING.md phase 2): no
+    // Fast path (the common chunk load, plans/STREAMING.md phase 2): no
     // decoded light, no stale clears, no seeds — nothing can change.
     // Skipping encodeColumns is valid because it would only clear and
     // re-encode the box's (all-null) light runs.
