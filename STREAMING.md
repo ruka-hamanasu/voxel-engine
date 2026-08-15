@@ -58,7 +58,22 @@
   14.56 (march sees terrain past the old 384 edge). Warm-up 1.3 s
   (was 6.8 s exact/2.9 s approx before the relight fast paths).
   MaxRSS: unbounded 34 MB vs bounded 38 MB; fine tier ~7 MB.
-- Phase 3 — not started.
+- **Phase 3 — DONE** (PLAN.md milestone 29). Item 13's tests were
+  already landed with phases 0-2 (tile independence
+  gen/terrain.zig, loadChunk == eager gen and per-chunk floods ==
+  floodAll + unload == reflood + coarse parity in src/chunk.zig,
+  unload/reload round-trip in src/stream.zig); this phase filled the
+  item-14 gaps. `--cam-to` gives --bench a camera path: the camera
+  lerps over the bench frames and the streamer runs under the
+  default per-frame budget inside the timed loop. Walk bench
+  (/tmp/opencode/walk_bench.sh, 960x540, unbounded, spawn -> +320 x
+  = 5 fine chunk boundaries over 240 frames): 16.7-16.9 ms/frame
+  with 28 chunk loads vs 14.5 static spawn — streaming adds ~2.3
+  ms/frame while walking. New unbounded worst view
+  (-150,55,-150,5.5): 14.9. Memory (/tmp/opencode/mem.sh, /proc
+  VmHWM polling): unbounded 31.4 MB vs bounded 38.4 MB peak.
+  Verification: zig build test green; all four sweeps
+  byte-identical (views_m26[/]_lod0, views_m28[/]_lod0).
 
 Decisions (agreed): **unbounded** world; worldgen becomes
 position-deterministic and the default world's feature placement changes
@@ -203,13 +218,14 @@ must remain byte-identical.
 13. Tests: per-chunk gen equals whole-region gen over overlaps
     (determinism); unload/reload round-trip identity; chunk-border light
     equals a single big flood on a bounded test world; existing suites
-    updated for the accessor/chunkmap API.
-14. Regression: regenerate views_m24 / views_m22_lod0 baselines against
-    the new worldgen; identity paths (`--no-light --fog 0`, `--lod 0`)
-    byte-identical after regeneration; bench A/B vs milestone-25 numbers
-    (spawn/worst/aerial/cave) plus a walk-across-chunk-boundaries
-    scenario; memory measurement (target: ~50 MB resident -> single-
-    digit MB fine tier).
+    updated for the accessor/chunkmap API. (All landed with phases 0-2;
+    see the status section.)
+14. Regression: baselines regenerated against the new worldgen as
+    views_m26[/]_lod0 (bounded) and views_m28[/]_lod0 (unbounded),
+    rerun byte-identical; bench A/B recorded per milestone (m26-m28)
+    plus the walk-across-chunk-boundaries scenario (--cam-to bench
+    path, /tmp/opencode/walk_bench.sh); memory measurement
+    (/tmp/opencode/mem.sh).
 
 ## Generation cost
 

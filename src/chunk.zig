@@ -312,8 +312,9 @@ test "per-chunk load floods match a single whole-world flood" {
     // color would extend its field past the reference's, which the
     // strict intensity check would catch along the path), and either
     // resolution is a valid fixpoint. Arrival dirs likewise differ at
-    // ties and are not compared.
-    var ties: usize = 0;
+    // ties and are not compared. (No stderr diagnostics: the 0.16
+    // build runner displays any captured test stderr under a
+    // misleading "failed command" header.)
     for (0..opts.w) |x| {
         for (0..opts.d) |z| {
             const ca = r.world.columnAt(@intCast(x), @intCast(z)).?;
@@ -322,15 +323,11 @@ test "per-chunk load floods match a single whole-world flood" {
                 const sa = lighting.sampleLight(ca, @intCast(y));
                 const sb = lighting.sampleLight(cb, @intCast(y));
                 try std.testing.expectEqual(sa.intensity, sb.intensity);
-                if (sa.intensity != 0 and sa.intensity == sb.intensity and sa.color_id != sb.color_id) {
-                    ties += 1;
-                } else {
-                    try std.testing.expectEqual(sa.color_id, sb.color_id);
-                }
+                const tied = sa.intensity != 0 and sa.color_id != sb.color_id;
+                if (!tied) try std.testing.expectEqual(sa.color_id, sb.color_id);
             }
         }
     }
-    std.debug.print("load-flood parity: {} two-seed tie cells\n", .{ties});
 }
 
 test "coarse chunk synthesis matches eager lod.build" {
@@ -381,7 +378,6 @@ test "coarse chunk synthesis matches eager lod.build" {
     // Light too matches over the full extent (resident-cell
     // confinement == the bounded reference's box confinement), with
     // the fine parity test's tie rule.
-    var ties: usize = 0;
     for (0..ref1.w.?) |x| {
         for (0..ref1.d.?) |z| {
             const ca = ref1.columnAt(@intCast(x), @intCast(z)).?;
@@ -390,15 +386,11 @@ test "coarse chunk synthesis matches eager lod.build" {
                 const sa = lighting.sampleLight(ca, @intCast(y));
                 const sb = lighting.sampleLight(cb, @intCast(y));
                 try std.testing.expectEqual(sa.intensity, sb.intensity);
-                if (sa.intensity != 0 and sa.intensity == sb.intensity and sa.color_id != sb.color_id) {
-                    ties += 1;
-                } else {
-                    try std.testing.expectEqual(sa.color_id, sb.color_id);
-                }
+                const tied = sa.intensity != 0 and sa.color_id != sb.color_id;
+                if (!tied) try std.testing.expectEqual(sa.color_id, sb.color_id);
             }
         }
     }
-    std.debug.print("coarse synthesis parity: {} two-seed tie cells\n", .{ties});
 
     // Level 2: one synthesized chunk covers the 64x24x64 world.
     var c2 = try World.init(allocator, null, 24, null);

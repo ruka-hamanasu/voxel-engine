@@ -576,7 +576,25 @@ entries here record scope and outcome only.
      byte-identical. Bench (960x540, bounded, m27 -> m28): spawn
      13.39 -> 13.29, aerial 9.56 -> 9.49, cave neutral; unbounded
      spawn 14.56 (the march sees terrain past the old 384 edge).
-     MaxRSS unbounded 34 MB vs bounded 38 MB (fine tier ~7 MB).
+      MaxRSS unbounded 34 MB vs bounded 38 MB (fine tier ~7 MB).
+
+29. COMPLETED - Chunked-streaming phase 3: verification (STREAMING.md;
+      detail tracked there). The item-13 suites were already in place
+      from milestones 26-28 (tile independence, loadChunk == eager gen,
+      per-chunk floods == floodAll, unload == reflood, coarse parity,
+      unload/reload round-trip); this milestone filled the item-14 gaps.
+      New `--cam-to` CLI: --bench lerps the camera from the start cam
+      to --cam-to over the bench frames and runs the streamer under the
+      default per-frame budget inside the timed loop (a cumulative
+      Streamer.loads counter backs the bench's chunk-load report).
+      Walk bench (/tmp/opencode/walk_bench.sh, 960x540, unbounded,
+      spawn -> +320 x = 5 fine chunk boundaries over 240 frames,
+      default budget): 16.7-16.9 ms/frame with 28 chunk loads vs 14.5
+      static spawn; new unbounded worst view (-150,55,-150,5.5) 14.9.
+      Reproducible memory measurement (/tmp/opencode/mem.sh, /proc
+      VmHWM polling): unbounded 31.4 MB vs bounded 38.4 MB peak.
+      Regression: zig build test green; all four sweeps byte-identical
+      to views_m26[/]_lod0 and views_m28[/]_lod0.
 
 25. COMPLETED - N-level LOD cascade. renderColumn's hardcoded
      fine->lod1->lod2 chain generalizes to a chain of up to max_lods (8)

@@ -18,6 +18,16 @@ const terrain = @import("gen/terrain.zig");
 const anim = @import("anim.zig");
 const clap = @import("clap");
 
+fn parseCam(s: []const u8) ![4]f32 {
+    var parts = std.mem.splitScalar(u8, s, ',');
+    var vals: [4]f32 = undefined;
+    for (&vals) |*v| {
+        const part = parts.next() orelse return error.BadCamValue;
+        v.* = try std.fmt.parseFloat(f32, part);
+    }
+    return vals;
+}
+
 pub fn main(init: std.process.Init) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help            Display this help and exit.
@@ -26,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
         \\    --gen <GEN>       World generator: terrain.
         \\    --cam <CAM>       Camera override as "x,y,z,yaw".
         \\    --bench <u32>     Render N frames and report ms/frame.
+        \\    --cam-to <CAM>    Bench-mode camera path end ("x,y,z,yaw"): the camera lerps from the start cam over the bench frames, driving the streamer each frame.
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
         \\    --lod <f32>       First LOD switch distance (default 96; 0 disables the coarse worlds).
@@ -73,16 +84,9 @@ pub fn main(init: std.process.Init) !void {
         return clap.helpToFile(init.io, .stdout(), clap.Help, &params, .{});
 
     var opts: gen.Options = .{};
-    var cam_override: ?[4]f32 = null;
-    if (res.args.cam) |cam_str| {
-        var parts = std.mem.splitScalar(u8, cam_str, ',');
-        var vals: [4]f32 = undefined;
-        for (&vals) |*v| {
-            const part = parts.next() orelse return error.BadCamValue;
-            v.* = try std.fmt.parseFloat(f32, part);
-        }
-        cam_override = vals;
-    }
+    const cam_override = if (res.args.cam) |s| try parseCam(s) else null;
+    const cam_to = if (res.args.@"cam-to") |s| try parseCam(s) else null;
+    if (cam_to != null and res.args.bench == null) return error.CamToRequiresBench;
     if (res.args.seed) |seed| opts.seed = seed;
     // --world-w/--world-d are optional test bounds: both or neither.
     // Neither gives the unbounded streamed world (STREAMING.md).
@@ -231,13 +235,31 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (bench_frames > 0) {
+        // --cam-to walks the camera along a straight path over the
+        // bench frames (chunk-boundary streaming bench, STREAMING.md
+        // phase 3): the streamer runs under the default per-frame
+        // budget inside the timed loop, as in interactive play.
+        const cam_start = cam;
+        const loads_before = if (streamer) |*st| st.loads else 0;
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
-        for (0..bench_frames) |_| {
+        for (0..bench_frames) |i| {
+            if (cam_to) |v| {
+                const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(@max(bench_frames - 1, 1)));
+                cam = .{
+                    .x = cam_start.x + (v[0] - cam_start.x) * t,
+                    .y = cam_start.y + (v[1] - cam_start.y) * t,
+                    .z = cam_start.z + (v[2] - cam_start.z) * t,
+                    .yaw = cam_start.yaw + (v[3] - cam_start.yaw) * t,
+                };
+                if (streamer) |*st| try st.update(cam);
+            }
             render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
         std.debug.print("bench: {} frames, {d:.3} ms/frame\n", .{ bench_frames, ns / 1e6 / @as(f64, @floatFromInt(bench_frames)) });
+        if (cam_to != null and streamer != null)
+            std.debug.print("bench stream: {} chunks loaded\n", .{streamer.?.loads - loads_before});
         if (headless_path == null) return;
     }
 

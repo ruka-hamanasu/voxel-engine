@@ -58,6 +58,8 @@ pub const Streamer = struct {
     queue: std.ArrayList(Work), // pending loads, sorted level/dist first
     repairs: std.ArrayList(Work), // pending coarse re-syntheses
     in_flight: ?InFlight,
+    /// Cumulative queued chunk loads started (all levels) — bench stats.
+    loads: usize = 0,
 
     const Work = struct {
         level: u32, // 0 = fine; repairs always coarse
@@ -370,6 +372,7 @@ pub const Streamer = struct {
         // May have become resident while queued (forceResident).
         if (self.levelWorld(w.level).chunks.contains(world_mod.chunkKey(w.cx, w.cz))) return;
         self.in_flight = .{ .level = w.level, .cx = w.cx, .cz = w.cz, .tile = 0, .col = 0 };
+        self.loads += 1;
     }
 
     /// Fill up to `remaining` columns of the in-flight chunk's current
