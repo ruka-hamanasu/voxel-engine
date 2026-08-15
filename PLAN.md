@@ -23,7 +23,8 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 
 - Voxel size: ~10cm (the milestone-23 walking player is 6x16x6 voxels
   = 0.6x1.6x0.6 m, eye at 14)
-- World height: Configurable
+- World height: Configurable (default 256; the bounded regression
+  gates pin 128)
 - Demo world extent: unbounded, chunk-streamed (milestone 28;
   status and plan tracked in STREAMING.md). Bounded test worlds via
   --world-w/--world-d (default for the regression gates: 384x128x384).
@@ -639,3 +640,21 @@ entries here record scope and outcome only.
      HEAD pre-change, so views_m30* are the new baselines). Bench
      (480x270 spawn, ms/frame): old config 5.83 -> new default 9.79 —
      ~2 ms from the 1.5x march distance, ~2 ms from detail 48 -> 144.
+
+31. COMPLETED - Biome-split terrain + default height 256 (design:
+     WORLDGEN.md heightfield section). heightAt lerps flat plains into
+     ridged mountains by a continentality mask; caves, crystals,
+     arches, and spawn logic unchanged. Default --world-h 128 -> 256
+     for mountain headroom. New biome-split test pins plains-majority
+     + real mountains; the rest of the suite passed unmodified (the
+     feared all-mountain 64x96x64 test world did not occur).
+     Regression: the bounded sweeps pin --world-h 128 (the 384x128x384
+     gate is preserved); grid/aerial/cave cameras re-tuned for the new
+     terrain (bounded y 44/70/100, aerial 90, caves at verified
+     interiors; stream y 90/130/180, aerial 160); all four baselines
+     regenerated as views_m31*, rerun byte-identical. Bench (480x270
+     spawn, ms/frame, old -> new): pinned 384x128x384 11.93 -> 13.89
+     (more relief in view — a scene change, not a code regression);
+     default world 14.33 -> 16.55 (h 128 -> 256). Startup (gen +
+     warmup + 1 frame) 2.5 -> 4.5 s: the doubled height doubles the
+     dense fill and the cave scan runs to the mountain surface.

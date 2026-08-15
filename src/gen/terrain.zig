@@ -37,6 +37,7 @@ const arch_candidates = 8;
 /// depend on evaluation order — per-chunk gen equals whole-world gen.
 pub const Ctx = struct {
     n_terrain: Noise,
+    n_biome: Noise,
     n_mask: Noise,
     n_cave_a: Noise,
     n_cave_b: Noise,
@@ -44,7 +45,8 @@ pub const Ctx = struct {
     n_arch: Noise,
     h: usize,
     base: f32,
-    amp: f32,
+    plain_amp: f32,
+    mount_amp: f32,
     sand_level: f32,
     hi_cap: i32,
 
@@ -53,9 +55,10 @@ pub const Ctx = struct {
         const n_terrain = Noise.init(seed);
         const hf: f32 = @floatFromInt(h);
         const base = hf * 0.30;
-        const amp = hf * 0.16;
+        const plain_amp = hf * 0.02;
         return .{
             .n_terrain = n_terrain,
+            .n_biome = n_terrain.reseed(0xB10BE),
             .n_mask = n_terrain.reseed(0x51ED),
             .n_cave_a = n_terrain.reseed(0xCA0EA),
             .n_cave_b = n_terrain.reseed(0xCA0EB),
@@ -63,8 +66,9 @@ pub const Ctx = struct {
             .n_arch = n_terrain.reseed(0xA4C4),
             .h = h,
             .base = base,
-            .amp = amp,
-            .sand_level = base - amp * 0.45,
+            .plain_amp = plain_amp,
+            .mount_amp = hf * 0.3,
+            .sand_level = base - plain_amp * 0.45,
             .hi_cap = @intCast(h - 12),
         };
     }
@@ -74,12 +78,19 @@ const Span = struct { min: u16, max: u16 };
 
 /// Topmost solid y of the heightfield at (x, z). Pure, so arches and
 /// spawn compute flatness spans on the fly and any chunk/tile/LOD
-/// synthesis path regenerates the same surface.
+/// synthesis path regenerates the same surface. Biome split (WORLDGEN.md):
+/// a plains-biased continentality mask lerps flat plains into ridged
+/// mountains, so relief is small on the plains and towers in the ranges.
 pub fn heightAt(ctx: *const Ctx, x: i32, z: i32) u16 {
     const xf: f32 = @floatFromInt(x);
     const zf: f32 = @floatFromInt(z);
-    const hn = ctx.n_terrain.fbm2(xf / 36.0, zf / 36.0, 4);
-    const hi: i32 = std.math.clamp(@as(i32, @intFromFloat(ctx.base + hn * ctx.amp)), 6, ctx.hi_cap);
+    const bn = ctx.n_biome.fbm2(xf / 384.0, zf / 384.0, 2);
+    const t = std.math.clamp((bn + 0.1) / 0.7, 0.0, 1.0);
+    const mask = t * t * (3.0 - 2.0 * t);
+    const plains = ctx.n_terrain.fbm2(xf / 128.0, zf / 128.0, 3) * ctx.plain_amp;
+    const ridged = 1.0 - @abs(ctx.n_terrain.fbm2(xf / 96.0, zf / 96.0, 4));
+    const mountains = ridged * ctx.mount_amp;
+    const hi: i32 = std.math.clamp(@as(i32, @intFromFloat(ctx.base + std.math.lerp(plains, mountains, mask))), 6, ctx.hi_cap);
     return @intCast(hi);
 }
 
@@ -610,4 +621,30 @@ test "caves have player-height headroom" {
         }
     }
     try std.testing.expect(walkable > 0);
+}
+
+test "biome split yields both plains and mountains" {
+    // Sample the pure heightfield over a few mask wavelengths: plains
+    // must dominate (flat, near base) and real mountains must exist.
+    const ctx = Ctx.init(1337, 256);
+    var flat_cols: usize = 0; // relief proxy: height within plains band
+    var high_cols: usize = 0; // mountain proxy: well above base
+    var total: usize = 0;
+    var lo: u16 = std.math.maxInt(u16);
+    var hi: u16 = 0;
+    var z: i32 = -2048;
+    while (z <= 2048) : (z += 8) {
+        var x: i32 = -2048;
+        while (x <= 2048) : (x += 8) {
+            const h = heightAt(&ctx, x, z);
+            lo = @min(lo, h);
+            hi = @max(hi, h);
+            const hf: f32 = @floatFromInt(h);
+            if (hf < ctx.base + 3.0 * ctx.plain_amp) flat_cols += 1;
+            if (hf > ctx.base + 0.5 * ctx.mount_amp) high_cols += 1;
+            total += 1;
+        }
+    }
+    try std.testing.expect(hi > @as(u16, @intFromFloat(ctx.base + 0.5 * ctx.mount_amp)));
+    try std.testing.expect(flat_cols * 2 > total); // plains are the majority biome
 }

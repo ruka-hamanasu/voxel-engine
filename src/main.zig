@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
         \\    --height <usize>  Render height (default 270).
         \\    --scale <u32>     Window scale factor vs render resolution (default 2).
     \\    --world-w <usize> World width in columns (bounded test world; default: unbounded, streamed).
-    \\    --world-h <usize> World height in voxels (default 128, max 65535).
+    \\    --world-h <usize> World height in voxels (default 256, max 65535).
     \\    --world-d <usize> World depth in columns (requires --world-w).
     \\    --load-budget <usize> Streamer dense-fill columns per frame (default 1200).
     \\    --exact-coarse   Synthesize coarse LOD chunks with full cave/crystal noise (default: approx, sub-skin caves skipped).

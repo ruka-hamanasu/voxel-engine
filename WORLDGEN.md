@@ -11,13 +11,22 @@ they can never disagree about the surface.
 
 ## Heightfield (current)
 
-- `heightAt`: `fbm2(x/36, z/36, 4)`, height =
-  `clamp(base + n * amp, 6, h - 12)` with base = 0.30h, amp = 0.16h.
-  Single-scale noise: relief is ~1.3 player heights (player is 16
-  voxels) and plains are exactly as rough as the peaks — the "player
-  feels gigantic" problem.
+- `heightAt` is a biome split (milestone 31): a continentality mask
+  (`n_biome` reseed, `fbm2(x/384, z/384, 2)` through a plains-biased
+  smoothstep, `t = clamp((bn + 0.1) / 0.7, 0, 1)`, `t*t*(3-2t)`)
+  lerps between plains (`fbm2(x/128, z/128, 3)` at 0.02h
+  amplitude — long-wavelength, ~5-voxel relief) and ridged mountains
+  (`1 - |fbm2(x/96, z/96, 4)|` at 0.3h — sharp ridgelines, peaks ~5
+  player heights above the plains). `n_terrain` serves both biome
+  fields. `height = base + lerp(plains, mountains, mask)`,
+  `clamp(.., 6, h - 12)`, base = 0.30h. Default world height is 256
+  for mountain headroom; RLE columns make the extra height ~free, the
+  real cost is the deeper cave scan under mountains. At seed 1337 the
+  split lands ~71% plains, ~13% mountains; the mask's hundreds-of-
+  voxels wavelength keeps both biomes in large contiguous patches.
 - Strata per column: bedrock at y=0, stone below surface-4, dirt, grass
-  on top; sand replaces dirt/grass below `sand_level = base - 0.45*amp`.
+  on top; sand replaces dirt/grass below `sand_level = base -
+  0.45*plain_amp` (beaches in the low plains only).
 
 ## Caves & crystals
 
@@ -56,36 +65,3 @@ they can never disagree about the surface.
 - Camera spawns with feet on the surface (eye 14 up); yaw aims at the
   nearest arch landmark within 192 voxels.
 
-## Plan: larger plains, higher mountains
-
-Goal: the player stops feeling gigantic — large flat plains and
-mountains that tower over them.
-
-1. **Biome-split heightfield** (`heightAt`, contained to terrain.zig):
-   - Continentality mask: new `n_biome` noise (Ctx reseed),
-     `fbm2(x/384, z/384, 2)` smoothstepped to [0,1] with a plains bias,
-     so plains and ranges span hundreds of voxels.
-   - Plains: `fbm2(x/128, z/128, 3)` at ~0.02h amplitude — long
-     wavelength, ~5-voxel relief.
-   - Mountains: ridged fbm `1 - |fbm2(x/96, z/96, 4)|` at ~0.3h
-     amplitude — sharp ridgelines, peaks ~5+ player heights above the
-     plains.
-   - `height = base + lerp(plains, mountains, mask)`; the [6, h-12]
-     clamp is unchanged.
-   - `sand_level` re-derived from base/plain_amp (beaches in the low
-     plains only).
-   - Caves, crystals, arches, spawn logic unchanged (arch flatness
-     checks get easier on flatter plains; caves simply run deeper under
-     mountains).
-2. **Default world height 128 -> 256** (`--world-h` default in
-   main.zig) for mountain headroom. Memory is ~free: columns are RLE
-   runs, so cost scales with strata/detail count, not raw height (a
-   512-voxel column is still 2–3 runs; see the Storage section of
-   PLAN.md). The real cost is a deeper per-column cave scan at gen
-   time under mountains.
-3. Update PLAN.md's scale section for the new default.
-
-Verification: `zig build test` green (the 64x96x64 "caves and arches
-exist" test may need amplitude tuning if that seed's small world lands
-all-mountain); headless spawn render to eyeball the plains/mountain
-silhouette.

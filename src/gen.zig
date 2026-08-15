@@ -5,7 +5,7 @@ const Camera = @import("camera.zig").Camera;
 pub const Options = struct {
     seed: u64 = 1337,
     w: usize = 384,
-    h: usize = 128,
+    h: usize = 256,
     d: usize = 384,
 };
 

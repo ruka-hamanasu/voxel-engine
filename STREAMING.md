@@ -229,9 +229,11 @@ must remain byte-identical.
 
 ## Generation cost
 
-Cave noise dominates: per column, one `fbm2` heightfield eval (~48
-`mix` ops) and ~28 y-positions x two `fbm3` cave evals (~3.5k mixes)
-where the cave mask passes (~half of columns). Grounding: milestone 17
+Cave noise dominates: per column, three `fbm2` heightfield evals (the
+milestone-31 biome split) and a cave scan of two `fbm3` evals per
+y-position from bedrock to surface-9 (~28 positions on the h=128
+plains, up to ~145 under h=256 mountains) where the cave mask passes
+(~half of columns). Grounding: milestone 17
 measured 768x1024x768 gen + LOD + 3 floods at 51 s in Debug; estimating
 gen at ~20-30 us/column Debug gives ~3-8 us/column in ReleaseSafe, so a
 64x64x128 chunk lands at ~15-40 ms and a 32x32 chunk at ~4-10 ms.
