@@ -257,7 +257,7 @@ src/anim.zig         # emissive palette pulse (time-driven, identity at t=0)
 src/gen.zig          # generator facade: Options/Result/Landmark, Generator enum dispatch
 src/gen/noise.zig    # seeded value noise + fBm (shared by generators)
 src/gen/builder.zig  # dense-column scratch + run encoding (shared by generators)
-src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals
+src/gen/terrain.zig  # demo world: heightmap terrain, caves, arches, crystals (WORLDGEN.md)
 ```
 
 ## Milestones
@@ -401,8 +401,8 @@ entries here record scope and outcome only.
      via the u16 y caches; volume < 2^32 for the flood's u32 cell keys,
      asserted in World.init). macro_max u8 -> u16 lifts the skip grid's
      h <= 256 gate; solid_mask keeps its h <= 64 gate (tall worlds take
-     the run-scan AO path). Terrain scales with h (base 0.30h, amp
-     0.16h), so 768x1024x768 mountains reach ~470. Regression: both
+     the run-scan AO path). Terrain scales with h (WORLDGEN.md), so
+     768x1024x768 mountains reach ~470. Regression: both
      view sweeps byte-identical to pre-change.
 17. COMPLETED - Sparse lighting scratch. The flood's working memory was
      3 B/voxel dense over the box (1.8 GB at 768x1024x768); it is now
@@ -481,14 +481,9 @@ entries here record scope and outcome only.
 
 22. COMPLETED - World rescale for a 16-voxel player (walking prep).
      Default world 192x64x192 -> 384x128x384 so caves with 16+
-     headroom fit under the 0.30h terrain base. Caves: noise /13,/9 ->
-     /24,/36 plus an 8-voxel solid skin under the surface (per-column
-     skin, so sloped terrain still gets skylit slot-canyon breaches —
-     kept, they read as cave entrances); tunnels ~10 wide x 14-28
-     headroom (3056 columns with 20+ in the default world). Crystals
-     2 -> 4 tall. Arches ~3x (27w x 33h x 6 thick, 17x18 opening),
-     density /8192 -> /16384, lenient flatness span (12), lintel
-     world-top clip guard. Spawn eye ground+15, pick_dist 16 -> 32.
+     headroom fit under the 0.30h terrain base. Caves, crystals,
+     arches, spawn eye, and pick_dist rescaled to match (worldgen
+     design: WORLDGEN.md).
      Consequence: the default world now exceeds the solid_mask h <= 64
      gate, so AO neighbor sampling takes the run-scan path. Bench
      (960x540, ms/frame): spawn 6.49, mid-terrain worst 7.17, aerial
