@@ -37,12 +37,13 @@ pub fn main(init: std.process.Init) !void {
         \\    --cam <CAM>       Camera override as "x,y,z,yaw".
         \\    --bench <u32>     Render N frames and report ms/frame.
         \\    --cam-to <CAM>    Bench-mode camera path end ("x,y,z,yaw"): the camera lerps from the start cam over the bench frames, driving the streamer each frame.
+        \\    --dist <f32>      Master draw distance (default 672): derives fog cutoff/density, LOD distances, and detail distance; the flags below override individual derivations.
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
-        \\    --lod <f32>       First LOD switch distance (default 96; 0 disables the coarse worlds).
-        \\    --lod2 <f32>      Second LOD switch distance (default 192; 0 ends the chain there).
+        \\    --lod <f32>       First LOD switch distance (default 144; 0 disables the coarse worlds).
+        \\    --lod2 <f32>      Second LOD switch distance (default 288; 0 ends the chain there).
         \\    --lods <u32>      Coarse LOD levels (default: the positive --lod/--lod2 entries); handoffs past --lod2 double.
-        \\    --detail <f32>    Per-voxel shading detail distance (default 48; 0 = full detail everywhere).
+        \\    --detail <f32>    Per-voxel shading detail distance (default: the first LOD distance; 0 = full detail everywhere).
         \\    --atten <u8>      Light attenuation.
         \\    --no-light        Disable lighting.
         \\    --no-anim         Disable palette animation.
@@ -154,6 +155,10 @@ pub fn main(init: std.process.Init) !void {
     if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
     render.rebuildShadeLut();
     var rparams: render.RenderParams = .{};
+    if (res.args.dist) |dist| {
+        if (dist <= 0) return error.BadDrawDistance;
+        rparams = render.RenderParams.forDrawDistance(dist);
+    }
     rparams.light = light_enabled;
     if (res.args.fog) |d| rparams.fog_density = d;
     if (res.args.fogcut) |co| rparams.fog_cutoff = co;
@@ -173,7 +178,12 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
-    if (res.args.detail) |dd| rparams.detail_dist = dd;
+    if (res.args.detail) |dd|
+        rparams.detail_dist = dd
+    else if (res.args.dist != null)
+        // --dist ties the detail pop to the (possibly --lod-overridden)
+        // first handoff unless --detail says otherwise.
+        rparams.detail_dist = rparams.lod_dists[0];
 
     // Halved-resolution far-field worlds (milestone 14 follow-up,
     // generalized to a chain in milestone 25): one per positive

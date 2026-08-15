@@ -30,11 +30,24 @@ const lod_eps: f32 = 1e-3;
 /// Tallest renderable frame (the sky gradient buffer is stack-sized).
 pub const max_sky_height = shade.max_sky_height;
 
+/// Default master draw distance; every distance-derived RenderParams
+/// default comes from forDrawDistance(draw_dist_default).
+pub const draw_dist_default: f32 = 672.0;
+/// Invariant density*cutoff: the normalized fog curve (shade.fogCurve)
+/// is fixed in fractional terms when fog_density = fog_k / cutoff, so
+/// each LOD handoff keeps the same fog concealment (~91%) at any draw
+/// distance while the near field clears as the distance grows.
+pub const fog_k: f32 = 11.2;
+/// LOD handoffs as fractions of the draw distance.
+pub const lod0_frac: f32 = 3.0 / 14.0;
+pub const lod1_frac: f32 = 3.0 / 7.0;
+const default_cutoff = @min(draw_dist_default, max_dist);
+
 /// Per-frame render configuration, threaded render -> renderColumn ->
 /// processCell. fog_* went live in milestone 8, light in milestone 9.
 pub const RenderParams = struct {
-    fog_density: f32 = 0.025,
-    fog_cutoff: f32 = 448.0,
+    fog_density: f32 = fog_k / default_cutoff,
+    fog_cutoff: f32 = default_cutoff,
     fog_color: u32 = 0x8ea6d2, // horizon-row sky color
     /// false = treat every column as unlit (identity tint), ignoring
     /// the flood-filled light runs; runtime toggle for the L hotkey.
@@ -43,11 +56,11 @@ pub const RenderParams = struct {
     /// March handoff distances into each coarse LOD level: past
     /// lod_dists[i] (snapped to a coarse-cell entry by lodBoundary,
     /// keeping each coarse voxel whole) the ray continues in the
-    /// 1/2^(i+1)-resolution world (91% fogged at the default 96, so the
+    /// 1/2^(i+1)-resolution world (91% fogged at the default 144, so the
     /// silhouette overestimate stays hidden). Must be increasing; the
     /// first non-increasing entry (0 = disabled) ends the chain, as
     /// does running out of worlds passed to render.
-    lod_dists: [max_lods]f32 = .{ 96.0, 192.0 } ++ .{0.0} ** (max_lods - 2),
+    lod_dists: [max_lods]f32 = .{ default_cutoff * lod0_frac, default_cutoff * lod1_frac } ++ .{0.0} ** (max_lods - 2),
     /// Distance past which per-voxel shading detail (AO neighbor
     /// sampling, the colored-light zipper and glow) is dropped: cells
     /// beyond it shade with max AO and no light, collapsing each
@@ -55,8 +68,24 @@ pub const RenderParams = struct {
     /// screen column to a cell entry (detailBoundary) so no cell
     /// straddles the mode line; the analytic sky bit stays (a cached
     /// compare, and it keeps cave/silhouette darkness) and fog hides
-    /// the seam. 0 disables (full detail everywhere).
-    detail_dist: f32 = 48.0,
+    /// the seam. 0 disables (full detail everywhere). Default: the
+    /// first LOD handoff, so the detail pop coincides with the LOD0
+    /// geometry transition.
+    detail_dist: f32 = default_cutoff * lod0_frac,
+
+    /// Derive every distance-related parameter from one master draw
+    /// distance: fog cutoff = dist (clamped to max_dist), density from
+    /// the fog_k invariant, LOD handoffs at the lod*_frac fractions,
+    /// and detail tied to the first handoff.
+    pub fn forDrawDistance(dist: f32) RenderParams {
+        const d = @min(dist, max_dist);
+        return .{
+            .fog_density = fog_k / d,
+            .fog_cutoff = d,
+            .lod_dists = .{ d * lod0_frac, d * lod1_frac } ++ .{0.0} ** (max_lods - 2),
+            .detail_dist = d * lod0_frac,
+        };
+    }
 };
 
 /// Rebuild the shade LUT after a palette mutation (milestone 10 calls
@@ -1051,14 +1080,37 @@ test "lodBoundary snaps the handoff to the first center-past coarse cell" {
     try std.testing.expectApproxEqAbs(@as(f32, 48.0), lodBoundary(100.0, 10.5, -1.0, 0.0, 48.0, 96.0, 0.5), 1e-3);
 }
 
+test "forDrawDistance derives fog, LOD, and detail from one distance" {
+    const p = RenderParams.forDrawDistance(672.0);
+    try std.testing.expectEqual(@as(f32, 672.0), p.fog_cutoff);
+    try std.testing.expectApproxEqAbs(@as(f32, 144.0), p.lod_dists[0], 1e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 288.0), p.lod_dists[1], 1e-2);
+    try std.testing.expectEqual(p.lod_dists[0], p.detail_dist);
+    try std.testing.expectEqual(@as(f32, 0.0), p.lod_dists[2]);
+    // The fog_k invariant: density*cutoff stays 11.2 at any distance,
+    // keeping the handoff concealment fixed while the near field clears.
+    try std.testing.expectApproxEqAbs(fog_k, p.fog_density * p.fog_cutoff, 1e-3);
+    const far = RenderParams.forDrawDistance(1344.0);
+    try std.testing.expectApproxEqAbs(fog_k, far.fog_density * far.fog_cutoff, 1e-2);
+    try std.testing.expectApproxEqAbs(p.fog_density / 2.0, far.fog_density, 1e-6);
+    // Defaults equal the derivation at draw_dist_default.
+    const d: RenderParams = .{};
+    try std.testing.expectEqual(RenderParams.forDrawDistance(draw_dist_default).fog_density, d.fog_density);
+    try std.testing.expectEqual(RenderParams.forDrawDistance(draw_dist_default).fog_cutoff, d.fog_cutoff);
+    try std.testing.expectEqual(RenderParams.forDrawDistance(draw_dist_default).lod_dists, d.lod_dists);
+    try std.testing.expectEqual(RenderParams.forDrawDistance(draw_dist_default).detail_dist, d.detail_dist);
+    // Distances past the march hard cap clamp to it.
+    try std.testing.expectEqual(max_dist, RenderParams.forDrawDistance(1e6).fog_cutoff);
+}
+
 test "lodChain ends at non-increasing distances, missing worlds, and the limit" {
     var t_b: [max_lods + 1]f32 = undefined;
     // Default chain with worlds present: two handoffs snapped near
     // the requested distances (within one coarse cell each).
     const n = lodChain(.{}, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);
     try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectApproxEqAbs(@as(f32, 96.0), t_b[1], 2.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 192.0), t_b[2], 4.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 144.0), t_b[1], 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 288.0), t_b[2], 4.0);
     try std.testing.expect(t_b[1] < t_b[2]);
     // A 0 entry ends the chain (the --lod2 0 form).
     const n1 = lodChain(.{ .lod_dists = .{ 96.0, 0.0 } ++ .{0.0} ** (max_lods - 2) }, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);

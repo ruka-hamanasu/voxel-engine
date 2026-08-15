@@ -622,3 +622,25 @@ entries here record scope and outcome only.
      farther on big worlds (tuning lever, not changed). Deferred:
      terrain feature scale (hill height & flat areas); chunked
      streaming only if km-scale is still wanted after that.
+
+30. COMPLETED - Single master draw distance (`--dist`, default 672).
+     RenderParams.forDrawDistance derives every distance parameter from
+     one number: fog_cutoff = D (clamped to max_dist), fog_density =
+     fog_k / D with fog_k = 11.2 — the density*cutoff invariant keeps
+     the normalized fog curve fixed in fractional terms, so each LOD
+     handoff stays ~91% fogged at any D while the near field clears as
+     D grows (raising the cutoff at fixed density barely changes the
+     near field: the curve normalizes and d*cutoff >> 1) — lod_dists =
+     {3/14, 3/7} * D, and detail_dist = lod_dists[0] (the detail pop
+     now coincides with the LOD0 geometry handoff instead of sitting
+     halfway inside the fine range). Defaults re-anchored from
+     448/0.025/{96,192}/48 to 672/(1/60)/{144,288}/144 via the same
+     derivation, so `RenderParams{}` == forDrawDistance(672). --fogcut/
+     --fog/--lod/--lod2/--lods/--detail remain as overrides applied
+     after --dist; with --dist and no --detail, detail tracks the final
+     lod_dists[0]. Regression scripts pin --detail 48 in l0f0 mode so
+     the identity gates keep their old config (verified byte-identical
+     pre/post change; the views_m28 baselines had already drifted from
+     HEAD pre-change, so views_m30* are the new baselines). Bench
+     (480x270 spawn, ms/frame): old config 5.83 -> new default 9.79 —
+     ~2 ms from the 1.5x march distance, ~2 ms from detail 48 -> 144.
