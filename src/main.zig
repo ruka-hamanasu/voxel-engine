@@ -13,6 +13,8 @@ const render = @import("render.zig");
 const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
 const lod_mod = @import("lod.zig");
+const stream = @import("stream.zig");
+const terrain = @import("gen/terrain.zig");
 const anim = @import("anim.zig");
 const clap = @import("clap");
 
@@ -37,10 +39,12 @@ pub fn main(init: std.process.Init) !void {
         \\    --width <usize>   Render width (default 480).
         \\    --height <usize>  Render height (default 270).
         \\    --scale <u32>     Window scale factor vs render resolution (default 2).
-        \\    --world-w <usize> World width in columns (default 384).
-        \\    --world-h <usize> World height in voxels (default 128, max 65535).
-        \\    --world-d <usize> World depth in columns (default 384).
-        \\
+    \\    --world-w <usize> World width in columns (bounded test world; default: unbounded, streamed).
+    \\    --world-h <usize> World height in voxels (default 128, max 65535).
+    \\    --world-d <usize> World depth in columns (requires --world-w).
+    \\    --load-budget <usize> Streamer dense-fill columns per frame (default 1200).
+    \\    --exact-coarse   Synthesize coarse LOD chunks with full cave/crystal noise (default: approx, sub-skin caves skipped).
+    \\
     );
 
     const parsers = comptime .{
@@ -80,11 +84,17 @@ pub fn main(init: std.process.Init) !void {
         cam_override = vals;
     }
     if (res.args.seed) |seed| opts.seed = seed;
-    if (res.args.@"world-w") |w| opts.w = w;
-    if (res.args.@"world-h") |h| opts.h = h;
-    if (res.args.@"world-d") |d| opts.d = d;
-    if (opts.w == 0 or opts.h == 0 or opts.d == 0 or opts.h > 65535)
+    // --world-w/--world-d are optional test bounds: both or neither.
+    // Neither gives the unbounded streamed world (STREAMING.md).
+    if ((res.args.@"world-w" == null) != (res.args.@"world-d" == null))
         return error.BadWorldSize;
+    const bounded = res.args.@"world-w" != null;
+    if (res.args.@"world-w") |w| opts.w = w;
+    if (res.args.@"world-d") |d| opts.d = d;
+    if (opts.h == 0 or opts.h > 65535 or (bounded and (opts.w == 0 or opts.d == 0)))
+        return error.BadWorldSize;
+    if (res.args.@"world-h") |h| opts.h = h;
+    const load_budget = res.args.@"load-budget" orelse 1200;
     const generator = res.args.gen orelse .terrain;
     const headless_path = res.args.headless;
     const bench_frames = res.args.bench orelse 0;
@@ -109,10 +119,34 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(framebuffer);
     const staging = try allocator.alloc(u32, render_w * render_h);
     defer allocator.free(staging);
-    var result = try gen.generate(generator, allocator, opts);
-    defer result.deinit(allocator);
-    const world = &result.world;
-    var cam = result.spawn;
+
+    // World setup: bounded test world (eager gen + floodAll + eager
+    // LOD build) when --world-w/d are given, else the unbounded world
+    // driven by the chunk streamer (STREAMING.md phase 2).
+    var result: ?gen.Result = null;
+    defer if (result) |*r| r.deinit(allocator);
+    var owned_world: ?World = null;
+    defer if (owned_world) |*w| w.deinit();
+    var streamer: ?stream.Streamer = null;
+    defer if (streamer) |*st| st.deinit();
+    var landmarks: []gen.Landmark = &.{};
+    defer if (result == null) allocator.free(landmarks);
+
+    var cam: Camera = undefined;
+    const world: *World = blk: {
+        if (bounded) {
+            result = try gen.generate(generator, allocator, opts);
+            cam = result.?.spawn;
+            landmarks = result.?.landmarks;
+            break :blk &result.?.world;
+        }
+        owned_world = try World.init(allocator, null, opts.h, null);
+        const sctx = terrain.Ctx.init(opts.seed, opts.h);
+        const sp = try terrain.spawnPoint(allocator, &sctx, null);
+        cam = sp.cam;
+        landmarks = sp.landmarks;
+        break :blk &owned_world.?;
+    };
     if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
     render.rebuildShadeLut();
     var rparams: render.RenderParams = .{};
@@ -138,38 +172,58 @@ pub fn main(init: std.process.Init) !void {
     if (res.args.detail) |dd| rparams.detail_dist = dd;
 
     // Halved-resolution far-field worlds (milestone 14 follow-up,
-    // generalized to a chain in milestone 25): built once here,
-    // incrementally rebuilt from dirty regions on edits; each level
-    // builds from the world one finer.
+    // generalized to a chain in milestone 25): one per positive
+    // increasing lod_dists entry. Bounded: built eagerly here and
+    // incrementally rebuilt from dirty regions on edits. Unbounded:
+    // owned by the streamer, chunks synthesized on demand.
+    var lod_count: usize = 0;
+    {
+        var prev_d: f32 = 0;
+        for (rparams.lod_dists) |d| {
+            if (d <= prev_d) break;
+            lod_count += 1;
+            prev_d = d;
+        }
+    }
     var lod_worlds: [render.max_lods]?World = @splat(null);
     defer for (&lod_worlds) |*lw| {
         if (lw.*) |*w| w.deinit();
     };
-    var lod_count: usize = 0;
-    {
-        var prev_d: f32 = 0;
-        for (0..render.max_lods) |i| {
-            const d = rparams.lod_dists[i];
-            if (d <= prev_d) break;
+    if (bounded) {
+        for (0..lod_count) |i| {
             lod_worlds[i] = try lod_mod.build(allocator, if (i == 0) world else &lod_worlds[i - 1].?);
-            prev_d = d;
-            lod_count += 1;
         }
+    } else {
+        streamer = try stream.Streamer.init(allocator, world, opts.seed, rparams.lod_dists[0..lod_count], rparams.fog_cutoff, if (light_enabled) light_params else null, load_budget, res.args.@"exact-coarse" != 0);
     }
     var lod_ptrs: [render.max_lods]*const World = undefined;
-    for (0..lod_count) |i| lod_ptrs[i] = &lod_worlds[i].?;
+    if (bounded) {
+        for (0..lod_count) |i| lod_ptrs[i] = &lod_worlds[i].?;
+    } else if (streamer) |*st| {
+        for (0..lod_count) |i| lod_ptrs[i] = &st.lods[i];
+    }
     const lods: []const *const World = lod_ptrs[0..lod_count];
 
     var flood_stats: lighting.Stats = .{};
     var flood_ms: f64 = 0;
-    if (light_enabled) {
+    if (bounded and light_enabled) {
         const fstart = std.Io.Clock.Timestamp.now(init.io, .awake);
         flood_stats = try lighting.floodAll(world, allocator, light_params);
         flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
         for (0..lod_count) |i| _ = try lighting.floodAll(&lod_worlds[i].?, allocator, light_params);
+        // Generation's dirty extents are fully covered by the initial flood.
+        _ = world.takeDirty();
     }
-    // Generation's dirty extents are fully covered by the initial flood.
-    _ = world.takeDirty();
+
+    // Synchronous streamer warm-up around the camera: headless/bench
+    // output and the first interactive frames all see the full
+    // resident set (STREAMING.md phase 2 decision).
+    if (streamer) |*st| {
+        const wstart = std.Io.Clock.Timestamp.now(init.io, .awake);
+        try st.runToCompletion(cam);
+        const wms = @as(f64, @floatFromInt(wstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+        std.log.debug("stream warm-up: {d:.2} ms", .{wms});
+    }
 
     if (anim_enabled) {
         anim.updatePalette(time_s);
@@ -188,9 +242,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (headless_path) |path| {
-        for (result.landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
+        for (landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
-        std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
+        if (bounded) std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
         render.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
         render.transpose(staging, framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, staging, render_w, render_h);
@@ -344,26 +398,40 @@ pub fn main(init: std.process.Init) !void {
         if (keys[c.SDL_SCANCODE_SPACE] != 0) input.vertical += 1;
         if (keys[c.SDL_SCANCODE_LCTRL] != 0) input.vertical -= 1;
         input.boost = keys[c.SDL_SCANCODE_LSHIFT] != 0;
+        if (streamer) |*st| {
+            try st.update(cam);
+            // The chunks the body can touch must be resident before
+            // physics (collision reads air as fall-through).
+            const px0: i32 = @intFromFloat(@floor(player.x - Player.half_width));
+            const pz0: i32 = @intFromFloat(@floor(player.z - Player.half_width));
+            const px1: i32 = @as(i32, @intFromFloat(@floor(player.x + Player.half_width))) + 1;
+            const pz1: i32 = @as(i32, @intFromFloat(@floor(player.z + Player.half_width))) + 1;
+            try st.forceResident(px0, pz0, px1, pz1);
+        }
         player.update(world, input, @floatCast(dt));
         cam = player.camera();
 
         if (world.takeDirty()) |r| {
-            var rr = r;
-            var fine: *const World = world;
-            for (0..lod_count) |i| {
-                const lw = &lod_worlds[i].?;
-                try lod_mod.rebuildRegion(allocator, fine, lw, rr);
-                if (light_enabled) {
-                    _ = try lighting.relight(lw, allocator, lod_mod.coarseRegion(lw, rr), light_params);
+            if (streamer) |*st| {
+                try st.onEdit(r);
+            } else {
+                var rr = r;
+                var fine: *const World = world;
+                for (0..lod_count) |i| {
+                    const lw = &lod_worlds[i].?;
+                    try lod_mod.rebuildRegion(allocator, fine, lw, rr);
+                    if (light_enabled) {
+                        _ = try lighting.relight(lw, allocator, lod_mod.coarseRegion(lw, rr), light_params);
+                    }
+                    rr = lod_mod.coarseRegion(lw, rr);
+                    fine = lw;
                 }
-                rr = lod_mod.coarseRegion(lw, rr);
-                fine = lw;
-            }
-            if (light_enabled) {
-                const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
-                const rstats = try lighting.relight(world, allocator, r, light_params);
-                const rms = @as(f64, @floatFromInt(rstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
-                std.log.info("relight: {} columns, {} runs, {d:.2} ms", .{ rstats.lit_columns, rstats.runs, rms });
+                if (light_enabled) {
+                    const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
+                    const rstats = try lighting.relight(world, allocator, r, light_params);
+                    const rms = @as(f64, @floatFromInt(rstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+                    std.log.info("relight: {} columns, {} runs, {d:.2} ms", .{ rstats.lit_columns, rstats.runs, rms });
+                }
             }
         }
         if (anim_enabled) {
@@ -392,7 +460,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-const PickResult = struct { hit: [3]usize, place: ?[3]usize };
+const PickResult = struct { hit: [3]i32, place: ?[3]i32 };
 
 /// Pixel-accurate voxel picking (milestone 10): with a yaw-only camera
 /// every screen pixel maps to a ray with a fixed vertical slope (rowAt
@@ -431,19 +499,19 @@ fn pickPixel(world: *const World, cam: Camera, sx: f32, sy: f32, width: usize, h
             else
                 world.firstSolidInColumn(dda.ix, dda.iz, y_lo, y_hi);
             if (hy) |hit_y| {
-                var side: ?[3]usize = null;
+                var side: ?[3]i32 = null;
                 if (dda.has_prev) {
                     const piy: i32 = @intFromFloat(@floor(ya));
                     if (piy >= 0 and piy < wh and world.get(dda.px, piy, dda.pz) == 0)
-                        side = .{ @intCast(dda.px), @intCast(piy), @intCast(dda.pz) };
+                        side = .{ dda.px, piy, dda.pz };
                 }
-                var vert: ?[3]usize = null;
+                var vert: ?[3]i32 = null;
                 if (slope != 0) {
                     const vy: i32 = if (slope < 0) hit_y + 1 else hit_y - 1;
                     if (vy >= 0 and vy < wh and world.get(dda.ix, vy, dda.iz) == 0)
-                        vert = .{ @intCast(dda.ix), @intCast(vy), @intCast(dda.iz) };
+                        vert = .{ dda.ix, vy, dda.iz };
                 }
-                var place: ?[3]usize = null;
+                var place: ?[3]i32 = null;
                 if (slope != 0) {
                     const plane_y: f32 = if (slope < 0) @floatFromInt(hit_y + 1) else @floatFromInt(hit_y);
                     const t_plane = (plane_y - cam.y) / slope;
@@ -451,7 +519,7 @@ fn pickPixel(world: *const World, cam: Camera, sx: f32, sy: f32, width: usize, h
                 } else {
                     place = side;
                 }
-                return .{ .hit = .{ @intCast(dda.ix), @intCast(hit_y), @intCast(dda.iz) }, .place = place };
+                return .{ .hit = .{ dda.ix, hit_y, dda.iz }, .place = place };
             }
         }
         dda.advance();
@@ -492,6 +560,7 @@ test {
     _ = anim;
     _ = @import("world.zig");
     _ = @import("chunk.zig");
+    _ = @import("stream.zig");
     _ = @import("camera.zig");
     _ = @import("player.zig");
 }
@@ -508,19 +577,19 @@ test "pickPixel hits the voxel under the pixel" {
 
     // Center pixel: horizontal hit on the wall, side placement.
     const wall = pickPixel(&world, cam, 4.0, 4.0, 8, 8, 16.0).?;
-    try std.testing.expectEqual([3]usize{ 5, 2, 2 }, wall.hit);
-    try std.testing.expectEqual([3]usize{ 4, 2, 2 }, wall.place.?);
+    try std.testing.expectEqual([3]i32{ 5, 2, 2 }, wall.hit);
+    try std.testing.expectEqual([3]i32{ 4, 2, 2 }, wall.place.?);
 
     // Bottom row: steep down-ray hits the floor, placement on top.
     const floor_pick = pickPixel(&world, cam, 4.0, 8.0, 8, 8, 16.0).?;
-    try std.testing.expectEqual(@as(usize, 0), floor_pick.hit[1]);
-    try std.testing.expectEqual(@as(usize, 1), floor_pick.place.?[1]);
+    try std.testing.expectEqual(@as(i32, 0), floor_pick.hit[1]);
+    try std.testing.expectEqual(@as(i32, 1), floor_pick.place.?[1]);
 
     // sy 0.5 (slope 0.875): up-ray meets the ceiling voxel's bottom
     // face inside its column, placement below it.
     const ceil = pickPixel(&world, cam, 4.0, 0.5, 8, 8, 16.0).?;
-    try std.testing.expectEqual([3]usize{ 5, 6, 2 }, ceil.hit);
-    try std.testing.expectEqual([3]usize{ 5, 5, 2 }, ceil.place.?);
+    try std.testing.expectEqual([3]i32{ 5, 6, 2 }, ceil.hit);
+    try std.testing.expectEqual([3]i32{ 5, 5, 2 }, ceil.place.?);
 
     // Nothing within range.
     try std.testing.expectEqual(@as(?PickResult, null), pickPixel(&world, cam, 4.0, 4.0, 8, 8, 2.0));

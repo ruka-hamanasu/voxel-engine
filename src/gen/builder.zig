@@ -42,27 +42,38 @@ pub const Builder = struct {
     }
 
     /// Run-encode tile column (lx, lz) into world column (x, z).
-    pub fn emit(self: *Builder, x: i32, z: i32, lx: usize, lz: usize) !void {
-        const dense = self.at(lx, lz);
-        var runs: std.ArrayList(world_mod.MatRun) = .empty;
-        errdefer runs.deinit(self.allocator);
-        var y: usize = dense.len;
-        while (y > 0) {
-            y -= 1;
-            const mat = dense[y];
-            if (runs.items.len > 0) {
-                const last = &runs.items[runs.items.len - 1];
-                if (last.palette_id == mat and last.count < 255) {
-                    last.count += 1;
-                    continue;
-                }
-            }
-            try runs.append(self.allocator, .{ .count = 1, .palette_id = mat });
-        }
-        const owned = try runs.toOwnedSlice(self.allocator);
-        self.world.setColumnRuns(x, z, owned);
+    /// keep_light preserves the column's light runs (chunk loads write
+    /// terrain over the pre-gen flood; see chunk.loadChunk).
+    pub fn emit(self: *Builder, x: i32, z: i32, lx: usize, lz: usize, keep_light: bool) !void {
+        return encodeDenseColumn(self.world, x, z, self.at(lx, lz), keep_light);
     }
 };
+
+/// Run-encode a dense column into world column (x, z). keep_light
+/// preserves the column's light runs (chunk loads write terrain over
+/// the pre-gen flood; see chunk.loadChunk).
+pub fn encodeDenseColumn(world: *world_mod.World, x: i32, z: i32, dense: []const u8, keep_light: bool) !void {
+    var runs: std.ArrayList(world_mod.MatRun) = .empty;
+    errdefer runs.deinit(world.allocator);
+    var y: usize = dense.len;
+    while (y > 0) {
+        y -= 1;
+        const mat = dense[y];
+        if (runs.items.len > 0) {
+            const last = &runs.items[runs.items.len - 1];
+            if (last.palette_id == mat and last.count < 255) {
+                last.count += 1;
+                continue;
+            }
+        }
+        try runs.append(world.allocator, .{ .count = 1, .palette_id = mat });
+    }
+    const owned = try runs.toOwnedSlice(world.allocator);
+    if (keep_light)
+        world.setColumnRunsKeepLight(x, z, owned)
+    else
+        world.setColumnRuns(x, z, owned);
+}
 
 test "emit run-encodes dense column" {
     const World = world_mod.World;
@@ -75,7 +86,7 @@ test "emit run-encodes dense column" {
     dense[0] = 1;
     dense[1] = 1;
     dense[2] = 5;
-    try builder.emit(1, 2, 1, 2);
+    try builder.emit(1, 2, 1, 2, false);
 
     const col = world.columnAtMut(1, 2).?;
     try std.testing.expectEqual(3, col.runs.len);

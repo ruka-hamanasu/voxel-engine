@@ -5,6 +5,7 @@ const Noise = @import("noise.zig").Noise;
 const Builder = @import("builder.zig").Builder;
 
 const World = world_mod.World;
+const Camera = @import("../camera.zig").Camera;
 
 pub const mat = struct {
     pub const bedrock: u8 = 8;
@@ -95,12 +96,12 @@ fn heightSpanAt(ctx: *const Ctx, x0: i32, z0: i32, wx: usize, wz: usize) Span {
     return .{ .min = lo, .max = hi };
 }
 
-/// Fill the dense column at (x, z): heightfield strata, caves, and
-/// crystals. Arches are NOT here — they cross tile boundaries, so they
-/// stamp into the dense tile after all its columns are filled (before
-/// run-encoding). Crystal rolls derive from a coordinate hash, so the
-/// result is independent of column evaluation order.
-pub fn genColumn(ctx: *const Ctx, x: i32, z: i32, dense: []u8) void {
+/// Heightfield strata only — no caves or crystals. Coarse-LOD
+/// synthesis uses this (the ~10x cheaper approx lever, STREAMING.md):
+/// the 8-voxel skin keeps caves sub-surface, so coarse column tops
+/// (and every above-ground silhouette) match exact synthesis, and the
+/// interior voids it fills are invisible past the fog.
+pub fn genColumnFast(ctx: *const Ctx, x: i32, z: i32, dense: []u8) void {
     @memset(dense, 0);
     const surface: usize = heightAt(ctx, x, z);
     const sandy = @as(f32, @floatFromInt(surface)) < ctx.sand_level;
@@ -116,6 +117,16 @@ pub fn genColumn(ctx: *const Ctx, x: i32, z: i32, dense: []u8) void {
         else
             mat.dirt;
     }
+}
+
+/// Fill the dense column at (x, z): heightfield strata, caves, and
+/// crystals. Arches are NOT here — they cross tile boundaries, so they
+/// stamp into the dense tile after all its columns are filled (before
+/// run-encoding). Crystal rolls derive from a coordinate hash, so the
+/// result is independent of column evaluation order.
+pub fn genColumn(ctx: *const Ctx, x: i32, z: i32, dense: []u8) void {
+    genColumnFast(ctx, x, z, dense);
+    const surface: usize = heightAt(ctx, x, z);
 
     const xf: f32 = @floatFromInt(x);
     const zf: f32 = @floatFromInt(z);
@@ -223,73 +234,144 @@ fn nearArch(ctx: *const Ctx, bounds: ?[2]usize, x: i32, z: i32, min_dist: i32) b
     return false;
 }
 
-/// One arch stamp box, clipped into the dense tile. Geometry identical
-/// to the pre-streaming fillBox arch: 27w x 33h x 6 thick, 17x18
-/// opening stepped to a lintel (a 16-voxel-tall player walks through).
-fn archBox(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, arch: Arch, l0: i32, l1: i32, ry0: i32, ry1: i32, m: u8) void {
-    const ax0 = if (arch.along_x) arch.x + l0 else arch.x;
-    const ax1 = if (arch.along_x) arch.x + l1 else arch.x + 6;
-    const az0 = if (arch.along_x) arch.z else arch.z + l0;
-    const az1 = if (arch.along_x) arch.z + 6 else arch.z + l1;
-    const cx0 = @max(ax0, tx0);
-    const cx1 = @min(ax1, tx0 + @as(i32, @intCast(tw)));
-    const cz0 = @max(az0, tz0);
-    const cz1 = @min(az1, tz0 + @as(i32, @intCast(td)));
-    const cy0: usize = @intCast(@max(arch.y + ry0, 0));
-    const cy1: usize = @intCast(@min(arch.y + ry1, @as(i32, @intCast(b.world.h))));
-    if (cx0 >= cx1 or cy0 >= cy1 or cz0 >= cz1) return;
+/// One arch stamp box (material fill), y clipped to [0, h]; XZ left
+/// unclipped for the caller (tile clip or column containment).
+pub const ArchBox = struct { x0: i32, z0: i32, x1: i32, z1: i32, y0: i32, y1: i32, m: u8 };
+
+/// The four stamp boxes of an arch. Geometry identical to the
+/// pre-streaming fillBox arch: 27w x 33h x 6 thick, 17x18 opening
+/// stepped to a lintel (a 16-voxel-tall player walks through).
+pub fn archBoxes(arch: Arch, h: usize) [4]ArchBox {
+    const hi: i32 = @intCast(h);
+    const spec = .{ .{ 0, 27, -3, 30, mat.arch }, .{ 5, 22, 0, 18, @as(u8, 0) }, .{ 8, 19, 18, 22, 0 }, .{ 10, 17, 22, 26, 0 } };
+    var out: [4]ArchBox = undefined;
+    inline for (spec, 0..) |s, i| {
+        const l0: i32 = s[0];
+        const l1: i32 = s[1];
+        const ry0: i32 = s[2];
+        const ry1: i32 = s[3];
+        out[i] = .{
+            .x0 = if (arch.along_x) arch.x + l0 else arch.x,
+            .x1 = if (arch.along_x) arch.x + l1 else arch.x + 6,
+            .z0 = if (arch.along_x) arch.z else arch.z + l0,
+            .z1 = if (arch.along_x) arch.z + 6 else arch.z + l1,
+            .y0 = @max(arch.y + ry0, 0),
+            .y1 = @min(arch.y + ry1, hi),
+            .m = s[4],
+        };
+    }
+    return out;
+}
+
+/// All arches whose stamps can reach the area [x0,x1)x[z0,z1): the
+/// regions covering the area plus ring-1 (the footprint reaches <= 35
+/// voxels past its origin). Ascending (rx, rz) order — overlapping
+/// arch stamps only commute under a fixed order.
+pub fn collectArches(ctx: *const Ctx, x0: i32, z0: i32, x1: i32, z1: i32, bounds: ?[2]usize, out: *std.ArrayList(Arch), allocator: std.mem.Allocator) !void {
+    const rx0 = @divFloor(x0, region_size) - 1;
+    const rx1 = @divFloor(x1 - 1, region_size) + 1;
+    const rz0 = @divFloor(z0, region_size) - 1;
+    const rz1 = @divFloor(z1 - 1, region_size) + 1;
+    var rx = rx0;
+    while (rx <= rx1) : (rx += 1) {
+        var rz = rz0;
+        while (rz <= rz1) : (rz += 1) {
+            if (archInRegion(ctx, rx, rz, bounds)) |arch| try out.append(allocator, arch);
+        }
+    }
+}
+
+/// One arch stamp box, clipped into the dense tile.
+fn archBox(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, box: ArchBox) void {
+    const cx0 = @max(box.x0, tx0);
+    const cx1 = @min(box.x1, tx0 + @as(i32, @intCast(tw)));
+    const cz0 = @max(box.z0, tz0);
+    const cz1 = @min(box.z1, tz0 + @as(i32, @intCast(td)));
+    if (cx0 >= cx1 or box.y0 >= box.y1 or cz0 >= cz1) return;
+    const y0: usize = @intCast(box.y0);
+    const y1: usize = @intCast(box.y1);
     var x = cx0;
     while (x < cx1) : (x += 1) {
         var z = cz0;
         while (z < cz1) : (z += 1) {
-            @memset(b.at(@intCast(x - tx0), @intCast(z - tz0))[cy0..cy1], m);
+            @memset(b.at(@intCast(x - tx0), @intCast(z - tz0))[y0..y1], box.m);
         }
     }
 }
 
 fn stampArch(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, arch: Arch) void {
-    archBox(b, tx0, tz0, tw, td, arch, 0, 27, -3, 30, mat.arch);
-    archBox(b, tx0, tz0, tw, td, arch, 5, 22, 0, 18, 0);
-    archBox(b, tx0, tz0, tw, td, arch, 8, 19, 18, 22, 0);
-    archBox(b, tx0, tz0, tw, td, arch, 10, 17, 22, 26, 0);
+    for (archBoxes(arch, b.world.h)) |box| archBox(b, tx0, tz0, tw, td, box);
 }
 
-/// The staged per-tile pipeline: dense-fill all columns, stamp the
-/// arches of the 3x3 region neighborhood, run-encode. This is exactly
-/// what a phase-1 chunk load runs, so chunk gen == whole-world gen.
-/// Regions stamp in ascending (rx, rz) order — overlapping arch
-/// stamps only commute under a fixed order. Tile origins are i32 so
-/// negative chunk coords work in the unbounded world.
+/// Apply every arch box covering column (x, z) — the per-column
+/// counterpart of stampArch for column-granular synthesis (coarse-LOD
+/// repair, STREAMING.md phase 2).
+pub fn archOverlayColumn(arches: []const Arch, h: usize, x: i32, z: i32, dense: []u8) void {
+    for (arches) |arch| {
+        for (archBoxes(arch, h)) |box| {
+            if (x >= box.x0 and x < box.x1 and z >= box.z0 and z < box.z1)
+                @memset(dense[@intCast(box.y0)..@intCast(box.y1)], box.m);
+        }
+    }
+}
+
+/// Fill stage of the staged per-tile pipeline: dense-fill columns
+/// [col0, col1) in linear (lx*td + lz) order — column-ranged so the
+/// streamer can budget the fill across frames (STREAMING.md phase 2).
+/// caves=false selects the approx coarse-LOD synthesis (genColumnFast).
+pub fn genTileFill(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, td: usize, col0: usize, col1: usize, caves: bool) void {
+    for (col0..col1) |ci| {
+        const lx = ci / td;
+        const lz = ci % td;
+        const col = b.column(lx, lz);
+        if (caves)
+            genColumn(ctx, tx0 + @as(i32, @intCast(lx)), tz0 + @as(i32, @intCast(lz)), col)
+        else
+            genColumnFast(ctx, tx0 + @as(i32, @intCast(lx)), tz0 + @as(i32, @intCast(lz)), col);
+    }
+}
+
+/// Arch stage: stamp the arches of the 3x3 region neighborhood into
+/// the filled dense tile. Runs once per tile after its fill completes.
+pub fn genTileArches(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
+    var arches: std.ArrayList(Arch) = .empty;
+    defer arches.deinit(b.allocator);
+    try collectArches(ctx, tx0, tz0, tx0 + @as(i32, @intCast(tw)), tz0 + @as(i32, @intCast(td)), bounds, &arches, b.allocator);
+    for (arches.items) |arch| stampArch(b, tx0, tz0, tw, td, arch);
+}
+
+/// Dense stage of the staged per-tile pipeline: fill + arch stamps.
+/// No world writes — coarse-LOD synthesis (STREAMING.md phase 2)
+/// consumes the dense tile directly. Tile origins are i32 so negative
+/// chunk coords work in the unbounded world.
+pub fn genTileDense(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
+    genTileFill(ctx, b, tx0, tz0, td, 0, tw * td, true);
+    try genTileArches(ctx, b, tx0, tz0, tw, td, bounds);
+}
+
+/// Emit stage: run-encode the dense tile into the world. keep_light
+/// preserves the columns' light runs (a chunk load writes terrain over
+/// the pre-gen flood; see chunk.loadChunk).
+pub fn emitTile(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, keep_light: bool) !void {
+    for (0..tw) |lx| {
+        for (0..td) |lz| {
+            try b.emit(tx0 + @as(i32, @intCast(lx)), tz0 + @as(i32, @intCast(lz)), lx, lz, keep_light);
+        }
+    }
+}
+
+/// The full pipeline (dense -> emit), exactly what a phase-1 chunk
+/// load runs, so chunk gen == whole-world gen.
 pub fn genTile(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
-    for (0..tw) |lx| {
-        for (0..td) |lz| {
-            genColumn(ctx, tx0 + @as(i32, @intCast(lx)), tz0 + @as(i32, @intCast(lz)), b.column(lx, lz));
-        }
-    }
-    const rx0 = @divFloor(tx0, region_size) - 1;
-    const rx1 = @divFloor(tx0 + @as(i32, @intCast(tw - 1)), region_size) + 1;
-    const rz0 = @divFloor(tz0, region_size) - 1;
-    const rz1 = @divFloor(tz0 + @as(i32, @intCast(td - 1)), region_size) + 1;
-    var rx = rx0;
-    while (rx <= rx1) : (rx += 1) {
-        var rz = rz0;
-        while (rz <= rz1) : (rz += 1) {
-            if (archInRegion(ctx, rx, rz, bounds)) |arch| stampArch(b, tx0, tz0, tw, td, arch);
-        }
-    }
-    for (0..tw) |lx| {
-        for (0..td) |lz| {
-            try b.emit(tx0 + @as(i32, @intCast(lx)), tz0 + @as(i32, @intCast(lz)), lx, lz);
-        }
-    }
+    try genTileDense(ctx, b, tx0, tz0, tw, td, bounds);
+    try emitTile(b, tx0, tz0, tw, td, false);
 }
 
 /// First acceptably flat spot on an expanding square-ring search near
-/// the origin (unbounded worlds spawn at ~0,0), at least 20 voxels
-/// from any arch. Falls back to the world center.
-fn findSpawn(ctx: *const Ctx, w: usize, d: usize, bounds: ?[2]usize) struct { usize, usize } {
-    const wx: i32 = @intCast(w);
-    const wz: i32 = @intCast(d);
+/// the origin (bounded worlds clamp candidates into the world), at
+/// least 20 voxels from any arch. Falls back to the world center
+/// (bounded) or the origin (unbounded).
+fn findSpawn(ctx: *const Ctx, bounds: ?[2]usize) struct { i32, i32 } {
     var r: i32 = 0;
     while (r <= 256) : (r += 4) {
         const side: i32 = @max(r * 2, 1);
@@ -304,17 +386,71 @@ fn findSpawn(ctx: *const Ctx, w: usize, d: usize, bounds: ?[2]usize) struct { us
                     else => .{ -r, r - k },
                 };
                 if (r > 0 and k == 0 and s > 0) continue; // shared corners
-                const sx = std.math.clamp(cx, 6, wx - 12);
-                const sz = std.math.clamp(cz, 6, wz - 12);
+                const sx = if (bounds) |b| std.math.clamp(cx, 6, @as(i32, @intCast(b[0])) - 12) else cx;
+                const sz = if (bounds) |b| std.math.clamp(cz, 6, @as(i32, @intCast(b[1])) - 12) else cz;
                 const span = heightSpanAt(ctx, sx, sz, 6, 6);
                 if (span.max - span.min > 2) continue;
                 if (nearArch(ctx, bounds, sx, sz, 20)) continue;
-                return .{ @intCast(sx), @intCast(sz) };
+                return .{ sx, sz };
             }
             if (r == 0) break;
         }
     }
-    return .{ w / 2, d / 2 };
+    return .{ if (bounds) |b| @divTrunc(@as(i32, @intCast(b[0])), 2) else 0, if (bounds) |b| @divTrunc(@as(i32, @intCast(b[1])), 2) else 0 };
+}
+
+pub const SpawnPoint = struct { cam: Camera, landmarks: []gen.Landmark };
+
+/// Spawn camera + landmark list without generating a world
+/// (STREAMING.md phase 2: the unbounded default world never generates
+/// eagerly). Landmarks = the arches of the regions near spawn
+/// (headless debug logging + spawn yaw); bounds = null for the
+/// unbounded world.
+pub fn spawnPoint(allocator: std.mem.Allocator, ctx: *const Ctx, bounds: ?[2]usize) !SpawnPoint {
+    const spawn_x, const spawn_z = findSpawn(ctx, bounds);
+
+    var landmarks: std.ArrayList(gen.Landmark) = .empty;
+    errdefer landmarks.deinit(allocator);
+    {
+        const rx0 = @divFloor(spawn_x - 192, region_size);
+        const rx1 = @divFloor(spawn_x + 192, region_size);
+        const rz0 = @divFloor(spawn_z - 192, region_size);
+        const rz1 = @divFloor(spawn_z + 192, region_size);
+        var rx = rx0;
+        while (rx <= rx1) : (rx += 1) {
+            var rz = rz0;
+            while (rz <= rz1) : (rz += 1) {
+                if (archInRegion(ctx, rx, rz, bounds)) |a|
+                    try landmarks.append(allocator, .{ .x = a.x, .y = a.y, .z = a.z });
+            }
+        }
+    }
+
+    const spawn_ground: f32 = @floatFromInt(heightAt(ctx, spawn_x, spawn_z));
+    var yaw: f32 = std.math.pi / 4.0;
+    var best_dist: i32 = std.math.maxInt(i32);
+    for (landmarks.items) |lm| {
+        const dx: i32 = lm.x - spawn_x;
+        const dz: i32 = lm.z - spawn_z;
+        const dist = dx * dx + dz * dz;
+        if (dist < best_dist) {
+            best_dist = dist;
+            yaw = std.math.atan2(@as(f32, @floatFromInt(dz)), @as(f32, @floatFromInt(dx)));
+        }
+    }
+
+    return .{
+        .cam = .{
+            .x = @as(f32, @floatFromInt(spawn_x)) + 0.5,
+            // Feet rest on the surface voxel's top face; the eye rides
+            // 14 voxels up (the milestone-23 walking player's eye
+            // height). The min() clamp only binds in tiny test worlds.
+            .y = @min(spawn_ground + 15.0, @as(f32, @floatFromInt(ctx.h)) - 1),
+            .z = @as(f32, @floatFromInt(spawn_z)) + 0.5,
+            .yaw = yaw,
+        },
+        .landmarks = try landmarks.toOwnedSlice(allocator),
+    };
 }
 
 pub fn generate(allocator: std.mem.Allocator, opts: gen.Options) !gen.Result {
@@ -341,56 +477,8 @@ fn generateTiled(allocator: std.mem.Allocator, opts: gen.Options, tile: usize) !
         }
     }
 
-    const spawn_x, const spawn_z = findSpawn(&ctx, opts.w, opts.d, bounds);
-
-    // Landmarks = the arches of the regions near spawn (headless debug
-    // logging + spawn yaw only; there is no global landmark list in an
-    // unbounded world).
-    var landmarks: std.ArrayList(gen.Landmark) = .empty;
-    errdefer landmarks.deinit(allocator);
-    {
-        const sx: i32 = @intCast(spawn_x);
-        const sz: i32 = @intCast(spawn_z);
-        const rx0 = @divFloor(sx - 192, region_size);
-        const rx1 = @divFloor(sx + 192, region_size);
-        const rz0 = @divFloor(sz - 192, region_size);
-        const rz1 = @divFloor(sz + 192, region_size);
-        var rx = rx0;
-        while (rx <= rx1) : (rx += 1) {
-            var rz = rz0;
-            while (rz <= rz1) : (rz += 1) {
-                if (archInRegion(&ctx, rx, rz, bounds)) |a|
-                    try landmarks.append(allocator, .{ .x = a.x, .y = a.y, .z = a.z });
-            }
-        }
-    }
-
-    const spawn_ground: f32 = @floatFromInt(heightAt(&ctx, @intCast(spawn_x), @intCast(spawn_z)));
-    var yaw: f32 = std.math.pi / 4.0;
-    var best_dist: i32 = std.math.maxInt(i32);
-    for (landmarks.items) |lm| {
-        const dx: i32 = lm.x - @as(i32, @intCast(spawn_x));
-        const dz: i32 = lm.z - @as(i32, @intCast(spawn_z));
-        const dist = dx * dx + dz * dz;
-        if (dist < best_dist) {
-            best_dist = dist;
-            yaw = std.math.atan2(@as(f32, @floatFromInt(dz)), @as(f32, @floatFromInt(dx)));
-        }
-    }
-
-    return .{
-        .world = world,
-        .spawn = .{
-            .x = @as(f32, @floatFromInt(spawn_x)) + 0.5,
-            // Feet rest on the surface voxel's top face; the eye rides
-            // 14 voxels up (the milestone-23 walking player's eye
-            // height). The min() clamp only binds in tiny test worlds.
-            .y = @min(spawn_ground + 15.0, @as(f32, @floatFromInt(opts.h)) - 1),
-            .z = @as(f32, @floatFromInt(spawn_z)) + 0.5,
-            .yaw = yaw,
-        },
-        .landmarks = try landmarks.toOwnedSlice(allocator),
-    };
+    const sp = try spawnPoint(allocator, &ctx, bounds);
+    return .{ .world = world, .spawn = sp.cam, .landmarks = sp.landmarks };
 }
 
 fn expectCoverage(world: *const World, x: i32, z: i32) !void {

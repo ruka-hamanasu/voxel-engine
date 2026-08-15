@@ -57,7 +57,7 @@ pub const Player = struct {
     }
 
     /// True when the voxel overlaps the body box (edit place-guard).
-    pub fn overlapsVoxel(self: *const Player, vx: usize, vy: usize, vz: usize) bool {
+    pub fn overlapsVoxel(self: *const Player, vx: i32, vy: i32, vz: i32) bool {
         const fx: f32 = @floatFromInt(vx);
         const fy: f32 = @floatFromInt(vy);
         const fz: f32 = @floatFromInt(vz);

@@ -24,7 +24,40 @@
   all covering chunks at init. `loadChunk`/`unloadChunk` in
   src/chunk.zig; chunk gen == eager gen and unload-relight == reflood
   pinned by tests. Both view sweeps byte-identical to views_m26.
-- Phase 2 — not started.
+- **Phase 2 — DONE** (PLAN.md milestone 28). The coordinate path went
+  signed (Region/set/fillBox/pickPixel/Scratch origins i32). Key
+  design change vs item 8's original sketch: the flood now confines
+  propagation to RESIDENT columns (World.getResident; non-resident
+  reads as blocked, not air), so no stored chain can route through an
+  unloaded chunk — chunk loads flood as a pure add pass and still land
+  the same fixpoint a single flood over the resident set computes
+  (pinned by the per-chunk == floodAll parity test, full extent). A
+  two-phase load (pre-gen air flood + post-gen clear) was implemented
+  first and abandoned: chains whose bright side lay in a non-resident
+  chunk reconstructed too dim and survived stale. Coarse chunks
+  synthesize from Ctx through a dense pyramid (== iterated lod.build
+  by construction; direct-from-fine picks different materials at mixed
+  top layers), never from resident fine chunks, so levels are
+  independent; fine-chunk unloads with live edits re-synthesize the
+  covering coarse columns (repair queue). Approx coarse gen
+  (genColumnFast: no sub-skin caves/crystals) is the default —
+  `--exact-coarse` opts out; exact stays the test reference.
+  relight fast paths: CellMap multiplicative hash, stale scan over
+  the map not the volume, shell-only border enqueue, empty-scratch
+  skip. Streamer (src/stream.zig): per-level Chebyshev discs (radius
+  = level render dist/2^i + margin, one chunk of unload hysteresis),
+  nearest-first queue, column-sliced budgeted fills (`--load-budget`,
+  default 1200), commit = stamp/encode/flood in one step, player-AABB
+  chunks force-generated before physics, sync warm-up in all modes.
+  main.zig: --world-w/d are optional test bounds (both or neither);
+  the default world is unbounded and streamed. Verification: pinned
+  bounded sweeps byte-identical to views_m26[/]_lod0; new unbounded
+  sweeps (views_stream[/]_lod0.sh) baselined as views_m28[/]_lod0,
+  rerun byte-identical. Bench (960x540, bounded, prev -> new): spawn
+  13.39 -> 13.29, aerial 9.56 -> 9.49, neutral. Unbounded spawn
+  14.56 (march sees terrain past the old 384 edge). Warm-up 1.3 s
+  (was 6.8 s exact/2.9 s approx before the relight fast paths).
+  MaxRSS: unbounded 34 MB vs bounded 38 MB; fine tier ~7 MB.
 - Phase 3 — not started.
 
 Decisions (agreed): **unbounded** world; worldgen becomes
@@ -128,19 +161,24 @@ must remain byte-identical.
    ring; `decodeColumns` loads resident neighbors' border light; seed
    the chunk's emissives; enqueue resident lit cells adjacent to the
    chunk; propagate; `encodeColumns` writes only to resident columns.
-   Unloaded columns read as air during propagate — self-consistent:
-   leaks past the resident set are never written, and light reach (31)
-   is far inside the load margin past render distance (~100).
+   As implemented (phase 2): propagation is confined to resident
+   columns (`World.getResident`; non-resident = blocked, not air), so
+   no stored chain routes through an unloaded chunk and the load flood
+   is a pure add pass landing the resident-set fixpoint. Leaks past
+   the resident set are never written, and light reach (31) is far
+   inside the load margin past render distance (~100).
 9. **Chunk unload**: blank the chunk's materials (uniform-air
    `setColumnRuns` per column) -> relight the region (the existing
    stale-seed path clears orphan light chains) -> free. Unload radius >
    load radius (hysteresis), both beyond fog cutoff, so the clear is
    invisible. Amortize across frames if profiling says so.
-10. **LOD chain**: coarse chunks built on demand by synthesizing <=4
-    fine columns per coarse column via `genColumn` (no fine residency);
-    per-chunk coarse flood as in 8. `lod.build`/`rebuildRegion`
-    re-shaped to chunk granularity; edit-driven `rebuildRegion` only
-    fires for resident fine chunks.
+10. **LOD chain**: coarse chunks built on demand by downsampling a
+    dense pyramid over generated fine columns (genColumn + arch stamps;
+    `genColumnFast` approx variant skips sub-skin caves by default) —
+    no fine residency, and the levels are mutually independent.
+    Edit-driven `rebuildRegion` only fires for resident fine chunks
+    (resident-guarded); a fine chunk unloaded with live edits gets its
+    covering coarse columns re-synthesized from generation.
 11. **Streamer** (new `src/stream.zig`): per frame, the desired set is a
     per-level Chebyshev disc around the camera chunk; radius = level's
     max render distance + 4-voxel margin (fine ~100, lod1 192, lod2

@@ -12,9 +12,10 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 - **UI:** Nuklear
 - **CLI:** zig-clap (0.12.0) for option parsing and `--help` text. Lighting
   and animation are on by default; `--no-light`/`--no-anim` disable them.
-  `--world-w`/`--world-h`/`--world-d` set the world size (h <= 65535;
-  total volume must stay under 2^32 voxels for the flood's u32 cell
-  keys).
+  `--world-w`/`--world-d` are optional XZ test bounds (both or neither;
+  neither = the unbounded streamed world); `--world-h` sets the height
+  (h <= 65535; total volume must stay under 2^32 voxels for the flood's
+  u32 cell keys).
 - **Headless mode:** `--headless` flag renders frames to PPM files so the
   renderer is verifiable without a display.
 
@@ -23,10 +24,10 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 - Voxel size: ~10cm (the milestone-23 walking player is 6x16x6 voxels
   = 0.6x1.6x0.6 m, eye at 14)
 - World height: Configurable
-- Demo world extent: bounded, fully resident (chunked streaming in
-  progress — status and plan tracked in STREAMING.md).
-  Default 384x128x384 (milestone 22: height fits 16+-headroom caves
-  under the 0.30h terrain base). Tested to 768x1024x768 (~50 MB
+- Demo world extent: unbounded, chunk-streamed (milestone 28;
+  status and plan tracked in STREAMING.md). Bounded test worlds via
+  --world-w/--world-d (default for the regression gates: 384x128x384).
+  Tested to 768x1024x768 (~50 MB
   resident columns across all LOD levels; the flood's scratch is
   sparse, milestone 17).
 - Internal render resolution: Configurable
@@ -243,7 +244,8 @@ identity regression path).
 build.zig            # link system SDL2 via pkg-config
 src/main.zig         # SDL init, frame loop, --headless mode, edit picking
 src/world.zig        # chunk map, columns, material + light RLE streams, edit API, palette
-src/chunk.zig        # chunk load/unload lifecycle (tile pipeline + unload relight)
+src/chunk.zig        # chunk load/unload lifecycle + coarse-LOD synthesis (dense pyramid)
+src/stream.zig       # chunk streamer: per-level discs, budgeted gen, edits/unloads
 src/lighting.zig     # colored flood-fill BFS + incremental relight
 src/render.zig       # march core: render/renderColumn, DdaIterator, CellCtx/genSegments/processCell, segmentColor
 src/render/spans.zig # free-span list + fillSpans/claim/claimGrad, the single pixel-write path
@@ -552,6 +554,29 @@ entries here record scope and outcome only.
      6.72 ms, aerial 3.87 -> 3.93, cave neutral; startup 0.52 -> 0.51).
      Regression: zig build test green (new chunk residency / load==gen
      / unload==reflood tests), both m26 view sweeps byte-identical.
+
+28. COMPLETED - Chunked streaming (STREAMING.md phase 2; detail and
+     the flood-confinement design change tracked there). The default
+     world is now unbounded and streamed: src/stream.zig keeps per-level
+     Chebyshev chunk discs around the camera (radii from lod_dists /
+     fog_cutoff, one chunk of unload hysteresis), generates under a
+     per-frame column budget (--load-budget, default 1200) with the
+     dense fill sliced across frames, force-generates the player's AABB
+     chunks before physics, and warms up synchronously around the
+     camera in all modes (~1.3 s after the relight fast paths:
+     multiplicative-hash CellMap, map-based stale scan, shell border
+     enqueue, empty-scratch skip). Coarse tiers synthesize from
+     generation through a dense pyramid (== iterated lod.build), with
+     the approx sub-skin-cave skip by default (--exact-coarse opts
+     out). --world-w/--world-d are now optional test bounds; the
+     bounded eager path is unchanged. Regression: pinned bounded
+     sweeps byte-identical to views_m26[/]_lod0 (scripts now pin
+     --world-w 384 --world-d 384); new unbounded sweeps
+     (views_stream[/]_lod0.sh) baselined as views_m28[/]_lod0, rerun
+     byte-identical. Bench (960x540, bounded, m27 -> m28): spawn
+     13.39 -> 13.29, aerial 9.56 -> 9.49, cave neutral; unbounded
+     spawn 14.56 (the march sees terrain past the old 384 edge).
+     MaxRSS unbounded 34 MB vs bounded 38 MB (fine tier ~7 MB).
 
 25. COMPLETED - N-level LOD cascade. renderColumn's hardcoded
      fine->lod1->lod2 chain generalizes to a chain of up to max_lods (8)

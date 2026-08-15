@@ -20,14 +20,19 @@ fn coarse(n: usize) usize {
 }
 
 /// Rebuild one coarse column from the fine world's current runs.
-/// dense scratch must hold coarse(fine.h) bytes.
-fn rebuildColumn(lod: *World, fine: *const World, cx: usize, cz: usize, dense: []u8) !void {
+/// dense scratch must hold coarse(fine.h) bytes. Non-resident coarse
+/// columns are skipped (streaming: edits only reach resident fine
+/// chunks, whose covering coarse chunks are always resident too — the
+/// coarse disc contains the fine disc — so this never fires in
+/// practice; it guards the invariant).
+fn rebuildColumn(lod: *World, fine: *const World, cx: i32, cz: i32, dense: []u8) !void {
+    if (lod.columnAt(cx, cz) == null) return;
     @memset(dense, 0);
     const lh = coarse(fine.h);
     const x0 = 2 * cx;
     const z0 = 2 * cz;
-    const x1 = @min(x0 + 2, fine.w.?);
-    const z1 = @min(z0 + 2, fine.d.?);
+    const x1 = if (fine.w) |w| @min(x0 + 2, @as(i32, @intCast(w))) else x0 + 2;
+    const z1 = if (fine.d) |d| @min(z0 + 2, @as(i32, @intCast(d))) else z0 + 2;
     var yc: usize = 0;
     while (yc < lh) : (yc += 1) {
         // Highest solid fine voxel wins: check the upper fine layer
@@ -37,10 +42,12 @@ fn rebuildColumn(lod: *World, fine: *const World, cx: usize, cz: usize, dense: [
         var yf = yf_hi + 1;
         while (yf > yf_lo) {
             yf -= 1;
-            for (x0..x1) |x| {
-                for (z0..z1) |z| {
-                    if (fine.solidAt(@intCast(x), @intCast(yf), @intCast(z))) {
-                        dense[yc] = fine.get(@intCast(x), @intCast(yf), @intCast(z));
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                var z = z0;
+                while (z < z1) : (z += 1) {
+                    if (fine.solidAt(x, @intCast(yf), z)) {
+                        dense[yc] = fine.get(x, @intCast(yf), z);
                         break;
                     }
                 } else continue;
@@ -65,7 +72,10 @@ fn rebuildColumn(lod: *World, fine: *const World, cx: usize, cz: usize, dense: [
         }
         try runs.append(lod.allocator, .{ .count = 1, .palette_id = mat });
     }
-    lod.setColumnRuns(@intCast(cx), @intCast(cz), try runs.toOwnedSlice(lod.allocator));
+    // Keep the old light runs: the caller always follows with a
+    // coarse relight, whose stale-clear pass needs them to find chains
+    // orphaned by removed content (e.g. a dug-out crystal).
+    lod.setColumnRunsKeepLight(cx, cz, try runs.toOwnedSlice(lod.allocator));
 }
 
 /// Build the coarse world for a bounded fine world.
@@ -76,22 +86,27 @@ pub fn build(allocator: std.mem.Allocator, fine: *const World) !World {
     defer allocator.free(dense);
     for (0..lod.w.?) |cx| {
         for (0..lod.d.?) |cz| {
-            try rebuildColumn(&lod, fine, cx, cz, dense);
+            try rebuildColumn(&lod, fine, @intCast(cx), @intCast(cz), dense);
         }
     }
     return lod;
 }
 
 /// Fine-coords dirty region -> rebuild the overlapping coarse columns.
+/// Unbounded worlds pass through without clamping; coarse columns
+/// whose fine footprint is not resident read air there (callers only
+/// fire this for regions covered by resident fine chunks).
 pub fn rebuildRegion(allocator: std.mem.Allocator, fine: *const World, lod: *World, r: world_mod.Region) !void {
     const dense = try allocator.alloc(u8, coarse(fine.h));
     defer allocator.free(dense);
-    const cx0 = r.x0 / 2;
-    const cz0 = r.z0 / 2;
-    const cx1 = @min(coarse(r.x1), lod.w.?);
-    const cz1 = @min(coarse(r.z1), lod.d.?);
-    for (cx0..cx1) |cx| {
-        for (cz0..cz1) |cz| {
+    const cx0 = @divFloor(r.x0, 2);
+    const cz0 = @divFloor(r.z0, 2);
+    const cx1 = if (lod.w) |w| @min(@divFloor(r.x1 + 1, 2), @as(i32, @intCast(w))) else @divFloor(r.x1 + 1, 2);
+    const cz1 = if (lod.d) |d| @min(@divFloor(r.z1 + 1, 2), @as(i32, @intCast(d))) else @divFloor(r.z1 + 1, 2);
+    var cx = cx0;
+    while (cx < cx1) : (cx += 1) {
+        var cz = cz0;
+        while (cz < cz1) : (cz += 1) {
             try rebuildColumn(lod, fine, cx, cz, dense);
         }
     }
@@ -100,13 +115,16 @@ pub fn rebuildRegion(allocator: std.mem.Allocator, fine: *const World, lod: *Wor
 /// The coarse-coords region covering a fine-coords dirty region (for
 /// the coarse relight after a rebuild).
 pub fn coarseRegion(lod: *const World, r: world_mod.Region) world_mod.Region {
+    const x1 = @divFloor(r.x1 + 1, 2);
+    const y1 = @divFloor(r.y1 + 1, 2);
+    const z1 = @divFloor(r.z1 + 1, 2);
     return .{
-        .x0 = r.x0 / 2,
-        .y0 = r.y0 / 2,
-        .z0 = r.z0 / 2,
-        .x1 = @min(coarse(r.x1), lod.w.?),
-        .y1 = @min(coarse(r.y1), lod.h),
-        .z1 = @min(coarse(r.z1), lod.d.?),
+        .x0 = @divFloor(r.x0, 2),
+        .y0 = @divFloor(r.y0, 2),
+        .z0 = @divFloor(r.z0, 2),
+        .x1 = if (lod.w) |w| @min(x1, @as(i32, @intCast(w))) else x1,
+        .y1 = @min(y1, @as(i32, @intCast(lod.h))),
+        .z1 = if (lod.d) |d| @min(z1, @as(i32, @intCast(d))) else z1,
     };
 }
 

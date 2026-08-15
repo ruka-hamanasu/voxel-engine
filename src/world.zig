@@ -196,13 +196,16 @@ pub fn CursorFor(comptime R: type) type {
 pub const RunCursor = CursorFor(MatRun);
 pub const LightCursor = CursorFor(LightRun);
 
+/// Half-open edit/extent box. Signed (i32) so unbounded-world chunk
+/// boxes and dirty regions at negative coords work (STREAMING.md
+/// phase 2); y is always within [0, h] after clamping.
 pub const Region = struct {
-    x0: usize,
-    y0: usize,
-    z0: usize,
-    x1: usize,
-    y1: usize,
-    z1: usize,
+    x0: i32,
+    y0: i32,
+    z0: i32,
+    x1: i32,
+    y1: i32,
+    z1: i32,
 };
 
 pub const World = struct {
@@ -465,6 +468,19 @@ pub const World = struct {
         self.updateMacro(x, z);
     }
 
+    /// setColumnRuns variant that PRESERVES the light runs: chunk
+    /// loads write terrain over an air column whose stored flood (the
+    /// pre-gen field) the following relight's stale-clear pass still
+    /// needs to find the chains detouring through the chunk
+    /// (chunk.loadChunk). Transient state: the relight re-encodes it.
+    pub fn setColumnRunsKeepLight(self: *World, x: i32, z: i32, runs: []MatRun) void {
+        const col = self.columnAtMut(x, z).?;
+        self.installRuns(col, runs);
+        col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
+        if (self.masks_ok) col.solid_mask = computeMask(col.runs, self.h);
+        self.updateMacro(x, z);
+    }
+
     /// Solidity at (x, y, z) without decoding materials: a single bit
     /// test when masks_ok, run scan otherwise. Matches get(...) != 0.
     pub inline fn solidAt(self: *const World, x: i32, y: i32, z: i32) bool {
@@ -481,6 +497,24 @@ pub const World = struct {
         const uy: usize = @intCast(y);
         if (uy >= self.h) return 0;
         const col = self.columnAt(x, z) orelse return 0;
+        var depth: usize = self.h - 1 - uy;
+        for (col.runs) |run| {
+            if (depth < run.count) return run.palette_id;
+            depth -= run.count;
+        }
+        return 0;
+    }
+
+    /// Material at (x, y, z), or null when the column's chunk is not
+    /// resident. The lighting flood confines propagation to resident
+    /// cells (STREAMING.md phase 2): no stored chain can then route
+    /// through an unloaded chunk, so a chunk load invalidates no
+    /// existing light and floods as a pure add pass.
+    pub inline fn getResident(self: *const World, x: i32, y: i32, z: i32) ?u8 {
+        const col = self.columnAt(x, z) orelse return null;
+        if (y < 0) return 0;
+        const uy: usize = @intCast(y);
+        if (uy >= self.h) return 0;
         var depth: usize = self.h - 1 - uy;
         for (col.runs) |run| {
             if (depth < run.count) return run.palette_id;
@@ -564,27 +598,30 @@ pub const World = struct {
         }
     }
 
-    pub fn set(self: *World, x: usize, y: usize, z: usize, mat: u8) !void {
-        const xc = if (self.w) |w| @min(x, w - 1) else x;
-        const yc = @min(y, self.h - 1);
-        const zc = if (self.d) |d| @min(z, d - 1) else z;
-        const depth = self.h - 1 - yc;
-        if (!try self.setRange(@intCast(xc), @intCast(zc), depth, depth + 1, mat)) return;
+    pub fn set(self: *World, x: i32, y: i32, z: i32, mat: u8) !void {
+        const xc = if (self.w) |w| std.math.clamp(x, 0, @as(i32, @intCast(w)) - 1) else x;
+        const yc = std.math.clamp(y, 0, @as(i32, @intCast(self.h)) - 1);
+        const zc = if (self.d) |d| std.math.clamp(z, 0, @as(i32, @intCast(d)) - 1) else z;
+        const depth = self.h - 1 - @as(usize, @intCast(yc));
+        if (!try self.setRange(xc, zc, depth, depth + 1, mat)) return;
         self.markDirty(.{ .x0 = xc, .y0 = yc, .z0 = zc, .x1 = xc + 1, .y1 = yc + 1, .z1 = zc + 1 });
     }
 
-    pub fn fillBox(self: *World, x0: usize, y0: usize, z0: usize, x1: usize, y1: usize, z1: usize, mat: u8) !void {
-        const xa = if (self.w) |w| @min(x0, w) else x0;
-        const ya = @min(y0, self.h);
-        const za = if (self.d) |d| @min(z0, d) else z0;
-        const xb = if (self.w) |w| @min(x1, w) else x1;
-        const yb = @min(y1, self.h);
-        const zb = if (self.d) |d| @min(z1, d) else z1;
+    pub fn fillBox(self: *World, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32, mat: u8) !void {
+        const hi: i32 = @intCast(self.h);
+        const xa = if (self.w) |w| std.math.clamp(x0, 0, @as(i32, @intCast(w))) else x0;
+        const ya = std.math.clamp(y0, 0, hi);
+        const za = if (self.d) |d| std.math.clamp(z0, 0, @as(i32, @intCast(d))) else z0;
+        const xb = if (self.w) |w| std.math.clamp(x1, 0, @as(i32, @intCast(w))) else x1;
+        const yb = std.math.clamp(y1, 0, hi);
+        const zb = if (self.d) |d| std.math.clamp(z1, 0, @as(i32, @intCast(d))) else z1;
         if (xa >= xb or ya >= yb or za >= zb) return;
         var any = false;
-        for (xa..xb) |x| {
-            for (za..zb) |z| {
-                any = try self.setRange(@intCast(x), @intCast(z), self.h - yb, self.h - ya, mat) or any;
+        var x = xa;
+        while (x < xb) : (x += 1) {
+            var z = za;
+            while (z < zb) : (z += 1) {
+                any = try self.setRange(x, z, self.h - @as(usize, @intCast(yb)), self.h - @as(usize, @intCast(ya)), mat) or any;
             }
         }
         if (any) self.markDirty(.{ .x0 = xa, .y0 = ya, .z0 = za, .x1 = xb, .y1 = yb, .z1 = zb });
@@ -704,7 +741,7 @@ test "set clamps out-of-bounds and edits record dirty extents" {
     try std.testing.expectEqual(Region{ .x0 = 1, .y0 = 2, .z0 = 3, .x1 = 8, .y1 = 8, .z1 = 8 }, world.dirty.?);
 
     const r = world.takeDirty().?;
-    try std.testing.expectEqual(@as(usize, 1), r.x0);
+    try std.testing.expectEqual(@as(i32, 1), r.x0);
     try std.testing.expectEqual(null, world.dirty);
     try std.testing.expectEqual(null, world.takeDirty());
 }

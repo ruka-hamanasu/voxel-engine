@@ -75,24 +75,41 @@ const neighbor_offsets = .{ .{ 1, 0, 0, Dir.px }, .{ -1, 0, 0, Dir.nx }, .{ 0, 1
 ///
 /// Keys are BOX-LOCAL: ((x-x0)*zd + (z-z0))*h + y, so the u32 key cap
 /// bounds one flood box (a chunk plus its reach ring once streaming
-/// lands, STREAMING.md), not the world volume.
+/// lands, STREAMING.md), not the world volume. Origins are i32 so
+/// chunk boxes at negative coords work in the unbounded world.
+///
+/// The map uses a multiplicative-mix hash (the ChunkMap trick): box-
+/// local keys are near-sequential, and Wyhash on them cost ~45% of a
+/// chunk load's flood. Hash choice doesn't affect flood OUTPUT — the
+/// BFS visit order and first-write-wins tie rule are independent of
+/// the map's internal layout.
+const CellMap = std.HashMap(u32, u32, struct {
+    pub fn hash(_: @This(), k: u32) u64 {
+        return @as(u64, k) *% 0x9E3779B97F4A7C15;
+    }
+    pub fn eql(_: @This(), a: u32, b: u32) bool {
+        return a == b;
+    }
+}, std.hash_map.default_max_load_percentage);
+
 const Scratch = struct {
-    x0: usize,
-    z0: usize,
+    x0: i32,
+    z0: i32,
     xd: usize,
     zd: usize,
     h: usize, // world height (key modulus)
-    map: std.AutoHashMap(u32, u32),
+    map: CellMap,
 
-    fn init(allocator: std.mem.Allocator, x0: usize, z0: usize, x1: usize, z1: usize, world: *const World) Scratch {
-        std.debug.assert(@as(u64, x1 - x0) * (z1 - z0) * world.h < std.math.maxInt(u32));
+    fn init(allocator: std.mem.Allocator, x0: i32, z0: i32, x1: i32, z1: i32, world: *const World) Scratch {
+        std.debug.assert(x1 > x0 and z1 > z0);
+        std.debug.assert(@as(u64, @intCast(x1 - x0)) * @as(u64, @intCast(z1 - z0)) * world.h < std.math.maxInt(u32));
         return .{
             .x0 = x0,
             .z0 = z0,
-            .xd = x1 - x0,
-            .zd = z1 - z0,
+            .xd = @intCast(x1 - x0),
+            .zd = @intCast(z1 - z0),
             .h = world.h,
-            .map = std.AutoHashMap(u32, u32).init(allocator),
+            .map = CellMap.init(allocator),
         };
     }
 
@@ -104,16 +121,18 @@ const Scratch = struct {
         return @as(u32, level) | @as(u32, color) << 8 | @as(u32, dir) << 16;
     }
 
-    fn index(self: *const Scratch, x: usize, y: usize, z: usize) u32 {
-        return @intCast(((x - self.x0) * self.zd + (z - self.z0)) * self.h + y);
+    fn index(self: *const Scratch, x: i32, y: i32, z: i32) u32 {
+        const lx: u32 = @intCast(x - self.x0);
+        const lz: u32 = @intCast(z - self.z0);
+        return (lx * @as(u32, @intCast(self.zd)) + lz) * @as(u32, @intCast(self.h)) + @as(u32, @intCast(y));
     }
 
-    fn coords(self: *const Scratch, vi: u32) struct { usize, usize, usize } {
+    fn coords(self: *const Scratch, vi: u32) struct { i32, i32, i32 } {
         const h: u32 = @intCast(self.h);
         const zd: u32 = @intCast(self.zd);
         const y = vi % h;
         const cxz = vi / h;
-        return .{ cxz / zd + self.x0, y, cxz % zd + self.z0 };
+        return .{ @as(i32, @intCast(cxz / zd)) + self.x0, @intCast(y), @as(i32, @intCast(cxz % zd)) + self.z0 };
     }
 
     fn get(self: *const Scratch, vi: u32) LightSample {
@@ -144,9 +163,11 @@ const Scratch = struct {
 /// Unloaded columns (chunk map, STREAMING.md) are skipped — their
 /// absence also decodes as 0.
 fn decodeColumns(world: *World, s: *Scratch) !void {
-    for (s.x0..s.x0 + s.xd) |x| {
-        for (s.z0..s.z0 + s.zd) |z| {
-            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
+    var x = s.x0;
+    while (x < s.x0 + @as(i32, @intCast(s.xd))) : (x += 1) {
+        var z = s.z0;
+        while (z < s.z0 + @as(i32, @intCast(s.zd))) : (z += 1) {
+            const col = world.columnAtMut(x, z) orelse continue;
             const runs = col.light orelse continue;
             var hi: i32 = col.light_base_y;
             for (runs) |run| {
@@ -154,7 +175,7 @@ fn decodeColumns(world: *World, s: *Scratch) !void {
                 const lo = hi - @as(i32, run.count) + 1;
                 while (y >= lo) : (y -= 1) {
                     if (run.intensity == 0) continue;
-                    try s.set(s.index(x, @intCast(y), z), run.intensity, run.color_id, run.dir);
+                    try s.set(s.index(x, y, z), run.intensity, run.color_id, run.dir);
                 }
                 hi = lo - 1;
             }
@@ -165,10 +186,12 @@ fn decodeColumns(world: *World, s: *Scratch) !void {
 /// Seed every emissive voxel in the box, run-scanning the columns.
 /// Seeds write only on strict improvement, so re-seeding an unchanged
 /// crystal during relight is a no-op that doesn't even enqueue.
-fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), allocator: std.mem.Allocator, params: Params, bx0: usize, by0: usize, bz0: usize, bx1: usize, by1: usize, bz1: usize) !void {
-    for (bx0..bx1) |x| {
-        for (bz0..bz1) |z| {
-            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
+fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), allocator: std.mem.Allocator, params: Params, bx0: i32, by0: i32, bz0: i32, bx1: i32, by1: i32, bz1: i32) !void {
+    var x = bx0;
+    while (x < bx1) : (x += 1) {
+        var z = bz0;
+        while (z < bz1) : (z += 1) {
+            const col = world.columnAtMut(x, z) orelse continue;
             var y: i32 = @intCast(world.h - 1);
             for (col.runs) |run| {
                 const m = run.palette_id;
@@ -177,7 +200,7 @@ fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), alloc
                     const lo = y - @as(i32, run.count) + 1;
                     while (yy >= lo) : (yy -= 1) {
                         if (yy < by0 or yy >= by1) continue;
-                        const vi = s.index(x, @intCast(yy), z);
+                        const vi = s.index(x, yy, z);
                         if (params.seed_intensity > s.intensity(vi)) {
                             try s.set(vi, params.seed_intensity, m, @intFromEnum(Dir.none));
                             try queue.append(allocator, vi);
@@ -194,6 +217,12 @@ fn seedEmissiveBox(world: *World, s: *Scratch, queue: *std.ArrayList(u32), alloc
 /// non-increasing level order, so the first write to a cell is the
 /// brightest and strict `>` makes ties resolve to the earliest seed
 /// (deterministic). Solid neighbors are terminal and record nothing.
+/// Non-resident columns (chunk map, STREAMING.md) are terminal too:
+/// confining propagation to resident cells means no stored chain can
+/// route through an unloaded chunk, so chunk loads never invalidate
+/// existing light (chunk.loadChunk floods as a pure add pass), and
+/// unloaded chunks' relights converge the resident set to the same
+/// fixpoint a full flood over it would compute.
 fn propagate(world: *const World, s: *Scratch, queue: *std.ArrayList(u32), allocator: std.mem.Allocator, params: Params) !void {
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
@@ -201,16 +230,13 @@ fn propagate(world: *const World, s: *Scratch, queue: *std.ArrayList(u32), alloc
         const cur = s.get(vi);
         const x, const y, const z = s.coords(vi);
         inline for (neighbor_offsets) |off| {
-            const nx = @as(i64, @intCast(x)) + off[0];
-            const ny = @as(i64, @intCast(y)) + off[1];
-            const nz = @as(i64, @intCast(z)) + off[2];
-            if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + s.xd and ny < s.h and nz < s.z0 + s.zd) {
-                const ux: usize = @intCast(nx);
-                const uy: usize = @intCast(ny);
-                const uz: usize = @intCast(nz);
-                const nvi = s.index(ux, uy, uz);
-                const nm = world.get(@intCast(nx), @intCast(ny), @intCast(nz));
-                if (nm == 0) {
+            const nx = @as(i64, x) + off[0];
+            const ny = @as(i64, y) + off[1];
+            const nz = @as(i64, z) + off[2];
+            if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + @as(i64, @intCast(s.xd)) and ny < s.h and nz < s.z0 + @as(i64, @intCast(s.zd))) {
+                const nvi = s.index(@intCast(nx), @intCast(ny), @intCast(nz));
+                const nm = world.getResident(@intCast(nx), @intCast(ny), @intCast(nz));
+                if (nm != null and nm.? == 0) {
                     const cand = cur.intensity -| params.attenuation;
                     if (cand > 0 and cand > s.intensity(nvi)) {
                         try s.set(nvi, cand, cur.color_id, @intFromEnum(off[3]));
@@ -229,9 +255,11 @@ fn propagate(world: *const World, s: *Scratch, queue: *std.ArrayList(u32), alloc
 /// Replaces and frees any previous runs.
 fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator) !Stats {
     var stats: Stats = .{};
-    for (s.x0..s.x0 + s.xd) |x| {
-        for (s.z0..s.z0 + s.zd) |z| {
-            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
+    var x = s.x0;
+    while (x < s.x0 + @as(i32, @intCast(s.xd))) : (x += 1) {
+        var z = s.z0;
+        while (z < s.z0 + @as(i32, @intCast(s.zd))) : (z += 1) {
+            const col = world.columnAtMut(x, z) orelse continue;
             if (col.light) |l| allocator.free(l);
             col.light = null;
             col.light_base_y = 0;
@@ -239,7 +267,7 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
         }
     }
     // Column y-extents of lit cells: value = lo | hi << 16.
-    var extents = std.AutoHashMap(u32, u32).init(allocator);
+    var extents = CellMap.init(allocator);
     defer extents.deinit();
     var it = s.map.iterator();
     while (it.next()) |e| {
@@ -256,11 +284,13 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
         }
     }
     const h32: u32 = @intCast(s.h);
-    for (s.x0..s.x0 + s.xd) |x| {
-        for (s.z0..s.z0 + s.zd) |z| {
-            const ci: u32 = @intCast((x - s.x0) * s.zd + (z - s.z0));
+    x = s.x0;
+    while (x < s.x0 + @as(i32, @intCast(s.xd))) : (x += 1) {
+        var z = s.z0;
+        while (z < s.z0 + @as(i32, @intCast(s.zd))) : (z += 1) {
+            const ci: u32 = @as(u32, @intCast(x - s.x0)) * @as(u32, @intCast(s.zd)) + @as(u32, @intCast(z - s.z0));
             const ext = extents.get(ci) orelse continue;
-            const col = world.columnAtMut(@intCast(x), @intCast(z)) orelse continue;
+            const col = world.columnAtMut(x, z) orelse continue;
             const bot: u32 = ext & 0xffff;
             const hi_y: u32 = ext >> 16;
             var runs: std.ArrayList(LightRun) = .empty;
@@ -292,13 +322,13 @@ fn encodeColumns(world: *World, s: *const Scratch, allocator: std.mem.Allocator)
 /// Full-world flood; bounded worlds only (the chunk streaming path
 /// floods per chunk on load, STREAMING.md phase 2).
 pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !Stats {
-    const w = world.w orelse unreachable;
-    const d = world.d orelse unreachable;
+    const w: i32 = @intCast(world.w orelse unreachable);
+    const d: i32 = @intCast(world.d orelse unreachable);
     var s = Scratch.init(allocator, 0, 0, w, d, world);
     defer s.deinit();
     var queue: std.ArrayList(u32) = .empty;
     defer queue.deinit(allocator);
-    try seedEmissiveBox(world, &s, &queue, allocator, params, 0, 0, 0, w, world.h, d);
+    try seedEmissiveBox(world, &s, &queue, allocator, params, 0, 0, 0, w, @intCast(world.h), d);
     try propagate(world, &s, &queue, allocator, params);
     return encodeColumns(world, &s, allocator);
 }
@@ -329,14 +359,15 @@ pub fn floodAll(world: *World, allocator: std.mem.Allocator, params: Params) !St
 /// has two equal-level predecessors, since the add queue's visit order
 /// differs. Both are valid fixpoints.
 pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Region, params: Params) !Stats {
-    const reach: usize = if (params.attenuation == 0)
-        @max(world.w orelse unreachable, @max(world.h, world.d orelse unreachable))
+    const reach: i32 = if (params.attenuation == 0)
+        // Unattenuated floods are a bounded-world test mode only.
+        @intCast(@max(world.w orelse unreachable, @max(world.h, world.d orelse unreachable)))
     else
         params.seed_intensity / params.attenuation;
-    const x0 = dirty.x0 -| reach;
-    const z0 = dirty.z0 -| reach;
-    const x1 = if (world.w) |w| @min(dirty.x1 + reach, w) else dirty.x1 + reach;
-    const z1 = if (world.d) |d| @min(dirty.z1 + reach, d) else dirty.z1 + reach;
+    const x0 = if (world.w != null) @max(dirty.x0 - reach, 0) else dirty.x0 - reach;
+    const z0 = if (world.d != null) @max(dirty.z0 - reach, 0) else dirty.z0 - reach;
+    const x1 = if (world.w) |w| @min(dirty.x1 + reach, @as(i32, @intCast(w))) else dirty.x1 + reach;
+    const z1 = if (world.d) |d| @min(dirty.z1 + reach, @as(i32, @intCast(d))) else dirty.z1 + reach;
 
     var s = Scratch.init(allocator, x0, z0, x1, z1, world);
     defer s.deinit();
@@ -346,24 +377,35 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
     defer reseeds.deinit(allocator);
     var clear_q: std.ArrayList(u64) = .empty;
     defer clear_q.deinit(allocator);
+    var any_clear = false;
 
-    for (dirty.x0..dirty.x1) |x| {
-        for (dirty.z0..dirty.z1) |z| {
-            for (dirty.y0..dirty.y1) |y| {
-                const vi = s.index(x, y, z);
-                const cur = s.get(vi);
-                if (cur.intensity == 0) continue;
-                const m = world.get(@intCast(x), @intCast(y), @intCast(z));
-                const is_seed = m != 0 and world_mod.palette[m].emissive != 0;
-                const was_seed = cur.dir == .none;
-                const stale = if (is_seed)
-                    !(was_seed and cur.color_id == m and cur.intensity == params.seed_intensity)
-                else if (m != 0)
-                    true
-                else
-                    was_seed;
-                if (stale) try clearChain(&s, vi, params, &reseeds, &clear_q, allocator);
-            }
+    // The stale scan only acts on cells with decoded light, so it
+    // iterates the scratch map (the lit cells) filtered to the dirty
+    // region, not the region's half-million cells (chunk loads,
+    // STREAMING.md phase 2). Start cells are collected first —
+    // clearChain mutates the map.
+    if (s.map.count() != 0) {
+        var starts: std.ArrayList(u32) = .empty;
+        defer starts.deinit(allocator);
+        var it = s.map.iterator();
+        while (it.next()) |e| {
+            const x, const y, const z = s.coords(e.key_ptr.*);
+            if (x < dirty.x0 or x >= dirty.x1 or y < dirty.y0 or y >= dirty.y1 or z < dirty.z0 or z >= dirty.z1) continue;
+            const cur = s.get(e.key_ptr.*);
+            const m = world.get(x, y, z);
+            const is_seed = m != 0 and world_mod.palette[m].emissive != 0;
+            const was_seed = cur.dir == .none;
+            const stale = if (is_seed)
+                !(was_seed and cur.color_id == m and cur.intensity == params.seed_intensity)
+            else if (m != 0)
+                true
+            else
+                was_seed;
+            if (stale) try starts.append(allocator, e.key_ptr.*);
+        }
+        for (starts.items) |vi| {
+            any_clear = true;
+            try clearChain(&s, vi, params, &reseeds, &clear_q, allocator);
         }
     }
 
@@ -373,17 +415,38 @@ pub fn relight(world: *World, allocator: std.mem.Allocator, dirty: world_mod.Reg
     for (reseeds.items) |vi| {
         if (s.intensity(vi) != 0) try queue.append(allocator, vi);
     }
-    for (dirty.x0..dirty.x1) |x| {
-        for (dirty.z0..dirty.z1) |z| {
-            for (dirty.y0..dirty.y1) |y| {
-                inline for (neighbor_offsets) |off| {
-                    const nx = @as(i64, @intCast(x)) + off[0];
-                    const ny = @as(i64, @intCast(y)) + off[1];
-                    const nz = @as(i64, @intCast(z)) + off[2];
-                    if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + s.xd and ny < s.h and nz < s.z0 + s.zd) {
-                        const nvi = s.index(@intCast(nx), @intCast(ny), @intCast(nz));
-                        if (s.intensity(nvi) != 0) try queue.append(allocator, nvi);
-                    }
+    // Fast path (the common chunk load, STREAMING.md phase 2): no
+    // decoded light, no stale clears, no seeds — nothing can change.
+    // Skipping encodeColumns is valid because it would only clear and
+    // re-encode the box's (all-null) light runs.
+    if (!any_clear and s.map.count() == 0 and queue.items.len == 0) return .{};
+    // Enqueue every lit cell face-adjacent to the dirty region so
+    // carved air floods from its neighbors: the one-cell shell around
+    // the region (~26k cells on a chunk box), not the region's whole
+    // volume (~524k map probes).
+    if (s.map.count() != 0) {
+        const sx0 = @max(dirty.x0 - 1, s.x0);
+        const sy0 = @max(dirty.y0 - 1, 0);
+        const sz0 = @max(dirty.z0 - 1, s.z0);
+        const sx1 = @min(dirty.x1 + 1, s.x0 + @as(i32, @intCast(s.xd)));
+        const sy1 = @min(dirty.y1 + 1, @as(i32, @intCast(s.h)));
+        const sz1 = @min(dirty.z1 + 1, s.z0 + @as(i32, @intCast(s.zd)));
+        var x = sx0;
+        while (x < sx1) : (x += 1) {
+            const in_x = x >= dirty.x0 and x < dirty.x1;
+            var z = sz0;
+            while (z < sz1) : (z += 1) {
+                const in_z = z >= dirty.z0 and z < dirty.z1;
+                var y = sy0;
+                while (y < sy1) : (y += 1) {
+                    const in_y = y >= dirty.y0 and y < dirty.y1;
+                    if (in_x and in_y and in_z) continue;
+                    const adjacent = (in_y and in_z and (x == dirty.x0 - 1 or x == dirty.x1)) or
+                        (in_x and in_z and (y == dirty.y0 - 1 or y == dirty.y1)) or
+                        (in_x and in_y and (z == dirty.z0 - 1 or z == dirty.z1));
+                    if (!adjacent) continue;
+                    const vi = s.index(x, y, z);
+                    if (s.intensity(vi) != 0) try queue.append(allocator, vi);
                 }
             }
         }
@@ -412,10 +475,10 @@ fn clearChain(s: *Scratch, start: u32, params: Params, reseeds: *std.ArrayList(u
         if (cand == 0) continue;
         const x, const y, const z = s.coords(vi);
         inline for (neighbor_offsets) |off| {
-            const nx = @as(i64, @intCast(x)) + off[0];
-            const ny = @as(i64, @intCast(y)) + off[1];
-            const nz = @as(i64, @intCast(z)) + off[2];
-            if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + s.xd and ny < s.h and nz < s.z0 + s.zd) {
+            const nx = @as(i64, x) + off[0];
+            const ny = @as(i64, y) + off[1];
+            const nz = @as(i64, z) + off[2];
+            if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + @as(i64, @intCast(s.xd)) and ny < s.h and nz < s.z0 + @as(i64, @intCast(s.zd))) {
                 const nvi = s.index(@intCast(nx), @intCast(ny), @intCast(nz));
                 const n = s.get(nvi);
                 if (n.intensity != 0) {
