@@ -49,25 +49,48 @@ cross-strip state, so output stays byte-identical. A zero-worker
   (current baselines views_m31*); bench A/B vs m31 numbers. Expect ~3x on the
   render portion at 960x540.
 
-### D2. Clear-far fog curve + km plumbing
+### D2. Clear-far fog curve + km plumbing — COMPLETED (milestone 33)
+
+Outcome: clear curve is the default (clear_k = 4 after A/B), fog LUTs
+endpoint-anchored so the last bucket is exactly 1.0, schedule fixed at
+{144, 288} doubling, max_dist 131072, all gates green. One finding
+that shapes D3/D4: coarse-chunk synthesis regenerates 4^level fine
+tiles per chunk, so streamer warmup is quadratic in chain depth (8 km
+spawn ~15 min) — the impostor tier eliminates the deep levels rather
+than speeding them up. Details and numbers: PLAN.md milestone 33.
+
+Retained design notes:
 
 The fog_k=11.2 invariant normalizes the curve to the cutoff, forcing
 >=91% fog at every LOD handoff and full haze past ~D/2 — incompatible
-with a readable far field. New curve family (selected under `--fog`,
-old curve kept for the regression gates and the fog_cutoff=96 tests):
+with a readable far field. New curve family (decisions locked with the
+user): `(exp(k*x) - 1) / (exp(k) - 1)` over fractional x = t/cutoff
+with k = density*cutoff (default clear_k ~4, tuned via headless A/B):
 low density through the midrange, converging to *exactly* 1.0 at the
 cutoff. The hard convergence is non-negotiable: it hides the world
-edge and the sky-horizon seam. Expect a few headless A/B tuning
-rounds on the curve shape; check fog LUT interpolation error under it.
+edge and the sky-horizon seam. The new curve is the RenderParams
+default; `--fogcurve <old|clear>` selects, `--fog` keeps its density
+override (k = density*cutoff in both families). The old curve stays
+for the fog_cutoff=96 unit tests (their mid-bucket expectations assume
+it); the l0f0 sweep halves run with fog off, so only the def halves
+regenerate (views_m32*). Check fog LUT interpolation error under the
+steep terminal rise; bump fog_buckets if banding shows.
 
-Also: `max_dist` 16384 -> 128k+; handoff schedule restructure so
-near/mid stay fixed ({144, 288} then doubling) instead of tracking
-fractions of D; verify per-range f32 DDA step bounds (cascade keeps
-ranges short; f64 t_max remains the fallback); `--dist` accepts km
-values.
+Also: `max_dist` 16384 -> 131072; handoff schedule restructure so
+near/mid stay fixed ({144, 288} then doubling while < D, so the
+default D=672 gains a third handoff at 576) instead of tracking
+fractions of D; per-range DDA steps are a constant ~144 level-voxels
+by construction (final partial range <= ~320 at 128k), so f32 t_max
+stays (verified, not just assumed). max_lods stays 8 — the streamer's
+rep_grid scratch is 4^n*h bytes, so a 10-level chain would cost
+~270 MB; at D=100k the truncated last range is ~318 steps, which is
+fine until D3 replaces the deep cascade. `--dist` stays plain voxels
+(100000 = 10 km; no km suffix). Verification scripts now live in
+scripts/ (moved out of /tmp).
 
-Gates: pinned-config sweeps byte-identical (old curve pinned); new km
-vista benches.
+Gates: `zig build test` green; l0f0 sweep halves byte-identical to
+views_m31*; def halves regenerated as views_m32*; new km vista benches
+(scripts/vista_km.sh) + mem.sh at km scale.
 
 ### D3. Heightfield impostor far tier (centerpiece)
 
@@ -75,8 +98,18 @@ Beyond the near/mid cascade (which ends at ~1-2 km), replace all
 deeper LOD levels with a streamed 2D heightmap grid: `{top_y,
 top_mat}` per cell (~128-256 vox/cell), synthesized directly from
 `terrain.heightAt` + strata coloring — no fine data, no flood, no
-edits. The far march is the existing column-DDA restricted to one
-solid interval `[0, top_y]` per cell: one interval test, no neighbor
+edits. Synthesis is a multi-resolution heightfield query: `top_y` is
+a conservative max of `heightAt` over the cell footprint (sample grid
++ noise Lipschitz pad, or a max-mip over a precomputed heightfield),
+with arch tops folded in — arches rise ~30 vox above the skin, which
+subtends <1 px past ~2 km, so missing them would also be acceptable.
+**Edits (deferred until persistence):** the impostor is render-only,
+but cells covering dirty columns must eventually show them — keep a
+per-cell dirty/version stamp so those cells re-synthesize with the
+edited columns overlaid on the heightfield (cheap at ~1 us/cell;
+edits never enter the cascade below the impostor). The far march is
+the existing column-DDA restricted to one solid interval `[0, top_y]`
+per cell: one interval test, no neighbor
 fetches, no light zipper, strata color pre-low-passed per cell at
 synthesis (kills sub-pixel shimmer, the #1 visual risk of a clear far
 field; reuses the m8 low-pass palette idea).
@@ -96,7 +129,8 @@ Move fine-chunk gen/pyramid/encode onto the D1 pool; impostor ring
 synthesis rides the same pool (cheap: ~1 us/cell, incremental ~ms).
 Keeps the walk bench flat at km scale. Gates: stream determinism
 tests unchanged (budgeted == completion, snapshot round-trip) — the
-impostor is render-only, never lit or edited.
+impostor is render-only, never lit; edits deferred to the persistence
+milestone via D3's dirty-cell re-synthesis.
 
 ### D5. Budget reclamation levers (profiling-gated)
 
@@ -119,6 +153,9 @@ impostor is render-only, never lit or edited.
    size to the coarsest cascade voxel at the handoff.
 4. **4 cores is tight** — if D1+D3 land at ~20 ms, the honest levers
    are D5, not heroics.
+5. **Far edits** — impostor cells ignore edits until persistence
+   lands; the dirty-cell stamp keeps the hook explicit so D3's
+   render-only fast path doesn't bake in the assumption.
 
 ## Verification conventions (unchanged)
 

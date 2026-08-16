@@ -243,6 +243,7 @@ identity regression path).
 
 ```
 build.zig            # link system SDL2 via pkg-config
+scripts/             # verification: views*.sh regression sweeps, walk_bench.sh, mem.sh, vista_km.sh
 src/main.zig         # SDL init, frame loop, --headless mode, edit picking
 src/world.zig        # chunk map, columns, material + light RLE streams, edit API, palette
 src/chunk.zig        # chunk load/unload lifecycle + coarse-LOD synthesis (dense pyramid)
@@ -658,6 +659,41 @@ entries here record scope and outcome only.
      default world 14.33 -> 16.55 (h 128 -> 256). Startup (gen +
      warmup + 1 frame) 2.5 -> 4.5 s: the doubled height doubles the
      dense fill and the cave scan runs to the mountain surface.
+
+33. COMPLETED - Clear-far fog curve + km plumbing (DISTANCE.md D2).
+     New default fog curve (`--fogcurve clear`, render.FogCurve):
+     (exp(kx)-1)/(exp(k)-1) over fractional x = t/cutoff with
+     k = density*cutoff (clear_k = 4 invariant in forDrawDistance) —
+     ~2.5% fog at the 144 handoff vs the old curve's ~91%, converging
+     to exactly 1.0 at the cutoff. The fog LUTs are now endpoint-
+     anchored (bucket 0 = t 0, last = exactly the cutoff): the old
+     bucket-center sampling topped out at 0.969 under the clear
+     curve's steep terminal rise, breaking the cutoff-convergence
+     guarantee. --fogcurve old + fog_k keep the milestone-8 curve for
+     the pinned fog_cutoff=96 tests. Handoff schedule: fixed {144,
+     288} doubling while < D (default D=672 gains a third handoff at
+     576) instead of 3/14-/3/7-fractions of D; detail tracks the first
+     handoff. max_dist 16384 -> 131072; per-range DDA steps are a
+     constant ~144 level-voxels by construction (final partial range
+     <= ~320 at 128k), so f32 t_max stays. Verification scripts moved
+     into scripts/ (were in /tmp); walk_bench's worst cam re-tuned
+     (the old one is underground since the m31 biome split). New
+     scripts/vista_km.sh: 2/4 km vistas (deeper gated behind DEEP=1 —
+     coarse-chunk synthesis regenerates 4^level fine tiles per chunk,
+     so streamer warmup grows quadratically with chain depth until
+     D3/D4; 8 km spawn warmup ~15 min) plus a 100 km plumbing smoke on
+     a small bounded world. Regression: zig build test green (new
+     clear-curve endpoint/shape tests; lodChain test now expects the
+     third default handoff); all four l0f0 sweep halves byte-identical
+     to views_m31*; def halves regenerated as views_m32* (near field
+     unchanged, far field readable to the horizon). clear_k A/B at
+     2 km (3/4/6): 4 kept — 3 leaves the far ridge raw, 6 over-hazes.
+     Bench (960x540 ms/frame, D1 -> D2): spawn 9.23 -> 8.42, pinned
+     384x128x384 480x270 4.47 -> 4.18, default 480x270 4.89 -> 4.49,
+     walk 12.4 -> 12.1 (the third level trims [288,672]); 2 km spawn
+     10.1, 4 km spawn 10.9. mem.sh: default 31 -> 73 MB (the extra
+     streamed level), 4 km 104 MB — linear in level count; D3's
+     impostor reclaims it.
 
 32. COMPLETED - Threaded render pool (DISTANCE.md D1). render.zig's
      free render/transpose became a Renderer struct owning pool.zig's

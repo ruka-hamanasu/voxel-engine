@@ -16,12 +16,15 @@ const OFace = shade.OFace;
 pub const hfov: f32 = std.math.pi / 2.0;
 /// March hard cap. The fine world only ever marches to lod_dists[0];
 /// the coarse (LOD) worlds absorb everything past it, so this sits far
-/// above the default fog cutoff with headroom for long draws.
-pub const max_dist: f32 = 16384.0;
+/// above the default fog cutoff with headroom for km-scale draws.
+pub const max_dist: f32 = 131072.0;
 /// Coarse LOD levels supported per render (level i marches at 1/2^i
-/// resolution). Per-range DDA steps stay bounded at any depth — the
-/// range length doubles while the cell size does — so f32 t suffices;
-/// f64 t_max is the deferred lever if ranges ever exceed ~1000 steps.
+/// resolution). Per-range DDA steps are a constant ~handoff0 level
+/// voxels by construction (the range length doubles with the cell
+/// size; the final partial range past the last handoff is <= ~320
+/// steps at max_dist), so f32 t suffices; f64 t_max is the deferred
+/// lever if ranges ever exceed ~1000 steps. 8 is also the streamer's
+/// scratch ceiling: its rep_grid is 4^levels*h bytes.
 pub const max_lods = 8;
 /// Start offset for the coarse march: lodBoundary returns a distance
 /// sitting exactly on a coarse-cell plane, where rounding could floor
@@ -34,22 +37,47 @@ pub const max_sky_height = shade.max_sky_height;
 /// Default master draw distance; every distance-derived RenderParams
 /// default comes from forDrawDistance(draw_dist_default).
 pub const draw_dist_default: f32 = 672.0;
-/// Invariant density*cutoff: the normalized fog curve (shade.fogCurve)
-/// is fixed in fractional terms when fog_density = fog_k / cutoff, so
-/// each LOD handoff keeps the same fog concealment (~91%) at any draw
-/// distance while the near field clears as the distance grows.
+/// Fog curve family (plans/DISTANCE.md D2), selected by
+/// RenderParams.fog_curve / `--fogcurve`:
+/// - old: normalized exponential `fogCurve`; with density = fog_k /
+///   cutoff the normalized shape is fixed in fractional terms, so
+///   every LOD handoff sits ~91% fogged at any draw distance. Kept for
+///   the pinned fog_cutoff=96 tests.
+/// - clear: `(exp(k*x) - 1) / (exp(k) - 1)` over fractional
+///   x = t/cutoff, k = density*cutoff — low density through the
+///   midrange so km-scale terrain stays readable, converging to
+///   exactly 1.0 at the cutoff (hides the world edge and the
+///   sky-horizon seam).
+pub const FogCurve = enum { old, clear };
+/// Invariant density*cutoff for the old curve (milestone 30).
 pub const fog_k: f32 = 11.2;
-/// LOD handoffs as fractions of the draw distance.
-pub const lod0_frac: f32 = 3.0 / 14.0;
-pub const lod1_frac: f32 = 3.0 / 7.0;
+/// Invariant density*cutoff (the clear curve's k) for the default
+/// clear curve: ~2.5% fog at the 144 handoff, ~50% at ~0.8*cutoff.
+pub const clear_k: f32 = 4.0;
+/// Fixed near/mid LOD handoffs (milestone 33): no longer fractions of
+/// the draw distance, so km-scale tuning never moves the near field.
+/// Deeper handoffs double from here while < D.
+pub const handoff0: f32 = 144.0;
+pub const handoff1: f32 = 288.0;
 const default_cutoff = @min(draw_dist_default, max_dist);
+
+/// LOD handoff chain for a draw distance: {handoff0, handoff1}, then
+/// doubling while the next entry is < dist.
+pub fn lodChainFor(dist: f32) [max_lods]f32 {
+    var chain: [max_lods]f32 = .{ handoff0, handoff1 } ++ .{0.0} ** (max_lods - 2);
+    var n: usize = 2;
+    while (n < max_lods and chain[n - 1] * 2.0 < dist) : (n += 1)
+        chain[n] = chain[n - 1] * 2.0;
+    return chain;
+}
 
 /// Per-frame render configuration, threaded render -> renderColumn ->
 /// processCell. fog_* went live in milestone 8, light in milestone 9.
 pub const RenderParams = struct {
-    fog_density: f32 = fog_k / default_cutoff,
+    fog_density: f32 = clear_k / default_cutoff,
     fog_cutoff: f32 = default_cutoff,
     fog_color: u32 = 0x8ea6d2, // horizon-row sky color
+    fog_curve: FogCurve = .clear,
     /// false = treat every column as unlit (identity tint), ignoring
     /// the flood-filled light runs; runtime toggle for the L hotkey.
     light: bool = true,
@@ -57,11 +85,10 @@ pub const RenderParams = struct {
     /// March handoff distances into each coarse LOD level: past
     /// lod_dists[i] (snapped to a coarse-cell entry by lodBoundary,
     /// keeping each coarse voxel whole) the ray continues in the
-    /// 1/2^(i+1)-resolution world (91% fogged at the default 144, so the
-    /// silhouette overestimate stays hidden). Must be increasing; the
+    /// 1/2^(i+1)-resolution world. Must be increasing; the
     /// first non-increasing entry (0 = disabled) ends the chain, as
     /// does running out of worlds passed to render.
-    lod_dists: [max_lods]f32 = .{ default_cutoff * lod0_frac, default_cutoff * lod1_frac } ++ .{0.0} ** (max_lods - 2),
+    lod_dists: [max_lods]f32 = .{ handoff0, handoff1, handoff1 * 2.0 } ++ .{0.0} ** (max_lods - 3),
     /// Distance past which per-voxel shading detail (AO neighbor
     /// sampling, the colored-light zipper and glow) is dropped: cells
     /// beyond it shade with max AO and no light, collapsing each
@@ -72,19 +99,24 @@ pub const RenderParams = struct {
     /// the seam. 0 disables (full detail everywhere). Default: the
     /// first LOD handoff, so the detail pop coincides with the LOD0
     /// geometry transition.
-    detail_dist: f32 = default_cutoff * lod0_frac,
+    detail_dist: f32 = handoff0,
 
     /// Derive every distance-related parameter from one master draw
     /// distance: fog cutoff = dist (clamped to max_dist), density from
-    /// the fog_k invariant, LOD handoffs at the lod*_frac fractions,
-    /// and detail tied to the first handoff.
+    /// the clear_k invariant, fixed near/mid LOD handoffs doubling to
+    /// dist, and detail tied to the first handoff.
     pub fn forDrawDistance(dist: f32) RenderParams {
         const d = @min(dist, max_dist);
+        var chain = lodChainFor(d);
+        // A handoff at or past the cutoff is never marched through.
+        for (&chain) |*h| {
+            if (h.* >= d) h.* = 0;
+        }
         return .{
-            .fog_density = fog_k / d,
+            .fog_density = clear_k / d,
             .fog_cutoff = d,
-            .lod_dists = .{ d * lod0_frac, d * lod1_frac } ++ .{0.0} ** (max_lods - 2),
-            .detail_dist = d * lod0_frac,
+            .lod_dists = chain,
+            .detail_dist = if (chain[0] > 0) chain[0] else 0,
         };
     }
 };
@@ -1150,16 +1182,28 @@ test "lodBoundary snaps the handoff to the first center-past coarse cell" {
 test "forDrawDistance derives fog, LOD, and detail from one distance" {
     const p = RenderParams.forDrawDistance(672.0);
     try std.testing.expectEqual(@as(f32, 672.0), p.fog_cutoff);
-    try std.testing.expectApproxEqAbs(@as(f32, 144.0), p.lod_dists[0], 1e-2);
-    try std.testing.expectApproxEqAbs(@as(f32, 288.0), p.lod_dists[1], 1e-2);
+    try std.testing.expectEqual(handoff0, p.lod_dists[0]);
+    try std.testing.expectEqual(handoff1, p.lod_dists[1]);
+    try std.testing.expectEqual(handoff1 * 2.0, p.lod_dists[2]);
+    try std.testing.expectEqual(@as(f32, 0.0), p.lod_dists[3]);
     try std.testing.expectEqual(p.lod_dists[0], p.detail_dist);
-    try std.testing.expectEqual(@as(f32, 0.0), p.lod_dists[2]);
-    // The fog_k invariant: density*cutoff stays 11.2 at any distance,
-    // keeping the handoff concealment fixed while the near field clears.
-    try std.testing.expectApproxEqAbs(fog_k, p.fog_density * p.fog_cutoff, 1e-3);
+    // The clear_k invariant: density*cutoff stays 4 (the clear curve's
+    // shape parameter k) at any distance, so the fractional fog shape
+    // is draw-distance invariant.
+    try std.testing.expectApproxEqAbs(clear_k, p.fog_density * p.fog_cutoff, 1e-3);
     const far = RenderParams.forDrawDistance(1344.0);
-    try std.testing.expectApproxEqAbs(fog_k, far.fog_density * far.fog_cutoff, 1e-2);
+    try std.testing.expectApproxEqAbs(clear_k, far.fog_density * far.fog_cutoff, 1e-2);
     try std.testing.expectApproxEqAbs(p.fog_density / 2.0, far.fog_density, 1e-6);
+    // Near/mid handoffs are fixed at any distance; deeper ones double
+    // while < D (1344: 144, 288, 576, 1152).
+    try std.testing.expectEqual(handoff0, far.lod_dists[0]);
+    try std.testing.expectEqual(handoff1 * 4.0, far.lod_dists[3]);
+    try std.testing.expectEqual(@as(f32, 0.0), far.lod_dists[4]);
+    // Handoffs at or past the cutoff are dropped; a short draw keeps
+    // only the entries it can march through.
+    const short = RenderParams.forDrawDistance(200.0);
+    try std.testing.expectEqual(handoff0, short.lod_dists[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), short.lod_dists[1]);
     // Defaults equal the derivation at draw_dist_default.
     const d: RenderParams = .{};
     try std.testing.expectEqual(RenderParams.forDrawDistance(draw_dist_default).fog_density, d.fog_density);
@@ -1172,12 +1216,15 @@ test "forDrawDistance derives fog, LOD, and detail from one distance" {
 
 test "lodChain ends at non-increasing distances, missing worlds, and the limit" {
     var t_b: [max_lods + 1]f32 = undefined;
-    // Default chain with worlds present: two handoffs snapped near
-    // the requested distances (within one coarse cell each).
+    // Default chain with worlds present: three handoffs ({144, 288,
+    // 576} at the default draw distance) snapped near the requested
+    // distances (within one coarse cell each); the third sits past the
+    // 448 limit, so it clamps to the limit and the march skips it.
     const n = lodChain(.{}, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);
-    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectApproxEqAbs(@as(f32, 144.0), t_b[1], 2.0);
     try std.testing.expectApproxEqAbs(@as(f32, 288.0), t_b[2], 4.0);
+    try std.testing.expectEqual(@as(f32, 448.0), t_b[3]);
     try std.testing.expect(t_b[1] < t_b[2]);
     // A 0 entry ends the chain (the --lod2 0 form).
     const n1 = lodChain(.{ .lod_dists = .{ 96.0, 0.0 } ++ .{0.0} ** (max_lods - 2) }, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);

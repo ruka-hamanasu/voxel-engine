@@ -4,6 +4,7 @@ const lighting = @import("../lighting.zig");
 const render = @import("../render.zig");
 
 const RenderParams = render.RenderParams;
+const FogCurve = render.FogCurve;
 
 pub const Face = enum(u2) { top, bottom, x_side, z_side };
 
@@ -112,11 +113,12 @@ pub fn rebuildShadeLut() void {
     light_v4 = unpackPalette(world_mod.palette);
 }
 
-/// Distance fog (milestone 8). fog_factor buckets a normalized
-/// exponential falloff over [0, fog_cutoff]; fog_dest is the low-pass
-/// variant: each material's color pre-collapses toward the shared fog
-/// color on a front-loaded curve, so distant hues die before the
-/// geometry fades, killing sub-pixel chromatic shimmer at 480x270.
+/// Distance fog (milestone 8). fog_factor buckets the selected
+/// RenderParams.fog_curve falloff over [0, fog_cutoff]; fog_dest is
+/// the low-pass variant: each material's color pre-collapses toward
+/// the shared fog color on a front-loaded curve, so distant hues die
+/// before the geometry fades, killing sub-pixel chromatic shimmer at
+/// 480x270.
 /// Emissive materials ride separate row rules: the destination lerps
 /// toward a saturated version of their own color on a half-density
 /// curve (volumetric neon haze) and THEN toward the fog color on the
@@ -162,18 +164,28 @@ pub fn lerpColor(a: u32, b: u32, f: f32) u32 {
     return packRgb(lerpColorV(unpackRgb(a), unpackRgb(b), f));
 }
 
-/// Normalized exponential falloff: 0 at t=0, exactly 1 at the cutoff,
-/// so geometry at the march limit is indistinguishable from the fogged
-/// horizon.
-fn fogCurve(density: f32, t: f32, cutoff: f32) f32 {
-    return (1.0 - @exp(-density * t)) / (1.0 - @exp(-density * cutoff));
+/// Fog curves (see render.FogCurve). old: normalized exponential
+/// falloff. clear: `(exp(k*x) - 1) / (exp(k) - 1)` over fractional
+/// x = t/cutoff with k = density*cutoff — nearly clear through the
+/// midrange, steep only near the cutoff. Both are 0 at t=0 and exactly
+/// 1 at the cutoff, so geometry at the march limit is
+/// indistinguishable from the fogged horizon.
+fn fogCurve(curve: FogCurve, density: f32, t: f32, cutoff: f32) f32 {
+    return switch (curve) {
+        .old => (1.0 - @exp(-density * t)) / (1.0 - @exp(-density * cutoff)),
+        .clear => clearShape(density * cutoff, t / cutoff),
+    };
+}
+
+fn clearShape(k: f32, x: f32) f32 {
+    return std.math.expm1(k * x) / std.math.expm1(k);
 }
 
 pub fn buildFogLuts(params: RenderParams) void {
-    const buckets_f: f32 = @floatFromInt(fog_buckets);
+    const buckets_f: f32 = @floatFromInt(fog_buckets - 1);
     for (0..fog_buckets) |b| {
-        const t = (@as(f32, @floatFromInt(b)) + 0.5) * params.fog_cutoff / buckets_f;
-        fog_factor[b] = fogCurve(params.fog_density, t, params.fog_cutoff);
+        const t = @as(f32, @floatFromInt(b)) * params.fog_cutoff / buckets_f;
+        fog_factor[b] = fogCurve(params.fog_curve, params.fog_density, t, params.fog_cutoff);
     }
     for (world_mod.palette, 0..) |entry, m| {
         if (entry.emissive != 0) {
@@ -187,9 +199,9 @@ pub fn buildFogLuts(params: RenderParams) void {
                 sat |= v << sh;
             }
             for (0..fog_buckets) |b| {
-                const t = (@as(f32, @floatFromInt(b)) + 0.5) * params.fog_cutoff / buckets_f;
-                const haze = lerpColor(entry.rgb, sat, fogCurve(params.fog_density * 0.5, t, params.fog_cutoff));
-                fog_dest[m][b] = lerpColor(haze, params.fog_color, fogCurve(params.fog_density, t, params.fog_cutoff));
+                const t = @as(f32, @floatFromInt(b)) * params.fog_cutoff / buckets_f;
+                const haze = lerpColor(entry.rgb, sat, fogCurve(params.fog_curve, params.fog_density * 0.5, t, params.fog_cutoff));
+                fog_dest[m][b] = lerpColor(haze, params.fog_color, fogCurve(params.fog_curve, params.fog_density, t, params.fog_cutoff));
             }
         } else {
             for (0..fog_buckets) |b| {
@@ -241,13 +253,15 @@ pub fn applyGlow(c: u32, light: lighting.LightSample) u32 {
 
 /// Fog both stops of a segment: bucket the distances, lerp toward the
 /// material's (pre-collapsed) fog destination. Per-stop so the
-/// gradient fill lerps between fogged endpoints. LUT entries sit at
-/// bucket centers, so both the factor and the destination interpolate
-/// between the two straddling buckets; the index math runs 2-wide.
+/// gradient fill lerps between fogged endpoints. LUT entries span
+/// [0, fog_cutoff] inclusive (bucket 0 = t 0, the last = exactly the
+/// cutoff, where the curve is 1.0), so both the factor and the
+/// destination interpolate between the two straddling buckets; the
+/// index math runs 2-wide.
 pub fn fogStopsV(mat: u8, ts: [2]f32, cs: [2]V4, params: RenderParams) [2]V4 {
     const V2 = @Vector(2, f32);
-    const buckets_f: f32 = @floatFromInt(fog_buckets);
-    const u = @min(@max(@as(V2, ts) * @as(V2, @splat(buckets_f / params.fog_cutoff)) - @as(V2, @splat(0.5)), @as(V2, @splat(0.0))), @as(V2, @splat(buckets_f - 1)));
+    const buckets_f: f32 = @floatFromInt(fog_buckets - 1);
+    const u = @min(@max(@as(V2, ts) * @as(V2, @splat(buckets_f / params.fog_cutoff)), @as(V2, @splat(0.0))), @as(V2, @splat(buckets_f)));
     const b0v: @Vector(2, u32) = @intFromFloat(u);
     const fr = u - @as(V2, @floatFromInt(b0v));
     var out: [2]V4 = undefined;
@@ -288,7 +302,8 @@ test "fog lut is monotonic and saturates at the cutoff" {
         try std.testing.expect(f >= prev);
         prev = f;
     }
-    try std.testing.expect(fog_factor[0] > 0);
+    try std.testing.expectEqual(@as(f32, 0.0), fog_factor[0]);
+    try std.testing.expect(fog_factor[1] > 0);
     try std.testing.expectApproxEqAbs(1.0, fog_factor[fog_buckets - 1], 0.01);
     // Low-pass dest of a normal material converges to the fog color.
     const dest = fog_dest[1][fog_buckets - 1];
@@ -303,10 +318,33 @@ test "fog lut is monotonic and saturates at the cutoff" {
     try std.testing.expect(@abs(@as(i32, @intCast((near >> 16) & 0xff)) - 0x8c) <= 4);
 }
 
+test "clear fog curve endpoints and midrange shape" {
+    // Exactly 1 at the cutoff (hides the world edge/sky seam), 0 at
+    // the origin, and nearly clear at the first LOD handoff (~2.5% at
+    // x = 144/672 with k=4, vs ~91% under the old curve).
+    const params: RenderParams = .{};
+    buildFogLuts(params);
+    defer buildFogLuts(params);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), fog_factor[fog_buckets - 1], 0.01);
+    const handoff_f = fog_factor[@intFromFloat(render.handoff0 / params.fog_cutoff * fog_buckets)];
+    try std.testing.expect(handoff_f < 0.05);
+    var prev: f32 = 0;
+    for (fog_factor) |f| {
+        try std.testing.expect(f >= prev);
+        prev = f;
+    }
+    // The old curve remains selectable for the pinned fog_cutoff=96
+    // tests; at its fog_k invariant the handoff is ~91% fogged.
+    const old: RenderParams = .{ .fog_curve = .old, .fog_density = render.fog_k / render.draw_dist_default };
+    buildFogLuts(old);
+    try std.testing.expect(fog_factor[@intFromFloat(render.handoff0 / old.fog_cutoff * fog_buckets)] > 0.9);
+}
+
 test "emissive materials fade slower but converge to the fog color" {
-    // Pinned cutoff: the mid-bucket expectations assume the old 96,
-    // where a mid-distance emissive still tints the haze visibly.
-    const params: RenderParams = .{ .fog_cutoff = 96.0 };
+    // Pinned cutoff + old curve at its fog_k density: the mid-bucket
+    // expectations assume the milestone-24 96 cutoff, where a
+    // mid-distance emissive still tints the haze visibly.
+    const params: RenderParams = .{ .fog_cutoff = 96.0, .fog_curve = .old, .fog_density = render.fog_k / render.draw_dist_default };
     defer buildFogLuts(params);
     const saved = world_mod.palette[9];
     defer world_mod.palette[9] = saved;

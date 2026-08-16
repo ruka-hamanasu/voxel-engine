@@ -37,9 +37,10 @@ pub fn main(init: std.process.Init) !void {
         \\    --cam <CAM>       Camera override as "x,y,z,yaw".
         \\    --bench <u32>     Render N frames and report ms/frame.
         \\    --cam-to <CAM>    Bench-mode camera path end ("x,y,z,yaw"): the camera lerps from the start cam over the bench frames, driving the streamer each frame.
-        \\    --dist <f32>      Master draw distance (default 672): derives fog cutoff/density, LOD distances, and detail distance; the flags below override individual derivations.
+        \\    --dist <f32>      Master draw distance in voxels (default 672; 100000 = 10 km): derives fog cutoff/density, LOD distances, and detail distance; the flags below override individual derivations.
         \\    --fog <f32>       Fog density override.
         \\    --fogcut <f32>    Fog cutoff distance override.
+        \\    --fogcurve <FOGCURVE> Fog curve family: clear (default; near-clear midrange, exactly 1 at the cutoff) or old (milestone-8 normalized exponential).
         \\    --lod <f32>       First LOD switch distance (default 144; 0 disables the coarse worlds).
         \\    --lod2 <f32>      Second LOD switch distance (default 288; 0 ends the chain there).
         \\    --lods <u32>      Coarse LOD levels (default: the positive --lod/--lod2 entries); handoffs past --lod2 double.
@@ -62,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
     const parsers = comptime .{
         .PATH = clap.parsers.string,
         .GEN = clap.parsers.enumeration(gen.Generator),
+        .FOGCURVE = clap.parsers.enumeration(render.FogCurve),
         .CAM = clap.parsers.string,
         .u8 = clap.parsers.int(u8, 10),
         .u32 = clap.parsers.int(u32, 10),
@@ -168,6 +170,7 @@ pub fn main(init: std.process.Init) !void {
     rparams.light = light_enabled;
     if (res.args.fog) |d| rparams.fog_density = d;
     if (res.args.fogcut) |co| rparams.fog_cutoff = co;
+    if (res.args.fogcurve) |fc| rparams.fog_curve = fc;
     if (res.args.lod) |ld| rparams.lod_dists[0] = ld;
     if (res.args.lod2) |ld2| rparams.lod_dists[1] = ld2;
     if (res.args.lods) |count| {
