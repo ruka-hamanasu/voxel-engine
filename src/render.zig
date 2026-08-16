@@ -6,12 +6,14 @@ const spans = @import("render/spans.zig");
 const ao = @import("render/ao.zig");
 const shade = @import("render/shade.zig");
 const pool_mod = @import("pool.zig");
+const impostor_mod = @import("impostor.zig");
 
 const World = world_mod.World;
 const Camera = camera_mod.Camera;
 const SpanList = spans.SpanList;
 const Face = shade.Face;
 const OFace = shade.OFace;
+const Impostor = impostor_mod.Impostor;
 
 pub const hfov: f32 = std.math.pi / 2.0;
 /// March hard cap. The fine world only ever marches to lod_dists[0];
@@ -52,14 +54,38 @@ pub const FogCurve = enum { old, clear };
 /// Invariant density*cutoff for the old curve (milestone 30).
 pub const fog_k: f32 = 11.2;
 /// Invariant density*cutoff (the clear curve's k) for the default
-/// clear curve: ~2.5% fog at the 144 handoff, ~50% at ~0.8*cutoff.
+/// clear curve up to 2 km vox: ~2.5% fog at the 144 handoff, ~50% at
+/// ~0.8*cutoff.
 pub const clear_k: f32 = 4.0;
+/// D-dependent clear-curve shape (plans/DISTANCE.md D3.1 F1): k=4 up
+/// to 2048 vox (the D2-tuned near/mid look), ramping down to 2 at
+/// 8+ km vox so km-scale draws keep a gentle aerial-perspective haze
+/// over the impostor band (50% fog at ~0.65*cutoff instead of 0.83 —
+/// k=4 leaves everything within ~5 km of a 10 km draw raw).
+pub fn clearKFor(dist: f32) f32 {
+    return std.math.clamp(clear_k * @sqrt(2048.0 / dist), 2.0, clear_k);
+}
 /// Fixed near/mid LOD handoffs (milestone 33): no longer fractions of
 /// the draw distance, so km-scale tuning never moves the near field.
 /// Deeper handoffs double from here while < D.
 pub const handoff0: f32 = 144.0;
 pub const handoff1: f32 = 288.0;
+/// Default cascade->impostor handoff (plans/DISTANCE.md D3, D3.1):
+/// 72 * 32-vox base cell — the cascade's pixels-per-cell invariant,
+/// so the impostor's first level is a 2x-granularity continuation of
+/// the {144, 288, 576, 1152} chain. Overridable via --impdist.
+pub const impostor_handoff: f32 = handoff1 * 8.0;
 const default_cutoff = @min(draw_dist_default, max_dist);
+
+/// Truncate the LOD chain at the impostor handoff (plans/DISTANCE.md
+/// D3): with the far tier active the deeper cascade levels are never
+/// marched, so their worlds needn't be built or streamed. Entries are
+/// increasing, so zeroing every entry >= handoff keeps a valid prefix.
+pub fn impostorTruncate(lod_dists: *[max_lods]f32, handoff: f32) void {
+    for (lod_dists) |*d| {
+        if (d.* >= handoff) d.* = 0;
+    }
+}
 
 /// LOD handoff chain for a draw distance: {handoff0, handoff1}, then
 /// doubling while the next entry is < dist.
@@ -113,7 +139,7 @@ pub const RenderParams = struct {
             if (h.* >= d) h.* = 0;
         }
         return .{
-            .fog_density = clear_k / d,
+            .fog_density = clearKFor(d) / d,
             .fog_cutoff = d,
             .lod_dists = chain,
             .detail_dist = if (chain[0] > 0) chain[0] else 0,
@@ -279,7 +305,7 @@ pub const Renderer = struct {
         self.pool.deinit();
     }
 
-    pub fn render(self: *Renderer, fb: []u32, width: usize, height: usize, world: *const World, lods: []const *const World, cam: Camera, params: RenderParams) void {
+    pub fn render(self: *Renderer, fb: []u32, width: usize, height: usize, world: *const World, lods: []const *const World, cam: Camera, params: RenderParams, imp: ?*const Impostor) void {
         std.debug.assert(height <= shade.max_sky_height);
         const fog_on = params.fog_density > 0;
         if (fog_on) shade.buildFogLuts(params);
@@ -307,7 +333,7 @@ pub const Renderer = struct {
         // out of the per-cell window math.
         const s_max = hf0 * 0.5 / f;
 
-        const job: ColumnJob = .{ .fb = fb, .width = width, .height = height, .world = world, .lods = lods, .cam = cam, .f = f, .s_max = s_max, .sky = sky, .params = params };
+        const job: ColumnJob = .{ .fb = fb, .width = width, .height = height, .world = world, .lods = lods, .cam = cam, .f = f, .s_max = s_max, .sky = sky, .params = params, .imp = imp };
         self.pool.run(&job, ColumnJob.run, (width + ColumnJob.strip - 1) / ColumnJob.strip);
     }
 
@@ -339,6 +365,7 @@ const ColumnJob = struct {
     s_max: f32,
     sky: []const u32,
     params: RenderParams,
+    imp: ?*const Impostor,
 
     fn run(self: *const ColumnJob, item: usize) void {
         const x0 = item * strip;
@@ -350,7 +377,7 @@ const ColumnJob = struct {
             const hx = (@as(f32, @floatFromInt(sx)) + 0.5 - wf * 0.5) / self.f;
             const dx = fwd[0] + rgt[0] * hx;
             const dz = fwd[1] + rgt[1] * hx;
-            renderColumn(self.fb, self.height, self.world, self.lods, self.cam, self.f, self.s_max, sx, dx, dz, self.sky, self.params);
+            renderColumn(self.fb, self.height, self.world, self.lods, self.cam, self.f, self.s_max, sx, dx, dz, self.sky, self.params, self.imp);
         }
     }
 };
@@ -407,7 +434,7 @@ const MarchCfg = struct {
     fog: FogRay,
 };
 
-fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *const World, cam: Camera, f: f32, s_max: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams) void {
+fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *const World, cam: Camera, f: f32, s_max: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams, imp: ?*const Impostor) void {
     var free = SpanList.initFull(@intCast(height));
 
     // March no farther than the fog cutoff: every later hit is fully
@@ -417,34 +444,61 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
     const limit = @min(max_dist, params.fog_cutoff);
     const fog_ray: FogRay = .{ .dxz2 = dx * dx + dz * dz, .inv_f = 1.0 / f };
     const cfg: MarchCfg = .{ .world = world, .cam_x = cam.x, .cam_y = cam.y, .cam_z = cam.z, .f = f, .s_max = s_max, .dx = dx, .dz = dz, .fog = fog_ray };
+    // Far heightfield impostor (plans/DISTANCE.md D3/D3.1): the
+    // cascade stops at the first impostor level's handoff (snapped to
+    // an impostor-cell plane like any LOD boundary) and the impostor
+    // levels march [t_imp, limit), handing off at 72 * cell voxels —
+    // the cascade's own pixels-per-cell invariant. Inactive (null, or
+    // the handoff past the cutoff) leaves the cascade's range ends at
+    // limit — byte-identical to no impostor.
+    var casc_limit = limit;
+    var t_imp = limit;
+    if (imp) |ip| {
+        if (ip.levels[0].handoff < limit) {
+            t_imp = lodBoundary(cam.x, cam.z, dx, dz, ip.levels[0].handoff, limit, ip.levels[0].inv_cell);
+            casc_limit = t_imp;
+        }
+    }
     // Shading-detail split (RenderParams.detail_dist): the mode flips
     // at most once per ray (t0 is monotonic), so the branch is hoisted
     // out of the march as a range split. limit when disabled or out of
     // reach, keeping --detail 0 a single detailed march (bit-identical
     // to the pre-split renderer).
-    const t_detail = if (params.detail_dist > 0 and params.detail_dist < limit)
+    const t_detail = if (params.detail_dist > 0 and params.detail_dist < casc_limit)
         detailBoundary(cam.x, cam.z, dx, dz, params.detail_dist)
     else
-        limit;
+        casc_limit;
     var t_b: [max_lods + 1]f32 = undefined;
-    const n = lodChain(params, lods.len, cam.x, cam.z, dx, dz, limit, &t_b);
+    const n = lodChain(params, lods.len, cam.x, cam.z, dx, dz, casc_limit, &t_b);
     if (n == 0) {
-        marchFine(fb, height, sx, cfg, t_detail, limit, &free, params);
+        marchFine(fb, height, sx, cfg, t_detail, casc_limit, &free, params);
     } else {
         marchFine(fb, height, sx, cfg, t_detail, t_b[1], &free, params);
         var i: usize = 1;
         var scale: f32 = 0.5;
-        while (i <= n and t_b[i] < limit and !free.isEmpty()) : ({
+        while (i <= n and t_b[i] < casc_limit and !free.isEmpty()) : ({
             i += 1;
             scale *= 0.5;
         }) {
             const cfg_i: MarchCfg = .{ .world = lods[i - 1], .fine = if (i == 1) world else lods[i - 2], .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
-            const t_end = if (i < n) t_b[i + 1] else limit;
+            const t_end = if (i < n) t_b[i + 1] else casc_limit;
             if (t_b[i] >= t_detail) {
                 marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, false);
             } else {
                 marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, true);
             }
+        }
+    }
+    if (imp) |ip| {
+        var lvl: usize = 0;
+        var t_begin = t_imp + lod_eps;
+        while (lvl < ip.n_levels and t_begin < limit and !free.isEmpty()) : (lvl += 1) {
+            const t_end = if (lvl + 1 < ip.n_levels)
+                lodBoundary(cam.x, cam.z, dx, dz, ip.levels[lvl + 1].handoff, limit, ip.levels[lvl + 1].inv_cell)
+            else
+                limit;
+            marchImpostor(fb, height, sx, ip, lvl, cam.x, cam.y, cam.z, f, s_max, dx, dz, t_begin, t_end, &free, params, fog_ray);
+            t_begin = t_end + lod_eps;
         }
     }
 
@@ -520,6 +574,88 @@ fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, 
             }
         }
         processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cfg.cam_x, cfg.cam_y, cfg.cam_z, cfg.f, cfg.s_max, cfg.dx, cfg.dz, t0, t1, dda.axis, no_cull, cfg.fine, free, params, cfg.fog, detail);
+        no_cull = false;
+        dda.advance();
+    }
+}
+
+/// Row for a fractional (impostor-cell-units) height — rowAt's f32
+/// counterpart. The fine march's bit-exactness constraints don't
+/// apply to the impostor tier (a new path, no pinned baselines).
+fn rowAtF(y: f32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
+    return hf * 0.5 - (y - cam_y) * f / t;
+}
+
+/// Far-tier heightfield march (plans/DISTANCE.md D3/D3.1): one solid
+/// interval [0, top_y] per impostor cell — one interval test per
+/// cell, no neighbor cursors, no light zipper, no AO. Emissions are
+/// sky-lit max-AO segments through the same SegmentSink/segmentColor
+/// path as the cascade (shade LUT, radial fog, and the low-pass
+/// fog_dest all apply unchanged). The frame is the cascade's
+/// scaled-frame trick at 1/cell_size (cam and dir shrink, f grows),
+/// so the row/window math is form-invariant; cell tops convert to
+/// cell units per cell. Per cell: the exposed side face is the
+/// interval part above the previous cell's top (the first cell — a
+/// handoff boundary — emits uncullled, span claiming resolving
+/// occlusion against the nearer ranges, exactly like LOD boundary
+/// cells), plus the top face where the ray crosses the top plane
+/// within the cell.
+fn marchImpostor(fb: []u32, height: usize, sx: usize, imp: *const Impostor, level: usize, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, s_max: f32, dx: f32, dz: f32, t_begin: f32, t_end: f32, free: *SpanList, params: RenderParams, fog_ray: FogRay) void {
+    const inv = imp.levels[level].inv_cell;
+    const scx = cam_x * inv;
+    const scy = cam_y * inv;
+    const scz = cam_z * inv;
+    const sf = f / inv;
+    const ss = s_max * inv;
+    const sdx = dx * inv;
+    const sdz = dz * inv;
+    var dda = DdaIterator.init(scx + sdx * t_begin, scz + sdz * t_begin, sdx, sdz, t_end - t_begin);
+    const hf: f32 = @floatFromInt(height);
+    var sink: SegmentSink = .{ .fb = fb, .height = height, .sx = sx, .free = free, .params = params, .fog = fog_ray };
+    var no_cull = true;
+    var prev_top: f32 = 0;
+    var prev_valid = false;
+    while (t_begin + dda.t0 < t_end and !free.isEmpty()) {
+        const t0 = t_begin + dda.t0;
+        const t1 = t_begin + dda.t1();
+        const cell = imp.cellAt(level, dda.ix, dda.iz) orelse {
+            prev_valid = false;
+            no_cull = false;
+            dda.advance();
+            continue;
+        };
+        const t0c = @max(t0, 1e-4); // processCell's own clamp
+        const top = (@as(f32, @floatFromInt(cell.top_y)) + 1.0) * inv;
+        // Window-above-top skip: nothing solid in view for this cell.
+        const win = @max(ss * t0c, ss * t1);
+        if (scy - win <= top) {
+            // Side face at the entry plane: the interval part above
+            // the previous cell's top (the lower part faces the
+            // previous cell's solid). A missing previous cell culls
+            // the whole face (no walls at the residency/bounds edge).
+            const lo: f32 = if (no_cull) 0 else if (prev_valid) prev_top else top;
+            if (top > lo) {
+                const r0 = rowAtF(top, scy, sf, t0c, hf);
+                const r1 = rowAtF(lo, scy, sf, t0c, hf);
+                if (spans.spanOverlap(free, r0, r1)) {
+                    const face: OFace = if (dda.axis == .x_side) (if (dx > 0) .nx else .px) else (if (dz > 0) .nz else .pz);
+                    sink.emit(.{ .mat = cell.mat, .face = face, .r0 = r0, .r1 = r1, .t = .{ t0c, t0c }, .ao = .{ 3, 3 }, .sky = 1 });
+                    if (free.isEmpty()) return;
+                }
+            }
+            // Top face where the ray crosses the top plane within the
+            // cell. Rows invert when the plane is above the eye (top
+            // genuinely invisible then): spanOverlap gates the emit
+            // exactly like claimGrad's r1 > r0.
+            const r_far = rowAtF(top, scy, sf, t1, hf);
+            const r_near = rowAtF(top, scy, sf, t0c, hf);
+            if (spans.spanOverlap(free, r_far, r_near)) {
+                sink.emit(.{ .mat = cell.mat, .face = .py, .r0 = r_far, .r1 = r_near, .t = .{ t1, t0c }, .ao = .{ 3, 3 }, .sky = 1 });
+                if (free.isEmpty()) return;
+            }
+        }
+        prev_top = top;
+        prev_valid = true;
         no_cull = false;
         dda.advance();
     }
@@ -1212,6 +1348,44 @@ test "forDrawDistance derives fog, LOD, and detail from one distance" {
     try std.testing.expectEqual(RenderParams.forDrawDistance(draw_dist_default).detail_dist, d.detail_dist);
     // Distances past the march hard cap clamp to it.
     try std.testing.expectEqual(max_dist, RenderParams.forDrawDistance(1e6).fog_cutoff);
+    // D3.1: the clear-curve k ramps from 4 (<= 2048 vox) down to 2 at
+    // km-scale draws, so the impostor band keeps a gentle haze.
+    try std.testing.expectEqual(clear_k, clearKFor(672.0));
+    try std.testing.expectEqual(clear_k, clearKFor(2048.0));
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), clearKFor(10240.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), clearKFor(100000.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), RenderParams.forDrawDistance(10240.0).fog_density * 10240.0, 1e-3);
+}
+
+test "impostorTruncate drops handoffs at and past the handoff" {
+    var chain: [max_lods]f32 = .{ 144, 288, 576, 1152, 2304, 0, 0, 0 };
+    impostorTruncate(&chain, impostor_handoff);
+    try std.testing.expectEqual([max_lods]f32{ 144, 288, 576, 1152, 0, 0, 0, 0 }, chain);
+    var short: [max_lods]f32 = .{ 144, 288 } ++ .{0} ** (max_lods - 2);
+    impostorTruncate(&short, impostor_handoff);
+    try std.testing.expectEqual(@as(f32, 144), short[0]);
+    try std.testing.expectEqual(@as(f32, 288), short[1]);
+    try std.testing.expectEqual(@as(f32, 0), short[2]);
+}
+
+test "marchImpostor claims the below-horizon rows over solid terrain" {
+    const impostor_mod_t = @import("impostor.zig");
+    var imp = try impostor_mod_t.Impostor.init(std.testing.allocator, .terrain, 1337, 256, 32, 2304, 4096, null);
+    defer imp.deinit();
+    const cam: Camera = .{ .x = 100.5, .y = 250, .z = 100.5, .yaw = 0 };
+    try imp.runToCompletion(cam);
+    const height = 16;
+    const sentinel: u32 = 0xdeadbeef;
+    var fb: [height]u32 = @splat(sentinel);
+    var free = SpanList.initFull(height);
+    const params: RenderParams = .{ .fog_density = 0, .light = false };
+    // Horizontal +x ray from above the terrain top: every row at or
+    // below the horizon (row 8) must be claimed by the far field.
+    marchImpostor(&fb, height, 0, &imp, 0, cam.x, cam.y, cam.z, 16.0, 0.5, 1.0, 0.0, 10.0, 4096.0, &free, params, .{});
+    for (free.spans[0..free.len]) |s| try std.testing.expect(s.y1 <= 9);
+    try std.testing.expect(fb[10] != sentinel);
+    try std.testing.expect(fb[height - 1] != sentinel);
+    try std.testing.expectEqual(sentinel, fb[0]);
 }
 
 test "lodChain ends at non-increasing distances, missing worlds, and the limit" {

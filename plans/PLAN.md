@@ -710,6 +710,73 @@ entries here record scope and outcome only.
      start. Gates: zig build test green; bench (ms/frame, pre -> D1):
      pinned 384x128x384 13.46 -> 4.47 (3.0x), default 480x270 16.0 ->
      4.89 (3.3x), walk 960x540 21.9 -> 12.4 (1.8x; streamer update
-     inside the timed loop bounds it), spawn 960x540 31.4 -> 9.23
+     inside the timed loop bounds it),      spawn 960x540 31.4 -> 9.23
      (3.4x). Machine: 20 cores, so ratios are representative of the
      4-core target; absolute ms will differ there.
+
+34. COMPLETED - Heightfield impostor far tier (DISTANCE.md D3; design
+     detail and retained notes there). Past the cascade handoff
+     (render.impostor_handoff = 1152, --impdist) a streamed 2D
+     heightmap grid (src/impostor.zig: 4 B {top_y, mat, stamp} cells,
+     128-vox default via --impostor, 0 disables; 32x32-cell tiles,
+     Chebyshev ring + hysteresis around the camera, budgeted
+     incremental synthesis) replaces every deeper cascade level;
+     main.zig truncates lod_dists at the handoff
+     (render.impostorTruncate) and passes the handoff to the streamer
+     as the last cascade level's radius (using the fog cutoff there
+     brought back the quadratic coarse-chunk gen: 7 min warmup at
+     10 km -> 34 s). Synthesis rides a new generator facade
+     (gen.ImpostorCtx/ImpostorTile/impostorCell, union(Generator)
+     dispatch, so future generators plug in their own skyline query):
+     terrain takes a 9x9 heightAt sample max + pad (4 + max adjacent
+     sample delta/4; a brute-force conservativeness test pins it) and
+     folds arch tops in per tile — height only, after arch mat painted
+     whole cell tops white. The per-cell stamp is the persistence
+     milestone's dirty hook; nothing consumes it (render-only, never
+     lit). render.marchImpostor marches the DDA in the cascade's
+     scaled frame at 1/cell_size: one interval test per cell, side
+     face above the previous cell's top + top face, sky-lit max-AO
+     segments through the unchanged SegmentSink/segmentColor path
+     (radial fog and the low-pass fog_dest apply for free). Active
+     only when fog_cutoff > handoff, so every pinned config is
+     untouched: zig build test green (new conservativeness/
+     determinism/arch fold-in/truncation/march-smoke/ring-residency
+     tests) and all four sweeps byte-identical to views_m31*/m32*.
+     Seam A/B vs the deep-cascade reference (960x540, scripts/
+     ppmdiff.py): spawn diffs 0.41% (2 km) / 0.67% (4 km) / 0.43%
+     (8 km) of pixels, confined to the horizon band; arches 0.5%;
+     aerial 7.5-11% (the intended one-mat-per-cell low-pass — mesa
+     quantization, static under motion). Cell-size A/B: 64 bought
+     0.2-0.3% at 4x synthesis/march cost; 128 kept. Bench (960x540,
+     ms/frame): 2 km spawn 10.10 ref -> 9.44 imp; 4 km 11.40 -> 9.51;
+     10 km 9.79 (no feasible cascade reference); walk bench flat at
+     12.0-12.4 (impostor inactive at the default 672). mem.sh: 4 km
+     104 -> 79 MB; 10 km 79 MB (the ring is ~2 MB; cascade memory no
+     longer grows with D). Warmup at 10 km ~34 s total: ~20 s streamer
+     (the truncated cascade) + ~13 s impostor, the latter dominated
+     ~80:1 by the exact arch flatness scans rather than the ~5 us/cell
+     heightfield sampling — D4's pool threading target.
+     D3.1 follow-up (impostor seam remediation; findings and retained
+     notes in DISTANCE.md): live testing exposed rotation shimmer and
+     an arch pop at the handoff — the single 128-vox tier's 16x
+     granularity jump sat in a near-zero-fog band (k=4 leaves
+     everything within ~5 km of a 10 km draw raw), and the 1152-vox
+     handoff was 115 m, not the design's "~1-2 km". Two fixes, both
+     user-approved. Fog: clearKFor ramps the clear curve's k from 4
+     (D <= 2048, all pinned baselines untouched) to 2 at 8+ km vox
+     (50% fog at ~0.65*cutoff — gentle aerial perspective over the
+     impostor band). Pixel-matched handoffs (user directive): the
+     impostor became a multi-level heightmap cascade — level i has
+     base*2^i-vox cells handing off at 72*cell voxels, the cascade's
+     own f/72-px invariant ({144, 288, ...} = 72*{2, 4, ...}) — so
+     every seam is a 2x-granularity handoff and each level marches
+     ~72 cells. --impostor is now the base cell (default 32),
+     --impdist defaults to 72*base (2304); arch tops fold in only for
+     S <= 128 (sub-pixel past that) and keep arch material only at
+     S <= 32. Seam A/B at 4096 vs deep-cascade reference: spawn 0.67
+     -> 0.04%, arches 0.47 -> 0.02%, aerial 11 -> 2.4%; 8192 spawn
+     0.43 -> 0.04%. True 10 km unbounded (--dist 100000): 13.2
+     ms/frame at 960x540, warmup ~2 min single-threaded (arch scans
+     dominate; D4), mem 95 MB (rings ~2 MB). Regression: zig build
+     test green (new level-schedule and arch-gating tests); all four
+     sweeps byte-identical; walk bench flat (12.6 ms).

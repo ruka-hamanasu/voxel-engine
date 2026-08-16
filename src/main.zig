@@ -14,6 +14,7 @@ const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
 const lod_mod = @import("lod.zig");
 const stream = @import("stream.zig");
+const impostor_mod = @import("impostor.zig");
 const terrain = @import("gen/terrain.zig");
 const anim = @import("anim.zig");
 const clap = @import("clap");
@@ -43,8 +44,10 @@ pub fn main(init: std.process.Init) !void {
         \\    --fogcurve <FOGCURVE> Fog curve family: clear (default; near-clear midrange, exactly 1 at the cutoff) or old (milestone-8 normalized exponential).
         \\    --lod <f32>       First LOD switch distance (default 144; 0 disables the coarse worlds).
         \\    --lod2 <f32>      Second LOD switch distance (default 288; 0 ends the chain there).
-        \\    --lods <u32>      Coarse LOD levels (default: the positive --lod/--lod2 entries); handoffs past --lod2 double.
-        \\    --detail <f32>    Per-voxel shading detail distance (default: the first LOD distance; 0 = full detail everywhere).
+    \\    --lods <u32>      Coarse LOD levels (default: the positive --lod/--lod2 entries); handoffs past --lod2 double.
+    \\    --impostor <u32>  Far heightfield impostor base cell size in voxels (default 32, power of two; 0 disables); levels double from it while inside the cutoff. Active only when the fog cutoff exceeds the impostor handoff.
+    \\    --impdist <f32>   Cascade-to-impostor handoff distance (default 72 * base cell = 2304); the LOD chain truncates there when the impostor is active.
+    \\    --detail <f32>    Per-voxel shading detail distance (default: the first LOD distance; 0 = full detail everywhere).
         \\    --atten <u8>      Light attenuation.
         \\    --no-light        Disable lighting.
         \\    --no-anim         Disable palette animation.
@@ -194,6 +197,18 @@ pub fn main(init: std.process.Init) !void {
         // first handoff unless --detail says otherwise.
         rparams.detail_dist = rparams.lod_dists[0];
 
+    // Far heightfield impostor (plans/DISTANCE.md D3/D3.1): active
+    // when the fog cutoff reaches past the first impostor handoff; the
+    // LOD chain truncates there since deeper cascade levels are never
+    // marched. The default handoff keeps the cascade's pixels-per-cell
+    // invariant: 72 * base cell voxels (2304 at 32-vox cells).
+    const imp_cell = res.args.impostor orelse 32;
+    const imp_dist = res.args.impdist orelse @as(f32, @floatFromInt(imp_cell)) * impostor_mod.handoff_per_cell;
+    if (imp_cell != 0 and (imp_cell < 16 or imp_cell > 4096 or !std.math.isPowerOfTwo(imp_cell)))
+        return error.BadImpostorCell;
+    const imp_active = imp_cell > 0 and rparams.fog_cutoff > imp_dist;
+    if (imp_active) render.impostorTruncate(&rparams.lod_dists, imp_dist);
+
     // Halved-resolution far-field worlds (milestone 14 follow-up,
     // generalized to a chain in milestone 25): one per positive
     // increasing lod_dists entry. Bounded: built eagerly here and
@@ -217,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
             lod_worlds[i] = try lod_mod.build(allocator, if (i == 0) world else &lod_worlds[i - 1].?);
         }
     } else {
-        streamer = try stream.Streamer.init(allocator, world, opts.seed, rparams.lod_dists[0..lod_count], rparams.fog_cutoff, if (light_enabled) light_params else null, load_budget, res.args.@"exact-coarse" != 0);
+        streamer = try stream.Streamer.init(allocator, world, opts.seed, rparams.lod_dists[0..lod_count], if (imp_active) imp_dist else rparams.fog_cutoff, if (light_enabled) light_params else null, load_budget, res.args.@"exact-coarse" != 0);
     }
     var lod_ptrs: [render.max_lods]*const World = undefined;
     if (bounded) {
@@ -248,6 +263,20 @@ pub fn main(init: std.process.Init) !void {
         std.log.debug("stream warm-up: {d:.2} ms", .{wms});
     }
 
+    // Far heightfield impostor ring (plans/DISTANCE.md D3): same
+    // warm-up discipline as the streamer, then per-frame budgeted
+    // updates alongside it.
+    var impostor: ?impostor_mod.Impostor = null;
+    defer if (impostor) |*im| im.deinit();
+    if (imp_active) {
+        impostor = try impostor_mod.Impostor.init(allocator, generator, opts.seed, opts.h, imp_cell, imp_dist, rparams.fog_cutoff, if (bounded) .{ opts.w, opts.d } else null);
+        const wstart = std.Io.Clock.Timestamp.now(init.io, .awake);
+        try impostor.?.runToCompletion(cam);
+        const wms = @as(f64, @floatFromInt(wstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+        std.log.debug("impostor warm-up: {d:.2} ms", .{wms});
+    }
+    const imp_ptr: ?*const impostor_mod.Impostor = if (impostor) |*im| im else null;
+
     if (anim_enabled) {
         anim.updatePalette(time_s);
         render.rebuildShadeLut();
@@ -271,8 +300,9 @@ pub fn main(init: std.process.Init) !void {
                     .yaw = cam_start.yaw + (v[3] - cam_start.yaw) * t,
                 };
                 if (streamer) |*st| try st.update(cam);
+                if (impostor) |*im| try im.update(cam);
             }
-            rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
+            rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams, imp_ptr);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
         const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
@@ -286,7 +316,7 @@ pub fn main(init: std.process.Init) !void {
         for (landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
         if (bounded) std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
-        rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
+        rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams, imp_ptr);
         rnd.transpose(staging, framebuffer, render_w, render_h);
         try render.writePpm(init.io, allocator, path, staging, render_w, render_h);
         return;
@@ -449,6 +479,7 @@ pub fn main(init: std.process.Init) !void {
             const pz1: i32 = @as(i32, @intFromFloat(@floor(player.z + Player.half_width))) + 1;
             try st.forceResident(px0, pz0, px1, pz1);
         }
+        if (impostor) |*im| try im.update(cam);
         player.update(world, input, @floatCast(dt));
         cam = player.camera();
 
@@ -481,7 +512,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         rparams.time_s = time_s;
-        rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams);
+        rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams, imp_ptr);
         rnd.transpose(staging, framebuffer, render_w, render_h);
 
         if (c.SDL_UpdateTexture(texture, null, staging.ptr, @intCast(render_w * 4)) != 0) {
@@ -602,6 +633,7 @@ test {
     _ = @import("world.zig");
     _ = @import("chunk.zig");
     _ = @import("stream.zig");
+    _ = @import("impostor.zig");
     _ = @import("camera.zig");
     _ = @import("player.zig");
 }

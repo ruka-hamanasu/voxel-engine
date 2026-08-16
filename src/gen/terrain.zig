@@ -292,6 +292,79 @@ pub fn collectArches(ctx: *const Ctx, x0: i32, z0: i32, x1: i32, z1: i32, bounds
     }
 }
 
+/// Far-impostor arch summary (plans/DISTANCE.md D3): each arch
+/// contributes its shell box's XZ footprint and conservative top
+/// (the lintel top, y1-1; the carved opening is ignored — a few
+/// voxels of overestimate at km range).
+pub const ArchTop = struct { x0: i32, z0: i32, x1: i32, z1: i32, top: u16 };
+
+/// Per-tile arch state for impostor synthesis: the arches reaching
+/// [x0, x0+extent) x [z0, z0+extent), collected once per tile instead
+/// of per cell (cells share the region neighborhood).
+pub const ImpostorTile = struct {
+    arch_tops: []ArchTop,
+
+    pub fn init(ctx: *const Ctx, bounds: ?[2]usize, x0: i32, z0: i32, extent: i32, arches: bool, allocator: std.mem.Allocator) !ImpostorTile {
+        if (!arches) return .{ .arch_tops = &.{} };
+        var arch_list: std.ArrayList(Arch) = .empty;
+        defer arch_list.deinit(allocator);
+        try collectArches(ctx, x0, z0, x0 + extent, z0 + extent, bounds, &arch_list, allocator);
+        const tops = try allocator.alloc(ArchTop, arch_list.items.len);
+        for (arch_list.items, tops) |arch, *at| {
+            const shell = archBoxes(arch, ctx.h)[0];
+            at.* = .{ .x0 = shell.x0, .z0 = shell.z0, .x1 = shell.x1, .z1 = shell.z1, .top = @intCast(shell.y1 - 1) };
+        }
+        return .{ .arch_tops = tops };
+    }
+
+    pub fn deinit(self: *ImpostorTile, allocator: std.mem.Allocator) void {
+        allocator.free(self.arch_tops);
+    }
+};
+
+/// One far-impostor cell (plans/DISTANCE.md D3): a conservative top
+/// height and one dominant material for the size x size voxel
+/// footprint at (x0, z0), from the pure heightfield alone — no fine
+/// data, no flood. top_y is the max of a 9x9 heightAt sample grid
+/// plus a pad (base + half the largest adjacent-sample delta) for the
+/// fBm energy unresolved between samples; the brute-force
+/// conservativeness test below pins the pad. Arch tops fold in from
+/// the tile's ArchTop list; the cell keeps arch material only at
+/// 32-vox cells and below (an arch spans most of such a cell — at
+/// bigger cells the white would paint the whole top), terrain
+/// material otherwise. One material per cell (the strata rule at the
+/// highest sample) IS the sub-pixel shimmer low-pass.
+pub fn impostorCell(ctx: *const Ctx, tile: *const ImpostorTile, x0: i32, z0: i32, size: u32) gen.ImpostorCell {
+    const stride = size / 8;
+    var samples: [9][9]u16 = undefined;
+    var best: u16 = 0;
+    for (0..9) |i| {
+        for (0..9) |j| {
+            const v = heightAt(ctx, x0 + @as(i32, @intCast(j * stride)), z0 + @as(i32, @intCast(i * stride)));
+            samples[i][j] = v;
+            best = @max(best, v);
+        }
+    }
+    var delta: u32 = 0;
+    for (0..9) |i| {
+        for (0..9) |j| {
+            if (i + 1 < 9) delta = @max(delta, @abs(@as(i32, samples[i][j]) - samples[i + 1][j]));
+            if (j + 1 < 9) delta = @max(delta, @abs(@as(i32, samples[i][j]) - samples[i][j + 1]));
+        }
+    }
+    const pad = 4 + delta / 4;
+    var top: u32 = @min(@as(u32, best) + pad, @as(u32, @intCast(ctx.hi_cap)));
+    var m: u8 = if (@as(f32, @floatFromInt(best)) < ctx.sand_level) mat.sand else mat.grass;
+    for (tile.arch_tops) |a| {
+        const sz: i32 = @intCast(size);
+        if (x0 < a.x1 and x0 + sz > a.x0 and z0 < a.z1 and z0 + sz > a.z0 and a.top > top) {
+            top = a.top;
+            if (size <= 32) m = mat.arch;
+        }
+    }
+    return .{ .top_y = @intCast(top), .mat = m };
+}
+
 /// One arch stamp box, clipped into the dense tile.
 fn archBox(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, box: ArchBox) void {
     const cx0 = @max(box.x0, tx0);
@@ -647,4 +720,60 @@ test "biome split yields both plains and mountains" {
     }
     try std.testing.expect(hi > @as(u16, @intFromFloat(ctx.base + 0.5 * ctx.mount_amp)));
     try std.testing.expect(flat_cols * 2 > total); // plains are the majority biome
+}
+
+test "impostor cell top conservatively covers the heightfield" {
+    // Brute-force check: the sampled+padded top must meet or exceed
+    // the dense heightfield max over the whole footprint, at plains
+    // and mountain locations, at both supported cell sizes.
+    const ctx = Ctx.init(1337, 256);
+    var tile = try ImpostorTile.init(&ctx, null, 0, 0, 0, true, std.testing.allocator);
+    defer tile.deinit(std.testing.allocator);
+    var rng = std.Random.DefaultPrng.init(0x1B05);
+    const rand = rng.random();
+    for ([_]u32{ 32, 64, 128 }) |size| {
+        for (0..24) |_| {
+            const x0 = @as(i32, @intCast(rand.intRangeAtMost(u32, 0, 20000))) - 10000;
+            const z0 = @as(i32, @intCast(rand.intRangeAtMost(u32, 0, 20000))) - 10000;
+            const cell = impostorCell(&ctx, &tile, x0, z0, size);
+            const span = heightSpanAt(&ctx, x0, z0, size, size);
+            try std.testing.expect(cell.top_y >= span.max);
+            try std.testing.expect(cell.top_y <= ctx.hi_cap);
+            // Determinism: same inputs, same cell.
+            try std.testing.expectEqual(cell, impostorCell(&ctx, &tile, x0, z0, size));
+        }
+    }
+}
+
+test "impostor cell folds arch tops in" {
+    // Find an arch near the origin; the cell containing it must rise
+    // to the lintel top (arch footprints sit on flat terrain, so the
+    // arch always wins the cell max). At 32 vox the cell keeps arch
+    // material (the arch spans most of it); at 128 it keeps the
+    // terrain's.
+    const ctx = Ctx.init(1337, 256);
+    var found: ?Arch = null;
+    var rx: i32 = -3;
+    while (rx <= 3 and found == null) : (rx += 1) {
+        var rz: i32 = -3;
+        while (rz <= 3 and found == null) : (rz += 1) {
+            found = archInRegion(&ctx, rx, rz, null);
+        }
+    }
+    const arch = found orelse return error.NoArchFound;
+    var tile = try ImpostorTile.init(&ctx, null, arch.x - 64, arch.z - 64, 128, true, std.testing.allocator);
+    defer tile.deinit(std.testing.allocator);
+    const cx = (arch.x - 64) & ~@as(i32, 127);
+    const cz = (arch.z - 64) & ~@as(i32, 127);
+    const cell = impostorCell(&ctx, &tile, cx, cz, 128);
+    try std.testing.expect(cell.top_y >= @min(@as(i32, arch.y) + 29, ctx.hi_cap));
+    try std.testing.expect(cell.mat == mat.grass or cell.mat == mat.sand);
+    const small = impostorCell(&ctx, &tile, arch.x & ~@as(i32, 31), arch.z & ~@as(i32, 31), 32);
+    try std.testing.expect(small.top_y >= @min(@as(i32, arch.y) + 29, ctx.hi_cap));
+    try std.testing.expectEqual(mat.arch, small.mat);
+    // No arch scan (big-cell levels): the fold-in disappears.
+    var plain = try ImpostorTile.init(&ctx, null, arch.x - 64, arch.z - 64, 128, false, std.testing.allocator);
+    defer plain.deinit(std.testing.allocator);
+    const nofold = impostorCell(&ctx, &plain, cx, cz, 128);
+    try std.testing.expect(nofold.top_y < cell.top_y);
 }
