@@ -21,8 +21,7 @@ pub const Noise = struct {
         return v;
     }
 
-    /// Integer-lattice hash behind noise2; also the per-region feature
-    /// roll source (arches, plans/STREAMING.md).
+    /// Integer-lattice hash behind noise2.
     pub fn hash2(self: Noise, x: i32, z: i32) u64 {
         const ux: u64 = @bitCast(@as(i64, x));
         const uz: u64 = @bitCast(@as(i64, z));

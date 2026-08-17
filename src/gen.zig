@@ -9,19 +9,11 @@ pub const Options = struct {
     d: usize = 384,
 };
 
-pub const Landmark = struct {
-    x: i32,
-    y: i32,
-    z: i32,
-};
-
 pub const Result = struct {
     world: World,
     spawn: Camera,
-    landmarks: []Landmark,
 
-    pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
-        allocator.free(self.landmarks);
+    pub fn deinit(self: *Result) void {
         self.world.deinit();
     }
 };
@@ -49,37 +41,15 @@ pub const ImpostorCtx = union(Generator) {
     terrain: *const terrain.Ctx,
 };
 
-/// Per-tile impostor synthesis state (terrain: the tile's arch tops).
-pub const ImpostorTile = union(Generator) {
-    terrain: terrain.ImpostorTile,
-};
-
-/// Begin impostor synthesis of the tile covering [x0, x0+extent) x
-/// [z0, z0+extent) fine voxels. bounds = the bounded world's XZ
-/// extent, null when unbounded. arches = false skips the arch fold-in
-/// (levels whose cells make arches sub-pixel; the region scans
-/// dominate synthesis cost).
-pub fn impostorBeginTile(ctx: ImpostorCtx, bounds: ?[2]usize, x0: i32, z0: i32, extent: i32, arches: bool, allocator: std.mem.Allocator) !ImpostorTile {
+pub fn impostorCell(ctx: ImpostorCtx, x0: i32, z0: i32, size: u32) ImpostorCell {
     return switch (ctx) {
-        .terrain => |tc| .{ .terrain = try terrain.ImpostorTile.init(tc, bounds, x0, z0, extent, arches, allocator) },
-    };
-}
-
-pub fn impostorEndTile(tile: *ImpostorTile, allocator: std.mem.Allocator) void {
-    switch (tile.*) {
-        .terrain => |*t| t.deinit(allocator),
-    }
-}
-
-pub fn impostorCell(ctx: ImpostorCtx, tile: *const ImpostorTile, x0: i32, z0: i32, size: u32) ImpostorCell {
-    return switch (ctx) {
-        .terrain => |tc| terrain.impostorCell(tc, &tile.terrain, x0, z0, size),
+        .terrain => |tc| terrain.impostorCell(tc, x0, z0, size),
     };
 }
 
 test "facade dispatch generates a world" {
     var result = try generate(.terrain, std.testing.allocator, .{ .seed = 3, .w = 48, .h = 32, .d = 48 });
-    defer result.deinit(std.testing.allocator);
+    defer result.deinit();
     try std.testing.expect(result.world.get(0, 0, 0) != 0);
     try std.testing.expect(result.spawn.y > 0);
     try std.testing.expect(result.spawn.y < @as(f32, @floatFromInt(result.world.h)));

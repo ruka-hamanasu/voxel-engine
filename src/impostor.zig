@@ -32,15 +32,6 @@ pub const max_levels = 8;
 /// — cascade or impostor — hands off where its cell covers f/72 px,
 /// i.e. at 72 * cell_size voxels.
 pub const handoff_per_cell: f32 = 72.0;
-/// Arch tops fold into cell heights only where an arch subtends more
-/// than ~1.7 px at the level's handoff (220 / cell px at f = 480);
-/// past that the fold-in is invisible but its region scans dominate
-/// synthesis cost.
-pub const arch_cell_max: u32 = 128;
-/// Cells whose skyline an arch wins keep arch material only at this
-/// cell size or below (an arch spans ~84% of a 32-vox cell, so the
-/// white reads as the arch, not a painted plateau).
-pub const arch_mat_cell_max: u32 = 32;
 
 pub const Cell = struct { top_y: u16, mat: u8, stamp: u8 = 0 };
 
@@ -86,8 +77,6 @@ pub const Level = struct {
     handoff: f32,
     /// Load radius in tiles (Chebyshev) around the camera's tile.
     radius: i32,
-    /// false past arch_cell_max: no arch fold-in (see arch_cell_max).
-    arches: bool,
     tiles: TileMap,
     memo: [world_mod.World.memo_slots]Memo = @splat(.{}),
 };
@@ -112,7 +101,6 @@ pub const Impostor = struct {
         tx: i32,
         tz: i32,
         tile: *Tile,
-        tctx: gen.ImpostorTile,
         next: usize,
     };
 
@@ -145,7 +133,6 @@ pub const Impostor = struct {
                 .inv_cell = 1.0 / @as(f32, @floatFromInt(size)),
                 .handoff = handoff,
                 .radius = @as(i32, @intFromFloat(@ceil(@min(cutoff, handoff * 2) / tile_vox))) + 1,
-                .arches = size <= arch_cell_max,
                 .tiles = TileMap.init(allocator),
             };
             self.n_levels += 1;
@@ -164,7 +151,6 @@ pub const Impostor = struct {
 
     fn dropInFlight(self: *Impostor) void {
         if (self.in_flight) |*f| {
-            gen.impostorEndTile(&f.tctx, self.allocator);
             self.allocator.destroy(f.tile);
             self.in_flight = null;
         }
@@ -290,8 +276,7 @@ pub const Impostor = struct {
                     const missing = self.nearestMissing(li, @divFloor(cx, extent), @divFloor(cz, extent)) orelse continue;
                     const tile = try self.allocator.create(Tile);
                     errdefer self.allocator.destroy(tile);
-                    const tctx = try gen.impostorBeginTile(self.gctx(), self.bounds, missing[0] * extent, missing[1] * extent, extent, lvl.arches, self.allocator);
-                    self.in_flight = .{ .level = li, .key = tileKey(missing[0], missing[1]), .tx = missing[0], .tz = missing[1], .tile = tile, .tctx = tctx, .next = 0 };
+                    self.in_flight = .{ .level = li, .key = tileKey(missing[0], missing[1]), .tx = missing[0], .tz = missing[1], .tile = tile, .next = 0 };
                     started = true;
                     break;
                 }
@@ -304,7 +289,7 @@ pub const Impostor = struct {
             for (f.next..f.next + n) |idx| {
                 const lx: i32 = @intCast(idx / tile_cells);
                 const lz: i32 = @intCast(idx % tile_cells);
-                const c = gen.impostorCell(self.gctx(), &f.tctx, (f.tx * @as(i32, tile_cells) + lx) << lvl.shift, (f.tz * @as(i32, tile_cells) + lz) << lvl.shift, size);
+                const c = gen.impostorCell(self.gctx(), (f.tx * @as(i32, tile_cells) + lx) << lvl.shift, (f.tz * @as(i32, tile_cells) + lz) << lvl.shift, size);
                 f.tile.cells[idx] = .{ .top_y = c.top_y, .mat = c.mat };
             }
             f.next += n;
@@ -312,7 +297,6 @@ pub const Impostor = struct {
             if (f.next == cells_per_tile) {
                 const key = f.key;
                 const tile = f.tile;
-                gen.impostorEndTile(&f.tctx, self.allocator);
                 self.in_flight = null;
                 try lvl.tiles.put(key, tile);
             }
@@ -388,9 +372,7 @@ test "levels follow the 72x pixel-matched schedule" {
     try std.testing.expectEqual(@as(f32, 9216), imp.levels[2].handoff);
     try std.testing.expectEqual(@as(u5, 5), imp.levels[0].shift); // 32 vox
     try std.testing.expectEqual(@as(u5, 7), imp.levels[2].shift); // 128 vox
-    try std.testing.expect(imp.levels[0].arches);
     var big = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 100000, null);
     defer big.deinit();
     try std.testing.expectEqual(@as(usize, 6), big.n_levels); // 32..1024
-    try std.testing.expect(!big.levels[4].arches); // 512-vox cells: no arch fold-in
 }

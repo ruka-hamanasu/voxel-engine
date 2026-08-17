@@ -20,7 +20,7 @@ const chunk_w = world_mod.chunk_w;
 /// both sit deep in fog, so load/unload relights are invisible.
 ///
 /// Generation cost concentrates in the dense fill, so the per-update
-/// budget slices column ranges of the fill stage; arch stamps, the
+/// budget slices column ranges of the fill stage; the
 /// coarse pyramid, run-encoding, and the load flood run as one
 /// finishing step (commitChunk). An in-flight chunk keeps its partial
 /// tile as streamer state and is not resident until it commits — the
@@ -51,7 +51,6 @@ pub const Streamer = struct {
     rep_grid: []u8, // repair scratch: dense fine grid (max span)
     rep_pyr: []u8, // repair scratch: flat pyramid (sliced per level)
     rep_col: []u8, // repair scratch: one coarse column (max coarse h)
-    arches: std.ArrayList(terrain.Arch),
     edited: std.AutoHashMap(u64, void), // fine chunk keys holding live edits
     load_r: []i32, // per level (0 = fine): load radius in chunks
     unload_r: []i32,
@@ -98,7 +97,6 @@ pub const Streamer = struct {
         s.rep_col = &.{};
         s.load_r = &.{};
         s.unload_r = &.{};
-        s.arches = .empty;
         s.edited = std.AutoHashMap(u64, void).init(allocator);
         s.queue = .empty;
         s.repairs = .empty;
@@ -120,7 +118,6 @@ pub const Streamer = struct {
             if (s.rep_col.len > 0) allocator.free(s.rep_col);
             if (s.load_r.len > 0) allocator.free(s.load_r);
             if (s.unload_r.len > 0) allocator.free(s.unload_r);
-            s.arches.deinit(allocator);
             s.edited.deinit();
             s.queue.deinit(allocator);
             s.repairs.deinit(allocator);
@@ -173,7 +170,6 @@ pub const Streamer = struct {
         self.allocator.free(self.load_r);
         self.allocator.free(self.unload_r);
         self.fine_builder.deinit();
-        self.arches.deinit(self.allocator);
         self.edited.deinit();
         self.queue.deinit(self.allocator);
         self.repairs.deinit(self.allocator);
@@ -326,7 +322,7 @@ pub const Streamer = struct {
                     }
                     self.in_flight = null;
                 }
-                try chunk_mod.loadChunk(self.fine, &self.ctx, &self.fine_builder, cx, cz, null, self.light);
+                try chunk_mod.loadChunk(self.fine, &self.ctx, &self.fine_builder, cx, cz, self.light);
             }
         }
     }
@@ -376,7 +372,7 @@ pub const Streamer = struct {
     }
 
     /// Fill up to `remaining` columns of the in-flight chunk's current
-    /// tile; a completed tile gets its arch stamps and (coarse levels)
+    /// tile; a completed tile gets (coarse levels)
     /// its pyramid downsample into the coarse builder. On the last
     /// tile the chunk commits (encode + flood) as one step.
     fn progressLoad(self: *Streamer, f: *InFlight, remaining: *usize) !void {
@@ -399,7 +395,6 @@ pub const Streamer = struct {
             f.col += take;
             remaining.* -= take;
             if (f.col == total_cols) {
-                try terrain.genTileArches(&self.ctx, &self.fine_builder, tx0, tz0, chunk_w, chunk_w, null);
                 if (f.level > 0) {
                     // Pyramid the fine tile down to the target level
                     // and copy its coarse columns into the coarse tile.
@@ -450,7 +445,7 @@ pub const Streamer = struct {
             off += side * side * dim.h;
         }
         const col = self.rep_col[0..self.lods[w.level - 1].h];
-        try chunk_mod.resynthCoarseRegion(&self.lods[w.level - 1], &self.ctx, w.level, self.fine.h, r, null, self.light, self.coarse_caves, grid, pyr_slices[0..w.level], col, &self.arches, self.allocator);
+        try chunk_mod.resynthCoarseRegion(&self.lods[w.level - 1], &self.ctx, w.level, self.fine.h, r, self.light, self.coarse_caves, grid, pyr_slices[0..w.level], col, self.allocator);
     }
 };
 

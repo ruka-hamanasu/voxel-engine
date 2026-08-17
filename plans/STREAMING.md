@@ -7,10 +7,7 @@
   bounds in camera/player clamps: all three verified byte-identical
   against views_m25[/]_lod0 before worldgen changed. Worldgen is
   position-deterministic: `Ctx`/`heightAt`/`genColumn` in
-  gen/terrain.zig, hash3-rolled crystals, one arch max per 128x128
-  region (first of 8 hash candidates passing flatness/lintel/bounds
-  wins; candidate origin range is region-local [10, 88] intersected
-  with the bounded world's [10, size-40]), arches stamped into the
+  gen/terrain.zig, hash3-rolled crystals, columns filled into the
   64x64xh Builder tile pre-encode (tile pipeline = future chunk load),
   spawn by ring search near origin. Baselines regenerated as
   views_m26[/]_lod0, rerun byte-identical; tile-independence (64 vs 16)
@@ -108,11 +105,9 @@ lost.
    the world volume.
 3. **Position-deterministic worldgen** (gen/terrain.zig). Generation is
    restructured as a staged per-chunk tile pipeline (the per-column math
-   is unchanged — storage and rendering are columnar — but arches are
-   tile features crossing chunk boundaries, so they must be stamped
-   before encoding, not applied via fillBox after):
+   is unchanged — storage and rendering are columnar):
    `heightAt` tile -> dense tile scratch (chunk_w x chunk_d x h u8,
-   ~512 KB reusable) -> arch stamps into the tile -> run-encode all
+   ~512 KB reusable) -> run-encode all
    columns -> flood. `Builder` generalizes from single-column dense
    scratch to a dense tile; `genColumn` writes one tile column. The
    staged tile also enables SIMD-batched noise later without touching
@@ -122,16 +117,10 @@ lost.
    - Crystal rolls: per-position hash (hash3(x, y, z)-derived rolls, so
      validity order doesn't matter) instead of the sequential
      world-global `rng`.
-   - Arches: region-hashed features. Per 128x128 region a hash decides
-     existence/position/orientation; flatness via `heightAt` spans
-     computed on the fly. Chunk gen consults its own + ring-1 regions
-     (arch footprint <= ~35 wide). Replaces the global attempts loop and
-     `farFromLandmarks`.
    - Extract `genColumn(ctx, x, z, dense_column_out)` — one code path
      for tests, chunk loading, and coarse-level synthesis.
    - Spawn: `heightAt` search near the origin (unbounded => spawn at
-     ~0,0); `landmarks` = arches in regions near spawn (headless debug
-     logging only).
+     ~0,0).
    - Regenerate all view-sweep baselines (world layout changes).
 4. **Player/camera declamp** (player.zig:72,122-124). XZ clamps become
    no-ops when the world is unbounded; keep them for bounded test
@@ -163,7 +152,7 @@ must remain byte-identical.
    i32 so negative chunk coords work.
 7. Chunk lifecycle (src/chunk.zig): `loadChunk(cx, cz)` =
    `World.ensureChunk` + the staged tile pipeline (dense fill ->
-   arch stamps -> run-encode); `unloadChunk` blanks the chunk's
+   run-encode); `unloadChunk` blanks the chunk's
    materials PRESERVING light runs, `lighting.relight`s the chunk box
    (the stale-seed clear needs the old runs to find orphan chains into
    neighbors), then frees (see 9 for the hysteresis context). The 3
@@ -188,7 +177,7 @@ must remain byte-identical.
    load radius (hysteresis), both beyond fog cutoff, so the clear is
    invisible. Amortize across frames if profiling says so.
 10. **LOD chain**: coarse chunks built on demand by downsampling a
-    dense pyramid over generated fine columns (genColumn + arch stamps;
+    dense pyramid over generated fine columns (genColumn;
     `genColumnFast` approx variant skips sub-skin caves by default) —
     no fine residency, and the levels are mutually independent.
     Edit-driven `rebuildRegion` only fires for resident fine chunks
@@ -201,7 +190,7 @@ must remain byte-identical.
     first. Generation cost is concentrated in the dense-fill stage, so
     the budget slices by column ranges within that stage: an in-flight
     chunk keeps its partial tile as streamer state across frames, and
-    arch-stamp + encode + flood run as one fast finishing step. The
+    encode + flood run as one fast finishing step. The
     chunk under the player force-generates synchronously before physics
     (collision reads air as fall-through). Unload beyond the hysteresis
     radius.

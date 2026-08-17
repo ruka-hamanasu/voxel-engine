@@ -18,7 +18,7 @@ tier (D3) the centerpiece rather than an optional lever.
   the `World` chunk-lookup memo (`@constCast`, world.zig) and the
   module-global LUTs, which are already rebuilt pre-render.
 - The yaw-only camera confines the far field to a thin row band near
-  the horizon, and terrain is a pure heightfield (caves/arches/
+  the horizon, and terrain is a pure heightfield (caves/
   crystals are all sub-skin). A 2D heightmap impostor reproduces
   exactly what the coarse cascade would show past ~1-2 km, at one
   interval test per cell. Terrain max relief ~150 vox subtends <1 px
@@ -99,19 +99,16 @@ streamed 2D heightmap grid (`src/impostor.zig`, {top_y, mat, stamp}
 per 128-vox cell, `--impostor`; 0 disables) replaces all deeper LOD
 levels. Synthesis is behind a generator facade (gen.impostorCell):
 terrain samples a 9x9 heightAt grid + pad (4 + max-sample-delta/4,
-pinned by a brute-force conservativeness test) and folds arch tops in
-(height only — arch mat painted whole cell tops white; ~1% footprint
-can't own the cell color). The far march (render.marchImpostor) is
+pinned by a brute-force conservativeness test). The far march
+(render.marchImpostor) is
 the column-DDA at 1/cell_size scale with one interval test per cell
 through the existing SegmentSink/segmentColor path. Seam A/B vs the
 deep-cascade reference (960x540): spawn 0.41% (2 km) / 0.67% (4 km)
 / 0.43% (8 km) pixels differing, confined to the horizon band; aerial
 7.5-11% (the intended one-mat-per-cell low-pass; mesa-quantized but
 static, no shimmer). Cell 64 halved nothing meaningful at 4x cost —
-128 kept. Findings that shape D4: impostor warmup at 10 km is ~13 s,
-dominated ~80:1 by the exact arch flatness scans (archInRegion's
-per-candidate 29x29 heightSpanAt), not the ~5 us/cell heightfield
-sampling; and the streamer's last-cascade-level radius must use the
+128 kept. Findings that shape D4: impostor warmup at 10 km is ~13 s;
+and the streamer's last-cascade-level radius must use the
 impostor handoff, not the fog cutoff, or the quadratic coarse-chunk
 gen returns (7 min warmup at 10 km). Numbers: PLAN.md milestone 34.
 
@@ -123,9 +120,7 @@ top_mat}` per cell (~128-256 vox/cell), synthesized directly from
 `terrain.heightAt` + strata coloring — no fine data, no flood, no
 edits. Synthesis is a multi-resolution heightfield query: `top_y` is
 a conservative max of `heightAt` over the cell footprint (sample grid
-+ noise Lipschitz pad, or a max-mip over a precomputed heightfield),
-with arch tops folded in — arches rise ~30 vox above the skin, which
-subtends <1 px past ~2 km, so missing them would also be acceptable.
++ noise Lipschitz pad, or a max-mip over a precomputed heightfield).
 **Edits (deferred until persistence):** the impostor is render-only,
 but cells covering dirty columns must eventually show them — keep a
 per-cell dirty/version stamp so those cells re-synthesize with the
@@ -156,20 +151,18 @@ restoring gentle aerial perspective over the impostor band. F2
 heightmap cascade {32, 64, 128, ...} vox/cell doubling while
 72*S < cutoff — the cascade's own f/72-px invariant — so every seam
 is a 2x-granularity handoff. Seam A/B vs deep-cascade reference
-(960x540, dist 4096): spawn 0.67% -> 0.04%, arches 0.47% -> 0.02%,
+(960x540, dist 4096): spawn 0.67% -> 0.04%, vista 0.47% -> 0.02%,
 aerial 11% -> 2.4%; at 8192 spawn 0.43% -> 0.04%. True 10 km
 (--dist 100000) unbounded: 13.2 ms/frame at 960x540, warmup ~2 min
-single-threaded (arch scans on the <= 128-vox levels dominate; D4's
+single-threaded (D4's
 threading target), mem 95 MB (vs 93 at 10240 — the rings add ~2 MB).
-Arch fold-in only where arches exceed ~1.7 px (S <= 128); arch
-material only at S <= 32 (an arch spans ~84% of such a cell).
 
 Retained findings (original text below the F-list):
 
 - Rotation shimmer was the 128-vox single tier's 16x granularity
   jump at the handoff plus near-zero fog — the multi-level schedule
   removes the jump, F1 covers the rest.
-- The arch pop was the 1152-vox (115 m) handoff, 10x closer than the
+- The horizon pop was the 1152-vox (115 m) handoff, 10x closer than the
   design text's "~1-2 km"; the pixel-matched schedule fixes the
   intent rather than the number.
 

@@ -11,7 +11,7 @@ for n in 1 2 3; do
 done
 # Fixed views (unbounded): spawn + worst (heaviest view found).
 # m32: the old worst (-150,55,-150,5.5) is underground since the m31
-# biome-split terrain; 100,100,-100,2.4 is a heavy arches vista.
+# biome-split terrain; 100,100,-100,2.4 is a heavy mid-terrain vista.
 for n in 1 2 3; do
   $BIN $RES --bench 500 2>&1 | grep bench | sed "s/^/spawn run$n: /"
   $BIN $RES --bench 500 --cam 100,100,-100,2.4 2>&1 | grep bench | sed "s/^/worst run$n: /"

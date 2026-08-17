@@ -1,7 +1,7 @@
 #!/bin/bash
 # DISTANCE.md D2/D3/D3.1: km-scale vista benches + PPMs. usage:
 # vista_km.sh <binary> <outdir> [DEEP=1]
-# Unbounded world, 960x540: spawn / arches / aerial cams at 2048,
+# Unbounded world, 960x540: spawn / vista / aerial cams at 2048,
 # 4096, and 10240 vox (205 m / 410 m / ~1 km at 10 cm voxels; the
 # true 10 km target is --dist 100000). At 2048/4096 an --impostor 0
 # deep-cascade reference pair is rendered for the D3 seam diff budget
@@ -18,7 +18,7 @@ OUT=$2
 mkdir -p "$OUT"
 RES="--width 960 --height 540"
 for dist in 2048 4096; do
-  for cam in "spawn:" "arches:--cam 100,100,-100,2.4" "aerial:--cam 0,300,0,0.79"; do
+  for cam in "spawn:" "vista:--cam 100,100,-100,2.4" "aerial:--cam 0,300,0,0.79"; do
     name=${cam%%:*}; args=${cam#*:}
     $BIN $RES --dist $dist $args --headless "$OUT/vista_${dist}_${name}_imp.ppm"
     $BIN $RES --dist $dist --impostor 0 $args --headless "$OUT/vista_${dist}_${name}_ref.ppm"

@@ -13,7 +13,6 @@ pub const mat = struct {
     pub const dirt: u8 = 7;
     pub const grass: u8 = 4;
     pub const sand: u8 = 3;
-    pub const arch: u8 = 6;
     pub const crystal_cyan: u8 = 9;
     pub const crystal_magenta: u8 = 10;
     pub const crystal_amber: u8 = 11;
@@ -24,15 +23,8 @@ pub const mat = struct {
 /// regenerates exactly the whole-world tiling.
 pub const tile_size = 64;
 
-/// Arch placement region: at most one arch per region, decided by a
-/// hash of the region coords. The arch footprint reaches <= 35 voxels
-/// past its origin, so a tile only consults its own plus the ring-1
-/// neighbor regions.
-pub const region_size = 128;
-const arch_candidates = 8;
-
 /// Position-deterministic generation context (plans/STREAMING.md phase 0):
-/// everything a column, tile, or arch query needs, derived from the
+/// everything a column or tile query needs, derived from the
 /// seed and world height alone. No mutable state, so results never
 /// depend on evaluation order — per-chunk gen equals whole-world gen.
 pub const Ctx = struct {
@@ -42,7 +34,6 @@ pub const Ctx = struct {
     n_cave_a: Noise,
     n_cave_b: Noise,
     n_crystal: Noise,
-    n_arch: Noise,
     h: usize,
     base: f32,
     plain_amp: f32,
@@ -63,7 +54,6 @@ pub const Ctx = struct {
             .n_cave_a = n_terrain.reseed(0xCA0EA),
             .n_cave_b = n_terrain.reseed(0xCA0EB),
             .n_crystal = n_terrain.reseed(0xC2757A1),
-            .n_arch = n_terrain.reseed(0xA4C4),
             .h = h,
             .base = base,
             .plain_amp = plain_amp,
@@ -76,8 +66,8 @@ pub const Ctx = struct {
 
 const Span = struct { min: u16, max: u16 };
 
-/// Topmost solid y of the heightfield at (x, z). Pure, so arches and
-/// spawn compute flatness spans on the fly and any chunk/tile/LOD
+/// Topmost solid y of the heightfield at (x, z). Pure, so spawn
+/// computes flatness spans on the fly and any chunk/tile/LOD
 /// synthesis path regenerates the same surface. Biome split (plans/WORLDGEN.md):
 /// a plains-biased continentality mask lerps flat plains into ridged
 /// mountains, so relief is small on the plains and towers in the ranges.
@@ -131,9 +121,7 @@ pub fn genColumnFast(ctx: *const Ctx, x: i32, z: i32, dense: []u8) void {
 }
 
 /// Fill the dense column at (x, z): heightfield strata, caves, and
-/// crystals. Arches are NOT here — they cross tile boundaries, so they
-/// stamp into the dense tile after all its columns are filled (before
-/// run-encoding). Crystal rolls derive from a coordinate hash, so the
+/// crystals. Crystal rolls derive from a coordinate hash, so the
 /// result is independent of column evaluation order.
 pub fn genColumn(ctx: *const Ctx, x: i32, z: i32, dense: []u8) void {
     genColumnFast(ctx, x, z, dense);
@@ -175,166 +163,16 @@ pub fn genColumn(ctx: *const Ctx, x: i32, z: i32, dense: []u8) void {
     }
 }
 
-pub const Arch = struct {
-    x: i32,
-    y: i32,
-    z: i32,
-    along_x: bool,
-};
-
-/// Candidate origin range on one axis: region-local [10, 88] (10
-/// voxels of margin plus room for the 27+6 footprint), intersected
-/// with the bounded world's [10, size-40] placement range. n <= 0
-/// means the region cannot hold an arch.
-fn archAxisRange(ri: i32, bound: ?usize) struct { lo: i32, n: i32 } {
-    var lo: i32 = ri * region_size + 10;
-    var hi: i32 = ri * region_size + 88;
-    if (bound) |b| {
-        lo = @max(lo, 10);
-        hi = @min(hi, @as(i32, @intCast(b)) - 40);
-    }
-    return .{ .lo = lo, .n = hi - lo + 1 };
-}
-
-/// The region's arch, if any: up to arch_candidates hash-derived
-/// positions, first one passing the bounds/flatness/height checks
-/// wins. Depends only on (seed, region, bounds), never on visit order
-/// — this replaces the pre-streaming global attempts loop and
-/// farFromLandmarks. bounds = null for an unbounded world.
-pub fn archInRegion(ctx: *const Ctx, rx: i32, rz: i32, bounds: ?[2]usize) ?Arch {
-    const xr = archAxisRange(rx, if (bounds) |b| b[0] else null);
-    const zr = archAxisRange(rz, if (bounds) |b| b[1] else null);
-    if (xr.n <= 0 or zr.n <= 0) return null;
-    const xn: u64 = @intCast(xr.n);
-    const zn: u64 = @intCast(zr.n);
-    for (0..arch_candidates) |i| {
-        var v = ctx.n_arch.hash3(rx, @intCast(i), rz);
-        const ax = xr.lo + @as(i32, @intCast(v % xn));
-        v /= xn;
-        const az = zr.lo + @as(i32, @intCast(v % zn));
-        v /= zn;
-        const span = heightSpanAt(ctx, ax, az, 29, 29);
-        // Lenient flatness: legs partially buried in a slope are
-        // fine, an arch split by a ridge is not.
-        if (span.max - span.min > 12) continue;
-        if (@as(i32, span.min) + 34 > @as(i32, @intCast(ctx.h))) continue; // lintel must not clip the world top
-        return .{ .x = ax, .y = span.min, .z = az, .along_x = v & 1 == 0 };
-    }
-    return null;
-}
-
-/// True when an arch origin lies within min_dist of (x, z) — the old
-/// farFromLandmarks check, answered per region instead of from a
-/// global landmark list.
-fn nearArch(ctx: *const Ctx, bounds: ?[2]usize, x: i32, z: i32, min_dist: i32) bool {
-    const rx0 = @divFloor(x - min_dist, region_size);
-    const rx1 = @divFloor(x + min_dist, region_size);
-    const rz0 = @divFloor(z - min_dist, region_size);
-    const rz1 = @divFloor(z + min_dist, region_size);
-    var rx = rx0;
-    while (rx <= rx1) : (rx += 1) {
-        var rz = rz0;
-        while (rz <= rz1) : (rz += 1) {
-            if (archInRegion(ctx, rx, rz, bounds)) |a| {
-                const dx = x - a.x;
-                const dz = z - a.z;
-                if (dx * dx + dz * dz < min_dist * min_dist) return true;
-            }
-        }
-    }
-    return false;
-}
-
-/// One arch stamp box (material fill), y clipped to [0, h]; XZ left
-/// unclipped for the caller (tile clip or column containment).
-pub const ArchBox = struct { x0: i32, z0: i32, x1: i32, z1: i32, y0: i32, y1: i32, m: u8 };
-
-/// The four stamp boxes of an arch. Geometry identical to the
-/// pre-streaming fillBox arch: 27w x 33h x 6 thick, 17x18 opening
-/// stepped to a lintel (a 16-voxel-tall player walks through).
-pub fn archBoxes(arch: Arch, h: usize) [4]ArchBox {
-    const hi: i32 = @intCast(h);
-    const spec = .{ .{ 0, 27, -3, 30, mat.arch }, .{ 5, 22, 0, 18, @as(u8, 0) }, .{ 8, 19, 18, 22, 0 }, .{ 10, 17, 22, 26, 0 } };
-    var out: [4]ArchBox = undefined;
-    inline for (spec, 0..) |s, i| {
-        const l0: i32 = s[0];
-        const l1: i32 = s[1];
-        const ry0: i32 = s[2];
-        const ry1: i32 = s[3];
-        out[i] = .{
-            .x0 = if (arch.along_x) arch.x + l0 else arch.x,
-            .x1 = if (arch.along_x) arch.x + l1 else arch.x + 6,
-            .z0 = if (arch.along_x) arch.z else arch.z + l0,
-            .z1 = if (arch.along_x) arch.z + 6 else arch.z + l1,
-            .y0 = @max(arch.y + ry0, 0),
-            .y1 = @min(arch.y + ry1, hi),
-            .m = s[4],
-        };
-    }
-    return out;
-}
-
-/// All arches whose stamps can reach the area [x0,x1)x[z0,z1): the
-/// regions covering the area plus ring-1 (the footprint reaches <= 35
-/// voxels past its origin). Ascending (rx, rz) order — overlapping
-/// arch stamps only commute under a fixed order.
-pub fn collectArches(ctx: *const Ctx, x0: i32, z0: i32, x1: i32, z1: i32, bounds: ?[2]usize, out: *std.ArrayList(Arch), allocator: std.mem.Allocator) !void {
-    const rx0 = @divFloor(x0, region_size) - 1;
-    const rx1 = @divFloor(x1 - 1, region_size) + 1;
-    const rz0 = @divFloor(z0, region_size) - 1;
-    const rz1 = @divFloor(z1 - 1, region_size) + 1;
-    var rx = rx0;
-    while (rx <= rx1) : (rx += 1) {
-        var rz = rz0;
-        while (rz <= rz1) : (rz += 1) {
-            if (archInRegion(ctx, rx, rz, bounds)) |arch| try out.append(allocator, arch);
-        }
-    }
-}
-
-/// Far-impostor arch summary (plans/DISTANCE.md D3): each arch
-/// contributes its shell box's XZ footprint and conservative top
-/// (the lintel top, y1-1; the carved opening is ignored — a few
-/// voxels of overestimate at km range).
-pub const ArchTop = struct { x0: i32, z0: i32, x1: i32, z1: i32, top: u16 };
-
-/// Per-tile arch state for impostor synthesis: the arches reaching
-/// [x0, x0+extent) x [z0, z0+extent), collected once per tile instead
-/// of per cell (cells share the region neighborhood).
-pub const ImpostorTile = struct {
-    arch_tops: []ArchTop,
-
-    pub fn init(ctx: *const Ctx, bounds: ?[2]usize, x0: i32, z0: i32, extent: i32, arches: bool, allocator: std.mem.Allocator) !ImpostorTile {
-        if (!arches) return .{ .arch_tops = &.{} };
-        var arch_list: std.ArrayList(Arch) = .empty;
-        defer arch_list.deinit(allocator);
-        try collectArches(ctx, x0, z0, x0 + extent, z0 + extent, bounds, &arch_list, allocator);
-        const tops = try allocator.alloc(ArchTop, arch_list.items.len);
-        for (arch_list.items, tops) |arch, *at| {
-            const shell = archBoxes(arch, ctx.h)[0];
-            at.* = .{ .x0 = shell.x0, .z0 = shell.z0, .x1 = shell.x1, .z1 = shell.z1, .top = @intCast(shell.y1 - 1) };
-        }
-        return .{ .arch_tops = tops };
-    }
-
-    pub fn deinit(self: *ImpostorTile, allocator: std.mem.Allocator) void {
-        allocator.free(self.arch_tops);
-    }
-};
-
 /// One far-impostor cell (plans/DISTANCE.md D3): a conservative top
 /// height and one dominant material for the size x size voxel
 /// footprint at (x0, z0), from the pure heightfield alone — no fine
 /// data, no flood. top_y is the max of a 9x9 heightAt sample grid
 /// plus a pad (base + half the largest adjacent-sample delta) for the
 /// fBm energy unresolved between samples; the brute-force
-/// conservativeness test below pins the pad. Arch tops fold in from
-/// the tile's ArchTop list; the cell keeps arch material only at
-/// 32-vox cells and below (an arch spans most of such a cell — at
-/// bigger cells the white would paint the whole top), terrain
-/// material otherwise. One material per cell (the strata rule at the
-/// highest sample) IS the sub-pixel shimmer low-pass.
-pub fn impostorCell(ctx: *const Ctx, tile: *const ImpostorTile, x0: i32, z0: i32, size: u32) gen.ImpostorCell {
+/// conservativeness test below pins the pad. One material per cell
+/// (the strata rule at the highest sample) IS the sub-pixel shimmer
+/// low-pass.
+pub fn impostorCell(ctx: *const Ctx, x0: i32, z0: i32, size: u32) gen.ImpostorCell {
     const stride = size / 8;
     var samples: [9][9]u16 = undefined;
     var best: u16 = 0;
@@ -353,50 +191,9 @@ pub fn impostorCell(ctx: *const Ctx, tile: *const ImpostorTile, x0: i32, z0: i32
         }
     }
     const pad = 4 + delta / 4;
-    var top: u32 = @min(@as(u32, best) + pad, @as(u32, @intCast(ctx.hi_cap)));
-    var m: u8 = if (@as(f32, @floatFromInt(best)) < ctx.sand_level) mat.sand else mat.grass;
-    for (tile.arch_tops) |a| {
-        const sz: i32 = @intCast(size);
-        if (x0 < a.x1 and x0 + sz > a.x0 and z0 < a.z1 and z0 + sz > a.z0 and a.top > top) {
-            top = a.top;
-            if (size <= 32) m = mat.arch;
-        }
-    }
+    const top: u32 = @min(@as(u32, best) + pad, @as(u32, @intCast(ctx.hi_cap)));
+    const m: u8 = if (@as(f32, @floatFromInt(best)) < ctx.sand_level) mat.sand else mat.grass;
     return .{ .top_y = @intCast(top), .mat = m };
-}
-
-/// One arch stamp box, clipped into the dense tile.
-fn archBox(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, box: ArchBox) void {
-    const cx0 = @max(box.x0, tx0);
-    const cx1 = @min(box.x1, tx0 + @as(i32, @intCast(tw)));
-    const cz0 = @max(box.z0, tz0);
-    const cz1 = @min(box.z1, tz0 + @as(i32, @intCast(td)));
-    if (cx0 >= cx1 or box.y0 >= box.y1 or cz0 >= cz1) return;
-    const y0: usize = @intCast(box.y0);
-    const y1: usize = @intCast(box.y1);
-    var x = cx0;
-    while (x < cx1) : (x += 1) {
-        var z = cz0;
-        while (z < cz1) : (z += 1) {
-            @memset(b.at(@intCast(x - tx0), @intCast(z - tz0))[y0..y1], box.m);
-        }
-    }
-}
-
-fn stampArch(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, arch: Arch) void {
-    for (archBoxes(arch, b.world.h)) |box| archBox(b, tx0, tz0, tw, td, box);
-}
-
-/// Apply every arch box covering column (x, z) — the per-column
-/// counterpart of stampArch for column-granular synthesis (coarse-LOD
-/// repair, plans/STREAMING.md phase 2).
-pub fn archOverlayColumn(arches: []const Arch, h: usize, x: i32, z: i32, dense: []u8) void {
-    for (arches) |arch| {
-        for (archBoxes(arch, h)) |box| {
-            if (x >= box.x0 and x < box.x1 and z >= box.z0 and z < box.z1)
-                @memset(dense[@intCast(box.y0)..@intCast(box.y1)], box.m);
-        }
-    }
 }
 
 /// Fill stage of the staged per-tile pipeline: dense-fill columns
@@ -415,22 +212,12 @@ pub fn genTileFill(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, td: usize, 
     }
 }
 
-/// Arch stage: stamp the arches of the 3x3 region neighborhood into
-/// the filled dense tile. Runs once per tile after its fill completes.
-pub fn genTileArches(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
-    var arches: std.ArrayList(Arch) = .empty;
-    defer arches.deinit(b.allocator);
-    try collectArches(ctx, tx0, tz0, tx0 + @as(i32, @intCast(tw)), tz0 + @as(i32, @intCast(td)), bounds, &arches, b.allocator);
-    for (arches.items) |arch| stampArch(b, tx0, tz0, tw, td, arch);
-}
-
-/// Dense stage of the staged per-tile pipeline: fill + arch stamps.
+/// Dense stage of the staged per-tile pipeline: the column fill.
 /// No world writes — coarse-LOD synthesis (plans/STREAMING.md phase 2)
 /// consumes the dense tile directly. Tile origins are i32 so negative
 /// chunk coords work in the unbounded world.
-pub fn genTileDense(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
+pub fn genTileDense(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize) void {
     genTileFill(ctx, b, tx0, tz0, td, 0, tw * td, true);
-    try genTileArches(ctx, b, tx0, tz0, tw, td, bounds);
 }
 
 /// Emit stage: run-encode the dense tile into the world. keep_light
@@ -446,15 +233,14 @@ pub fn emitTile(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, keep_ligh
 
 /// The full pipeline (dense -> emit), exactly what a phase-1 chunk
 /// load runs, so chunk gen == whole-world gen.
-pub fn genTile(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, bounds: ?[2]usize) !void {
-    try genTileDense(ctx, b, tx0, tz0, tw, td, bounds);
+pub fn genTile(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize) !void {
+    genTileDense(ctx, b, tx0, tz0, tw, td);
     try emitTile(b, tx0, tz0, tw, td, false);
 }
 
 /// First acceptably flat spot on an expanding square-ring search near
-/// the origin (bounded worlds clamp candidates into the world), at
-/// least 20 voxels from any arch. Falls back to the world center
-/// (bounded) or the origin (unbounded).
+/// the origin (bounded worlds clamp candidates into the world).
+/// Falls back to the world center (bounded) or the origin (unbounded).
 fn findSpawn(ctx: *const Ctx, bounds: ?[2]usize) struct { i32, i32 } {
     var r: i32 = 0;
     while (r <= 256) : (r += 4) {
@@ -474,7 +260,6 @@ fn findSpawn(ctx: *const Ctx, bounds: ?[2]usize) struct { i32, i32 } {
                 const sz = if (bounds) |b| std.math.clamp(cz, 6, @as(i32, @intCast(b[1])) - 12) else cz;
                 const span = heightSpanAt(ctx, sx, sz, 6, 6);
                 if (span.max - span.min > 2) continue;
-                if (nearArch(ctx, bounds, sx, sz, 20)) continue;
                 return .{ sx, sz };
             }
             if (r == 0) break;
@@ -483,57 +268,21 @@ fn findSpawn(ctx: *const Ctx, bounds: ?[2]usize) struct { i32, i32 } {
     return .{ if (bounds) |b| @divTrunc(@as(i32, @intCast(b[0])), 2) else 0, if (bounds) |b| @divTrunc(@as(i32, @intCast(b[1])), 2) else 0 };
 }
 
-pub const SpawnPoint = struct { cam: Camera, landmarks: []gen.Landmark };
-
-/// Spawn camera + landmark list without generating a world
-/// (plans/STREAMING.md phase 2: the unbounded default world never generates
-/// eagerly). Landmarks = the arches of the regions near spawn
-/// (headless debug logging + spawn yaw); bounds = null for the
-/// unbounded world.
-pub fn spawnPoint(allocator: std.mem.Allocator, ctx: *const Ctx, bounds: ?[2]usize) !SpawnPoint {
+/// Spawn camera without generating a world (plans/STREAMING.md
+/// phase 2: the unbounded default world never generates eagerly).
+/// bounds = null for the unbounded world.
+pub fn spawnPoint(ctx: *const Ctx, bounds: ?[2]usize) Camera {
     const spawn_x, const spawn_z = findSpawn(ctx, bounds);
 
-    var landmarks: std.ArrayList(gen.Landmark) = .empty;
-    errdefer landmarks.deinit(allocator);
-    {
-        const rx0 = @divFloor(spawn_x - 192, region_size);
-        const rx1 = @divFloor(spawn_x + 192, region_size);
-        const rz0 = @divFloor(spawn_z - 192, region_size);
-        const rz1 = @divFloor(spawn_z + 192, region_size);
-        var rx = rx0;
-        while (rx <= rx1) : (rx += 1) {
-            var rz = rz0;
-            while (rz <= rz1) : (rz += 1) {
-                if (archInRegion(ctx, rx, rz, bounds)) |a|
-                    try landmarks.append(allocator, .{ .x = a.x, .y = a.y, .z = a.z });
-            }
-        }
-    }
-
     const spawn_ground: f32 = @floatFromInt(heightAt(ctx, spawn_x, spawn_z));
-    var yaw: f32 = std.math.pi / 4.0;
-    var best_dist: i32 = std.math.maxInt(i32);
-    for (landmarks.items) |lm| {
-        const dx: i32 = lm.x - spawn_x;
-        const dz: i32 = lm.z - spawn_z;
-        const dist = dx * dx + dz * dz;
-        if (dist < best_dist) {
-            best_dist = dist;
-            yaw = std.math.atan2(@as(f32, @floatFromInt(dz)), @as(f32, @floatFromInt(dx)));
-        }
-    }
-
     return .{
-        .cam = .{
-            .x = @as(f32, @floatFromInt(spawn_x)) + 0.5,
-            // Feet rest on the surface voxel's top face; the eye rides
-            // 14 voxels up (the milestone-23 walking player's eye
-            // height). The min() clamp only binds in tiny test worlds.
-            .y = @min(spawn_ground + 15.0, @as(f32, @floatFromInt(ctx.h)) - 1),
-            .z = @as(f32, @floatFromInt(spawn_z)) + 0.5,
-            .yaw = yaw,
-        },
-        .landmarks = try landmarks.toOwnedSlice(allocator),
+        .x = @as(f32, @floatFromInt(spawn_x)) + 0.5,
+        // Feet rest on the surface voxel's top face; the eye rides
+        // 14 voxels up (the milestone-23 walking player's eye
+        // height). The min() clamp only binds in tiny test worlds.
+        .y = @min(spawn_ground + 15.0, @as(f32, @floatFromInt(ctx.h)) - 1),
+        .z = @as(f32, @floatFromInt(spawn_z)) + 0.5,
+        .yaw = std.math.pi / 4.0,
     };
 }
 
@@ -548,7 +297,6 @@ fn generateTiled(allocator: std.mem.Allocator, opts: gen.Options, tile: usize) !
     errdefer world.deinit();
 
     const ctx = Ctx.init(opts.seed, opts.h);
-    const bounds: ?[2]usize = .{ opts.w, opts.d };
 
     var builder = try Builder.init(allocator, &world, tile, tile);
     defer builder.deinit();
@@ -557,12 +305,11 @@ fn generateTiled(allocator: std.mem.Allocator, opts: gen.Options, tile: usize) !
     while (tx < opts.w) : (tx += tile) {
         var tz: usize = 0;
         while (tz < opts.d) : (tz += tile) {
-            try genTile(&ctx, &builder, @intCast(tx), @intCast(tz), @min(tile, opts.w - tx), @min(tile, opts.d - tz), bounds);
+            try genTile(&ctx, &builder, @intCast(tx), @intCast(tz), @min(tile, opts.w - tx), @min(tile, opts.d - tz));
         }
     }
 
-    const sp = try spawnPoint(allocator, &ctx, bounds);
-    return .{ .world = world, .spawn = sp.cam, .landmarks = sp.landmarks };
+    return .{ .world = world, .spawn = spawnPoint(&ctx, .{ opts.w, opts.d }) };
 }
 
 fn expectCoverage(world: *const World, x: i32, z: i32) !void {
@@ -610,28 +357,28 @@ const test_opts: gen.Options = .{ .seed = 7, .w = 64, .h = 96, .d = 64 };
 
 test "generation is deterministic per seed" {
     var r1 = try generate(std.testing.allocator, test_opts);
-    defer r1.deinit(std.testing.allocator);
+    defer r1.deinit();
     var r2 = try generate(std.testing.allocator, test_opts);
-    defer r2.deinit(std.testing.allocator);
+    defer r2.deinit();
     try std.testing.expect(worldsEqual(&r1.world, &r2.world));
     try std.testing.expectEqual(r1.spawn, r2.spawn);
 
     var r3 = try generate(std.testing.allocator, .{ .seed = 8, .w = 64, .h = 96, .d = 64 });
-    defer r3.deinit(std.testing.allocator);
+    defer r3.deinit();
     try std.testing.expect(!worldsEqual(&r1.world, &r3.world));
 }
 
 test "generation is independent of the tile subdivision" {
     var r1 = try generateTiled(std.testing.allocator, test_opts, 64);
-    defer r1.deinit(std.testing.allocator);
+    defer r1.deinit();
     var r2 = try generateTiled(std.testing.allocator, test_opts, 16);
-    defer r2.deinit(std.testing.allocator);
+    defer r2.deinit();
     try std.testing.expect(worldsEqual(&r1.world, &r2.world));
 }
 
 test "columns stay covered and terrain in bounds" {
     var r = try generate(std.testing.allocator, test_opts);
-    defer r.deinit(std.testing.allocator);
+    defer r.deinit();
     for (0..r.world.w.?) |x| {
         for (0..r.world.d.?) |z| {
             try expectCoverage(&r.world, @intCast(x), @intCast(z));
@@ -640,9 +387,9 @@ test "columns stay covered and terrain in bounds" {
     }
 }
 
-test "caves and arches exist" {
+test "caves exist" {
     var r = try generate(std.testing.allocator, test_opts);
-    defer r.deinit(std.testing.allocator);
+    defer r.deinit();
 
     var underground_air: usize = 0;
     for (0..r.world.w.?) |x| {
@@ -655,25 +402,12 @@ test "caves and arches exist" {
         }
     }
     try std.testing.expect(underground_air > 64);
-
-    try std.testing.expect(r.landmarks.len > 0);
-    for (r.landmarks) |lm| {
-        try std.testing.expectEqual(mat.arch, r.world.get(lm.x, lm.y, lm.z));
-        // Orientation shows in the lintel (top beam, always arch): exactly
-        // one of the +x / +z mid-beam probes is arch material. Probing the
-        // opening instead is unreliable — terrain beside the arch can be
-        // legitimately lower than the opening.
-        const x_beam = r.world.get(lm.x + 13, lm.y + 28, lm.z) == mat.arch;
-        const z_beam = r.world.get(lm.x, lm.y + 28, lm.z + 13) == mat.arch;
-        try std.testing.expect(x_beam != z_beam);
-    }
 }
 
 test "caves have player-height headroom" {
-    // w/d < 51 disables arches, so every long enclosed air streak is a
-    // cave. The milestone-23 walking player is 16 voxels tall.
+    // The milestone-23 walking player is 16 voxels tall.
     var r = try generate(std.testing.allocator, .{ .seed = 7, .w = 48, .h = 96, .d = 48 });
-    defer r.deinit(std.testing.allocator);
+    defer r.deinit();
     var walkable: usize = 0;
     for (0..r.world.w.?) |x| {
         for (0..r.world.d.?) |z| {
@@ -727,53 +461,18 @@ test "impostor cell top conservatively covers the heightfield" {
     // the dense heightfield max over the whole footprint, at plains
     // and mountain locations, at both supported cell sizes.
     const ctx = Ctx.init(1337, 256);
-    var tile = try ImpostorTile.init(&ctx, null, 0, 0, 0, true, std.testing.allocator);
-    defer tile.deinit(std.testing.allocator);
     var rng = std.Random.DefaultPrng.init(0x1B05);
     const rand = rng.random();
     for ([_]u32{ 32, 64, 128 }) |size| {
         for (0..24) |_| {
             const x0 = @as(i32, @intCast(rand.intRangeAtMost(u32, 0, 20000))) - 10000;
             const z0 = @as(i32, @intCast(rand.intRangeAtMost(u32, 0, 20000))) - 10000;
-            const cell = impostorCell(&ctx, &tile, x0, z0, size);
+            const cell = impostorCell(&ctx, x0, z0, size);
             const span = heightSpanAt(&ctx, x0, z0, size, size);
             try std.testing.expect(cell.top_y >= span.max);
             try std.testing.expect(cell.top_y <= ctx.hi_cap);
             // Determinism: same inputs, same cell.
-            try std.testing.expectEqual(cell, impostorCell(&ctx, &tile, x0, z0, size));
+            try std.testing.expectEqual(cell, impostorCell(&ctx, x0, z0, size));
         }
     }
-}
-
-test "impostor cell folds arch tops in" {
-    // Find an arch near the origin; the cell containing it must rise
-    // to the lintel top (arch footprints sit on flat terrain, so the
-    // arch always wins the cell max). At 32 vox the cell keeps arch
-    // material (the arch spans most of it); at 128 it keeps the
-    // terrain's.
-    const ctx = Ctx.init(1337, 256);
-    var found: ?Arch = null;
-    var rx: i32 = -3;
-    while (rx <= 3 and found == null) : (rx += 1) {
-        var rz: i32 = -3;
-        while (rz <= 3 and found == null) : (rz += 1) {
-            found = archInRegion(&ctx, rx, rz, null);
-        }
-    }
-    const arch = found orelse return error.NoArchFound;
-    var tile = try ImpostorTile.init(&ctx, null, arch.x - 64, arch.z - 64, 128, true, std.testing.allocator);
-    defer tile.deinit(std.testing.allocator);
-    const cx = (arch.x - 64) & ~@as(i32, 127);
-    const cz = (arch.z - 64) & ~@as(i32, 127);
-    const cell = impostorCell(&ctx, &tile, cx, cz, 128);
-    try std.testing.expect(cell.top_y >= @min(@as(i32, arch.y) + 29, ctx.hi_cap));
-    try std.testing.expect(cell.mat == mat.grass or cell.mat == mat.sand);
-    const small = impostorCell(&ctx, &tile, arch.x & ~@as(i32, 31), arch.z & ~@as(i32, 31), 32);
-    try std.testing.expect(small.top_y >= @min(@as(i32, arch.y) + 29, ctx.hi_cap));
-    try std.testing.expectEqual(mat.arch, small.mat);
-    // No arch scan (big-cell levels): the fold-in disappears.
-    var plain = try ImpostorTile.init(&ctx, null, arch.x - 64, arch.z - 64, 128, false, std.testing.allocator);
-    defer plain.deinit(std.testing.allocator);
-    const nofold = impostorCell(&ctx, &plain, cx, cz, 128);
-    try std.testing.expect(nofold.top_y < cell.top_y);
 }

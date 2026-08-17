@@ -140,27 +140,22 @@ pub fn main(init: std.process.Init) !void {
     // LOD build) when --world-w/d are given, else the unbounded world
     // driven by the chunk streamer (plans/STREAMING.md phase 2).
     var result: ?gen.Result = null;
-    defer if (result) |*r| r.deinit(allocator);
+    defer if (result) |*r| r.deinit();
     var owned_world: ?World = null;
     defer if (owned_world) |*w| w.deinit();
     var streamer: ?stream.Streamer = null;
     defer if (streamer) |*st| st.deinit();
-    var landmarks: []gen.Landmark = &.{};
-    defer if (result == null) allocator.free(landmarks);
 
     var cam: Camera = undefined;
     const world: *World = blk: {
         if (bounded) {
             result = try gen.generate(generator, allocator, opts);
             cam = result.?.spawn;
-            landmarks = result.?.landmarks;
             break :blk &result.?.world;
         }
         owned_world = try World.init(allocator, null, opts.h, null);
         const sctx = terrain.Ctx.init(opts.seed, opts.h);
-        const sp = try terrain.spawnPoint(allocator, &sctx, null);
-        cam = sp.cam;
-        landmarks = sp.landmarks;
+        cam = terrain.spawnPoint(&sctx, null);
         break :blk &owned_world.?;
     };
     if (cam_override) |v| cam = .{ .x = v[0], .y = v[1], .z = v[2], .yaw = v[3] };
@@ -313,7 +308,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (headless_path) |path| {
-        for (landmarks) |lm| std.log.debug("landmark ({}, {}, {})", .{ lm.x, lm.y, lm.z });
         std.log.debug("spawn ({d:.1}, {d:.1}, {d:.1}) yaw {d:.2}", .{ cam.x, cam.y, cam.z, cam.yaw });
         if (bounded) std.log.debug("flood: {} columns, {} runs, {d:.2} ms", .{ flood_stats.lit_columns, flood_stats.runs, flood_ms });
         rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams, imp_ptr);

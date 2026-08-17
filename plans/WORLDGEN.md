@@ -1,12 +1,12 @@
 # Worldgen — the minecrafty demo world
 
 `src/gen/terrain.zig` generates the demo world: heightmap terrain with
-strata, caves, crystals, arches, and a spawn search. Everything derives
+strata, caves, crystals, and a spawn search. Everything derives
 from a position-deterministic `Ctx` (seed + world height, no mutable
 state), so per-chunk streamed regeneration equals whole-world gen (the
 streaming pipeline itself is documented in STREAMING.md). `heightAt` is
 the single pure surface function — fine columns, coarse-LOD approx
-synthesis, arch flatness spans, and the spawn search all read it, so
+synthesis, and the spawn search all read it, so
 they can never disagree about the surface.
 
 ## Heightfield (current)
@@ -43,25 +43,10 @@ they can never disagree about the surface.
   with 5 voxels of headroom, 1-in-48 columns, 4 tall, three colors
   (cyan/magenta/amber).
 
-## Arches
-
-- At most one arch per 128x128 region, decided by a region-coord hash:
-  up to 8 hash-derived candidate origins, first one passing the checks
-  wins (depends only on seed/region/bounds, never visit order).
-- Checks: 29x29 flatness span max-min <= 12 (legs may be partially
-  buried in a slope, but a ridge must not split the arch); lintel must
-  not clip the world top (`span.min + 34 <= h`).
-- Geometry: 27w x 33h x 6 thick, 17x18 opening stepped to a lintel (a
-  16-voxel player walks through). Stamped as 4 fill boxes into the
-  dense tile after column fill, so arches crossing tile boundaries are
-  exact.
-
 ## Spawn
 
 - Expanding square-ring search near the origin (bounded worlds clamp
-  candidates inside) for a 6x6 spot with height span <= 2, at least 20
-  voxels from any arch; falls back to world center (bounded) or origin
-  (unbounded).
-- Camera spawns with feet on the surface (eye 14 up); yaw aims at the
-  nearest arch landmark within 192 voxels.
+  candidates inside) for a 6x6 spot with height span <= 2; falls back
+  to world center (bounded) or origin (unbounded).
+- Camera spawns with feet on the surface (eye 14 up), yaw pi/4.
 
