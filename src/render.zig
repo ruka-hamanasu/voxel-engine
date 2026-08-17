@@ -464,12 +464,21 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
     // out of the march as a range split. limit when disabled or out of
     // reach, keeping --detail 0 a single detailed march (bit-identical
     // to the pre-split renderer).
-    const t_detail = if (params.detail_dist > 0 and params.detail_dist < casc_limit)
+    var t_detail = if (params.detail_dist > 0 and params.detail_dist < casc_limit)
         detailBoundary(cam.x, cam.z, dx, dz, params.detail_dist)
     else
         casc_limit;
     var t_b: [max_lods + 1]f32 = undefined;
     const n = lodChain(params, lods.len, cam.x, cam.z, dx, dz, casc_limit, &t_b);
+    // When the detail distance IS the first handoff (the default
+    // derivation), snap the split to the handoff itself: detailBoundary
+    // snaps to the containing cell's entry (<= d) while lodBoundary's
+    // center-distance rule can land on either side of d, so independent
+    // snapping flips the coarse march between detailed (AO) and simple
+    // (flat) per ray — adjacent screen columns then shade the same
+    // coarse terrain in different modes, reading as dark 1px vertical
+    // dashes. Coincident boundaries flip nothing.
+    if (n >= 1 and params.detail_dist == params.lod_dists[0]) t_detail = t_b[1];
     if (n == 0) {
         marchFine(fb, height, sx, cfg, t_detail, casc_limit, &free, params);
     } else {

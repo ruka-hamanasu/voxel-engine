@@ -3,7 +3,7 @@
 # 37 views l0f0 + 37 views default + 4 cave views default.
 # --fogcut 96 pins the pre-milestone-24 march limit so --lod 0 stays
 # byte-identical across the default fog cutoff change.
-# Current baselines: views_m31_stream_lod0 (l0f0), views_m32_stream_lod0 (def).
+# Current baselines: views_m35_stream_lod0.
 set -e
 BIN=$1
 OUT=$2

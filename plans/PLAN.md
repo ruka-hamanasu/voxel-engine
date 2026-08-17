@@ -776,3 +776,26 @@ entries here record scope and outcome only.
      mem 95 MB (rings ~2 MB). Regression: zig build
      test green (new level-schedule tests); all four
      sweeps byte-identical; walk bench flat (12.6 ms).
+
+35. COMPLETED - LOD/detail seam fix (dark 1px vertical dashes on coarse
+      terrain). Root cause: with the default derivation detail_dist ==
+      lod_dists[0], detailBoundary (snaps to the containing cell's
+      entry, <= d) and lodBoundary (center-distance rule, lands on
+      either side of d) disagreed per ray, so each screen column
+      independently flipped the first coarse march between detailed
+      (AO) and simple (flat) shading — adjacent columns shaded the same
+      coarse terrain in different modes, reading as dark vertical
+      dashes that shimmer in motion (visible since m33's clear fog
+      curve left the 144+ band nearly unfogged). Diagnosis via debug
+      face-class tints + --detail A/B (dash count at the repro view:
+      205 default, 2 at --detail 100, 7 at --detail 200, 47 after the
+      fix vs 51 with --lod 0). Fix: renderColumn snaps t_detail to
+      t_b[1] per ray when the two distances are configured equal, so
+      the detail pop coincides with the geometry handoff exactly (m30's
+      original intent). Regression: pre/post HEAD A/B (the views_m31*
+      baselines predate HEAD's worldgen change and are stale) — all
+      l0f0 halves and both --lod 0 sweeps byte-identical, def halves
+      differ on <=0.6% of pixels (the removed seam columns); zig build
+      test green; spawn bench neutral (4.77 -> 4.72 ms at 480x270).
+      Baselines regenerated as views_m35* (the m31/m32 baselines had
+      gone stale at HEAD's worldgen change); rerun byte-identical.

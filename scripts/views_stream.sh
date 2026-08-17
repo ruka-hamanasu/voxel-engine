@@ -3,7 +3,7 @@
 # 37 views l0f0 + 37 views default + 4 cave views default.
 # l0f0 pins the milestone-23 render defaults so the identity gate
 # stays byte-identical across the milestone-24 default changes.
-# Current baselines: views_m31_stream (l0f0), views_m32_stream (def).
+# Current baselines: views_m35_stream.
 set -e
 BIN=$1
 OUT=$2
