@@ -1,6 +1,7 @@
 const std = @import("std");
 const world_mod = @import("world.zig");
 const chunk_mod = @import("chunk.zig");
+const pool_mod = @import("pool.zig");
 const terrain = @import("gen/terrain.zig");
 const lighting = @import("lighting.zig");
 const lod_mod = @import("lod.zig");
@@ -35,17 +36,33 @@ const chunk_w = world_mod.chunk_w;
 /// from generation (repair queue) so lost edits leave the coarse
 /// tiers. Unedited fine chunks need no repair — their coarse content
 /// already matches generation.
+///
+/// Threading (plans/DISTANCE.md D4): the dense fill, pyramid
+/// downsample, and run-encode ride the shared pool (borrowed, null =
+/// inline) as disjoint column-range / 8x8-group work items over the
+/// streamer's scratch builders; budget accounting and the single
+/// in-flight chunk are unchanged, and commits (ensureChunk, the
+/// cross-chunk flood) stay serial on the calling thread in queue
+/// order, so pooled and inline runs reach byte-identical worlds.
 pub const Streamer = struct {
     allocator: std.mem.Allocator,
     ctx: terrain.Ctx,
     fine: *World,
     lods: []World,
     light: ?lighting.Params,
+    /// Borrowed gen pool; null runs gen inline (tests).
+    pool: ?*pool_mod.Pool,
     /// false = approx coarse synthesis (genColumnFast: no sub-skin
     /// caves/crystals — the default, ~10x cheaper); true = exact.
     coarse_caves: bool,
     budget: usize, // dense-fill columns per update
     fine_builder: Builder,
+    /// forceResident's private tile scratch: the player-chunk load
+    /// must not clobber fine_builder's in-flight partial fill (a
+    /// dropped in-flight load restarts from column zero — fast flight
+    /// used to discard whole coarse-chunk fills every few frames, so
+    /// mid-distance areas never caught up).
+    force_builder: Builder,
     coarse_builders: []Builder,
     tile_pyr: [][]u8, // per coarse level: the level's dense tile scratch
     rep_grid: []u8, // repair scratch: dense fine grid (max span)
@@ -78,7 +95,7 @@ pub const Streamer = struct {
     /// lod_dists is the resolved increasing handoff prefix (one entry
     /// per coarse level, matching render.RenderParams). The fine world
     /// must be unbounded.
-    pub fn init(allocator: std.mem.Allocator, fine: *World, seed: u64, lod_dists: []const f32, fog_cutoff: f32, light: ?lighting.Params, budget: usize, coarse_caves: bool) !Streamer {
+    pub fn init(allocator: std.mem.Allocator, fine: *World, seed: u64, lod_dists: []const f32, fog_cutoff: f32, light: ?lighting.Params, budget: usize, coarse_caves: bool, pool: ?*pool_mod.Pool) !Streamer {
         std.debug.assert(fine.w == null); // streaming implies unbounded
         const n = lod_dists.len;
         std.debug.assert(n <= 8);
@@ -87,6 +104,7 @@ pub const Streamer = struct {
         s.ctx = terrain.Ctx.init(seed, fine.h);
         s.fine = fine;
         s.light = light;
+        s.pool = pool;
         s.budget = budget;
         s.coarse_caves = coarse_caves;
         s.lods = &.{};
@@ -101,12 +119,15 @@ pub const Streamer = struct {
         s.queue = .empty;
         s.repairs = .empty;
         s.in_flight = null;
+        s.loads = 0;
         var lods_built: usize = 0;
         var builders_built: usize = 0;
         var pyr_built: usize = 0;
         var builder_built = false;
+        var force_built = false;
         errdefer {
             if (builder_built) s.fine_builder.deinit();
+            if (force_built) s.force_builder.deinit();
             for (s.lods[0..lods_built]) |*w| w.deinit();
             for (s.coarse_builders[0..builders_built]) |*b| b.deinit();
             for (s.tile_pyr[0..pyr_built]) |p| allocator.free(p);
@@ -124,6 +145,8 @@ pub const Streamer = struct {
         }
         s.fine_builder = try Builder.init(allocator, fine, chunk_w, chunk_w);
         builder_built = true;
+        s.force_builder = try Builder.init(allocator, fine, chunk_w, chunk_w);
+        force_built = true;
         s.lods = try allocator.alloc(World, n);
         s.coarse_builders = try allocator.alloc(Builder, n);
         s.tile_pyr = try allocator.alloc([]u8, n);
@@ -170,6 +193,7 @@ pub const Streamer = struct {
         self.allocator.free(self.load_r);
         self.allocator.free(self.unload_r);
         self.fine_builder.deinit();
+        self.force_builder.deinit();
         self.edited.deinit();
         self.queue.deinit(self.allocator);
         self.repairs.deinit(self.allocator);
@@ -301,8 +325,10 @@ pub const Streamer = struct {
     /// Synchronously generate the fine chunks overlapping the
     /// fine-coords box [x0,x1)x[z0,z1) — the chunk under the player
     /// must be resident before physics (collision reads air as
-    /// fall-through). An in-flight load of another chunk is dropped
-    /// (its partial tile is streamer scratch; generation restarts).
+    /// fall-through). An in-flight load of the forced chunk completes;
+    /// an in-flight load of any other chunk is left untouched (the
+    /// forced load uses force_builder scratch), so a fast-moving
+    /// camera never discards partial generation.
     pub fn forceResident(self: *Streamer, x0: i32, z0: i32, x1: i32, z1: i32) !void {
         const cx0 = @divFloor(x0, chunk_w);
         const cz0 = @divFloor(z0, chunk_w);
@@ -320,9 +346,8 @@ pub const Streamer = struct {
                         self.in_flight = null;
                         continue;
                     }
-                    self.in_flight = null;
                 }
-                try chunk_mod.loadChunk(self.fine, &self.ctx, &self.fine_builder, cx, cz, self.light);
+                try chunk_mod.loadChunk(self.fine, &self.ctx, &self.force_builder, cx, cz, self.light, self.pool);
             }
         }
     }
@@ -383,7 +408,7 @@ pub const Streamer = struct {
             if (f.tile == tiles_side * tiles_side) {
                 const w = self.levelWorld(f.level);
                 const b = if (f.level == 0) &self.fine_builder else &self.coarse_builders[f.level - 1];
-                try chunk_mod.commitChunk(w, b, f.cx, f.cz, self.light);
+                try chunk_mod.commitChunk(w, b, f.cx, f.cz, self.light, self.pool);
                 return;
             }
             const take = @min(remaining.*, total_cols - f.col);
@@ -391,7 +416,7 @@ pub const Streamer = struct {
             const ttz = f.tile % tiles_side;
             const tx0 = (f.cx * chunk_w << @as(u5, @intCast(f.level))) + @as(i32, @intCast(ttx * chunk_w));
             const tz0 = (f.cz * chunk_w << @as(u5, @intCast(f.level))) + @as(i32, @intCast(ttz * chunk_w));
-            terrain.genTileFill(&self.ctx, &self.fine_builder, tx0, tz0, chunk_w, f.col, f.col + take, f.level == 0 or self.coarse_caves);
+            terrain.genTileFillPooled(self.pool, &self.ctx, &self.fine_builder, tx0, tz0, chunk_w, f.col, f.col + take, f.level == 0 or self.coarse_caves);
             f.col += take;
             remaining.* -= take;
             if (f.col == total_cols) {
@@ -402,7 +427,7 @@ pub const Streamer = struct {
                     var ss: usize = chunk_w;
                     var sh: usize = self.fine.h;
                     for (0..f.level) |l| {
-                        chunk_mod.downsampleDense(src, ss, sh, self.tile_pyr[l]);
+                        chunk_mod.downsampleDensePooled(self.pool, src, ss, sh, self.tile_pyr[l]);
                         src = self.tile_pyr[l];
                         ss /= 2;
                         sh = (sh + 1) / 2;
@@ -496,7 +521,7 @@ test "streamer: warm-up residency, budgeted equals completion, unload/reload rou
 
     var fine = try World.init(allocator, null, 96, null);
     defer fine.deinit();
-    var st = try Streamer.init(allocator, &fine, 7, &lod_dists, 448, .{}, 200, false);
+    var st = try Streamer.init(allocator, &fine, 7, &lod_dists, 448, .{}, 200, false, null);
     defer st.deinit();
     try st.runToCompletion(cam_a);
 
@@ -518,7 +543,7 @@ test "streamer: warm-up residency, budgeted equals completion, unload/reload rou
     // Budgeted streaming from scratch reaches the same state.
     var fine2 = try World.init(allocator, null, 96, null);
     defer fine2.deinit();
-    var st2 = try Streamer.init(allocator, &fine2, 7, &lod_dists, 448, .{}, 200, false);
+    var st2 = try Streamer.init(allocator, &fine2, 7, &lod_dists, 448, .{}, 200, false, null);
     defer st2.deinit();
     while (try st2.updateBudgeted(cam_a, 200)) {}
     var snap_b = try snapshot(allocator, &fine2);
@@ -538,12 +563,47 @@ test "streamer: warm-up residency, budgeted equals completion, unload/reload rou
     try expectSnapshotsEqual(&snap_a1, &snap_a1b);
 }
 
+test "streamer: pooled gen matches inline gen (plans/DISTANCE.md D4)" {
+    const allocator = std.testing.allocator;
+    const lod_dists = [_]f32{ 96, 192 };
+    const cam: Camera = .{ .x = 32.5, .y = 60, .z = -200.5, .yaw = 0 };
+
+    var fine_a = try World.init(allocator, null, 96, null);
+    defer fine_a.deinit();
+    var st_a = try Streamer.init(allocator, &fine_a, 7, &lod_dists, 448, .{}, 200, false, null);
+    defer st_a.deinit();
+    try st_a.runToCompletion(cam);
+
+    var pool: pool_mod.Pool = .{};
+    try pool.start(pool_mod.max_participants - 1);
+    defer pool.deinit();
+    var fine_b = try World.init(allocator, null, 96, null);
+    defer fine_b.deinit();
+    var st_b = try Streamer.init(allocator, &fine_b, 7, &lod_dists, 448, .{}, 200, false, &pool);
+    defer st_b.deinit();
+    // Small budget so loads slice mid-tile across several updates.
+    while (try st_b.updateBudgeted(cam, 37)) {}
+
+    var snap_a = try snapshot(allocator, &fine_a);
+    defer snap_a.deinit();
+    var snap_b = try snapshot(allocator, &fine_b);
+    defer snap_b.deinit();
+    try expectSnapshotsEqual(&snap_a, &snap_b);
+    for (0..st_a.lods.len) |i| {
+        var snap_la = try snapshot(allocator, &st_a.lods[i]);
+        defer snap_la.deinit();
+        var snap_lb = try snapshot(allocator, &st_b.lods[i]);
+        defer snap_lb.deinit();
+        try expectSnapshotsEqual(&snap_la, &snap_lb);
+    }
+}
+
 test "streamer: forceResident generates the player chunk synchronously" {
     const allocator = std.testing.allocator;
     const lod_dists = [_]f32{ 96, 192 };
     var fine = try World.init(allocator, null, 96, null);
     defer fine.deinit();
-    var st = try Streamer.init(allocator, &fine, 7, &lod_dists, 448, .{}, 1, false);
+    var st = try Streamer.init(allocator, &fine, 7, &lod_dists, 448, .{}, 1, false, null);
     defer st.deinit();
     try std.testing.expect(!fine.chunks.contains(world_mod.chunkKey(-1, 0)));
     try st.forceResident(-5, 3, 1, 4); // straddles chunks (-1,0) and (0,0)
@@ -563,7 +623,7 @@ test "streamer: edited fine chunk unload re-synthesizes the coarse tiers" {
 
     var fine = try World.init(allocator, null, 96, null);
     defer fine.deinit();
-    var st = try Streamer.init(allocator, &fine, 7, &lod_dists, 448, .{}, 100000, false);
+    var st = try Streamer.init(allocator, &fine, 7, &lod_dists, 448, .{}, 100000, false, null);
     defer st.deinit();
     try st.runToCompletion(cam_a);
 
@@ -613,3 +673,59 @@ test "streamer: edited fine chunk unload re-synthesizes the coarse tiers" {
         try std.testing.expect(lighting.sampleLight(after1, @intCast(y)).color_id != 9);
     }
 }
+
+test "streamer: forceResident preserves the in-flight load and a fast flight leaves no holes" {
+    const allocator = std.testing.allocator;
+    const lod_dists = [_]f32{ 144, 288, 576 };
+    var fine = try World.init(allocator, null, 256, null);
+    defer fine.deinit();
+    var st = try Streamer.init(allocator, &fine, 7, &lod_dists, 672, .{}, 1200, false, null);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(usize, 0), st.loads);
+    var cam: Camera = .{ .x = 0.5, .y = 80, .z = 0.5, .yaw = 0 };
+    try st.runToCompletion(cam);
+
+    // A partially filled in-flight load survives forcing a different
+    // chunk resident (same chunk, same fill position).
+    _ = try st.updateBudgeted(.{ .x = 320.5, .y = 80, .z = 0.5, .yaw = 0 }, 200);
+    const f0 = st.in_flight.?;
+    try std.testing.expect(f0.tile > 0 or f0.col > 0);
+    try st.forceResident(390, -30, 400, -20); // elsewhere, missing
+    const f1 = st.in_flight.?;
+    try std.testing.expectEqual(f0.level, f1.level);
+    try std.testing.expectEqual(f0.cx, f1.cx);
+    try std.testing.expectEqual(f0.cz, f1.cz);
+    try std.testing.expectEqual(f0.tile, f1.tile);
+    try std.testing.expectEqual(f0.col, f1.col);
+
+    // Fast flight (~15 vox/frame, the interactive loop's update +
+    // forceResident per frame), then hover to completion: every chunk
+    // in the load discs must be resident.
+    for (0..240) |i| {
+        const t = @as(f32, @floatFromInt(i)) / 239.0;
+        cam.x = 0.5 + 3000.0 * t;
+        cam.z = 0.5 - 2000.0 * t;
+        _ = try st.updateBudgeted(cam, 1200);
+        const px0: i32 = @intFromFloat(@floor(cam.x - 0.3));
+        const pz0: i32 = @intFromFloat(@floor(cam.z - 0.3));
+        const px1: i32 = @as(i32, @intFromFloat(@floor(cam.x + 0.3))) + 1;
+        const pz1: i32 = @as(i32, @intFromFloat(@floor(cam.z + 0.3))) + 1;
+        try st.forceResident(px0, pz0, px1, pz1);
+    }
+    try st.runToCompletion(cam);
+    for (0..st.lods.len + 1) |li| {
+        const level: u32 = @intCast(li);
+        const w = st.levelWorld(level);
+        const ccx = Streamer.chunkAtLevel(cam.x, level);
+        const ccz = Streamer.chunkAtLevel(cam.z, level);
+        const r = st.load_r[li];
+        var dz = -r;
+        while (dz <= r) : (dz += 1) {
+            var dx = -r;
+            while (dx <= r) : (dx += 1) {
+                try std.testing.expect(w.chunks.contains(world_mod.chunkKey(ccx + dx, ccz + dz)));
+            }
+        }
+    }
+}
+

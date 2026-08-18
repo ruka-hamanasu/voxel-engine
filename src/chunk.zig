@@ -1,6 +1,7 @@
 const std = @import("std");
 const world_mod = @import("world.zig");
 const lighting = @import("lighting.zig");
+const pool_mod = @import("pool.zig");
 const terrain = @import("gen/terrain.zig");
 const Builder = @import("gen/builder.zig").Builder;
 const encodeDenseColumn = @import("gen/builder.zig").encodeDenseColumn;
@@ -21,8 +22,9 @@ const chunk_w = world_mod.chunk_w;
 /// the chunk's former absence, so the clear pass is a no-op and the
 /// add pass — seed the chunk's emissives, propagate from the lit ring —
 /// lands exactly the fixpoint a single flood over the resident set
-/// computes. builder must be a 64x64 tile over `world`.
-pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params) !void {
+/// computes. builder must be a 64x64 tile over `world`. The fill and
+/// encode ride `pool` when given (plans/DISTANCE.md D4).
+pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params, pool: ?*pool_mod.Pool) !void {
     std.debug.assert(builder.tw == chunk_w and builder.td == chunk_w);
     _ = try world.ensureChunk(cx, cz);
     var tw: usize = chunk_w;
@@ -37,21 +39,23 @@ pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: 
         .y1 = @intCast(world.h),
         .z1 = cz * chunk_w + @as(i32, @intCast(td)),
     };
-    terrain.genTileDense(ctx, builder, box.x0, box.z0, tw, td);
-    try commitChunk(world, builder, cx, cz, light);
+    terrain.genTileFillPooled(pool, ctx, builder, box.x0, box.z0, td, 0, tw * td, true);
+    try commitChunk(world, builder, cx, cz, light, pool);
 }
 
 /// Finishing step of a (possibly frame-sliced) chunk load: register
 /// the chunk, run-encode the dense tile into it, and flood the chunk
 /// box. The streamer fills the builder tile over several frames, then
-/// commits in one step (plans/STREAMING.md phase 2).
-pub fn commitChunk(world: *World, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params) !void {
+/// commits in one step (plans/STREAMING.md phase 2). The encode rides
+/// `pool` when given; the flood stays serial on the calling thread
+/// (it propagates across chunk boundaries).
+pub fn commitChunk(world: *World, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params, pool: ?*pool_mod.Pool) !void {
     _ = try world.ensureChunk(cx, cz);
     var tw: usize = chunk_w;
     var td: usize = chunk_w;
     if (world.w) |w| tw = @min(tw, w - @as(usize, @intCast(cx)) * chunk_w);
     if (world.d) |d| td = @min(td, d - @as(usize, @intCast(cz)) * chunk_w);
-    try terrain.emitTile(builder, cx * chunk_w, cz * chunk_w, tw, td, false);
+    try terrain.emitTilePooled(pool, builder, cx * chunk_w, cz * chunk_w, tw, td, false);
     if (light) |params| {
         _ = try lighting.relight(world, world.allocator, .{ .x0 = cx * chunk_w, .y0 = 0, .z0 = cz * chunk_w, .x1 = cx * chunk_w + @as(i32, @intCast(tw)), .y1 = @intCast(world.h), .z1 = cz * chunk_w + @as(i32, @intCast(td)) }, params);
     }
@@ -64,34 +68,64 @@ pub fn commitChunk(world: *World, builder: *Builder, cx: i32, cz: i32, light: ?l
 /// Column-major tiles ((lx*side + lz) * h + y); dst side = src side/2.
 pub fn downsampleDense(src: []const u8, ss: usize, sh: usize, dst: []u8) void {
     const ds = ss / 2;
+    downsampleDenseCols(src, ss, sh, dst, 0, ds * ds);
+}
+
+/// Column range [c0, c1) of downsampleDense (linear lcx*ds + lcz
+/// order) — the streamer's pooled pyramid dispatches sub-ranges; items
+/// read shared src and write disjoint dst columns.
+pub fn downsampleDenseCols(src: []const u8, ss: usize, sh: usize, dst: []u8, c0: usize, c1: usize) void {
+    const ds = ss / 2;
     const dh = (sh + 1) / 2;
     std.debug.assert(dst.len == ds * ds * dh);
     std.debug.assert(src.len == ss * ss * sh);
-    for (0..ds) |lcx| {
-        for (0..ds) |lcz| {
-            const out = dst[(lcx * ds + lcz) * dh ..][0..dh];
-            var yc: usize = 0;
-            while (yc < dh) : (yc += 1) {
-                const yf_hi = @min(2 * yc + 1, sh - 1);
-                var m: u8 = 0;
-                var yf = yf_hi + 1;
-                scan: while (yf > 2 * yc) {
-                    yf -= 1;
-                    for (0..2) |dx| {
-                        for (0..2) |dz| {
-                            const v = src[((2 * lcx + dx) * ss + (2 * lcz + dz)) * sh + yf];
-                            if (v != 0) {
-                                m = v;
-                                break :scan;
-                            }
+    for (c0..c1) |c| {
+        const lcx = c / ds;
+        const lcz = c % ds;
+        const out = dst[c * dh ..][0..dh];
+        var yc: usize = 0;
+        while (yc < dh) : (yc += 1) {
+            const yf_hi = @min(2 * yc + 1, sh - 1);
+            var m: u8 = 0;
+            var yf = yf_hi + 1;
+            scan: while (yf > 2 * yc) {
+                yf -= 1;
+                for (0..2) |dx| {
+                    for (0..2) |dz| {
+                        const v = src[((2 * lcx + dx) * ss + (2 * lcz + dz)) * sh + yf];
+                        if (v != 0) {
+                            m = v;
+                            break :scan;
                         }
                     }
                 }
-                out[yc] = m;
             }
+            out[yc] = m;
         }
     }
 }
+
+/// downsampleDense across the pool (plans/DISTANCE.md D4).
+pub fn downsampleDensePooled(p: ?*pool_mod.Pool, src: []const u8, ss: usize, sh: usize, dst: []u8) void {
+    const ds = ss / 2;
+    const job: PyrJob = .{ .src = src, .ss = ss, .sh = sh, .dst = dst };
+    pool_mod.dispatch(p, &job, PyrJob.run, (ds * ds + PyrJob.gran - 1) / PyrJob.gran);
+}
+
+const PyrJob = struct {
+    const gran = 32;
+
+    src: []const u8,
+    ss: usize,
+    sh: usize,
+    dst: []u8,
+
+    fn run(self: *const PyrJob, item: usize) void {
+        const ds = self.ss / 2;
+        const c0 = item * gran;
+        downsampleDenseCols(self.src, self.ss, self.sh, self.dst, c0, @min(c0 + gran, ds * ds));
+    }
+};
 
 /// Dense tile side/height at level L for a 64-wide chunk: 64/2^L
 /// columns, ceil(fine_h/2^L) voxels.
@@ -260,7 +294,7 @@ test "loadChunk matches eager whole-world generation" {
     defer builder.deinit();
     for (0..2) |cx| {
         for (0..2) |cz| {
-            try loadChunk(&world, &ctx, &builder, @intCast(cx), @intCast(cz), null);
+            try loadChunk(&world, &ctx, &builder, @intCast(cx), @intCast(cz), null, null);
         }
     }
 
@@ -296,7 +330,7 @@ test "per-chunk load floods match a single whole-world flood" {
     var builder = try Builder.init(allocator, &world, chunk_w, chunk_w);
     defer builder.deinit();
     const order = [_][2]i32{ .{ 1, 1 }, .{ 0, 0 }, .{ 2, 0 }, .{ 0, 1 }, .{ 2, 1 }, .{ 1, 0 } };
-    for (order) |cc| try loadChunk(&world, &ctx, &builder, cc[0], cc[1], params);
+    for (order) |cc| try loadChunk(&world, &ctx, &builder, cc[0], cc[1], params, null);
 
     // Full-extent exact: the flood's confinement to resident cells
     // matches the bounded reference's box confinement one-to-one.

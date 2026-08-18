@@ -129,6 +129,15 @@ pub const Pool = struct {
     }
 };
 
+/// run() through an optional pool: null (or a zero-worker pool) runs
+/// inline on the calling thread. D4 (plans/DISTANCE.md) gives the
+/// streamer/impostor gen paths a ?*Pool so tests and the bounded paths
+/// stay on the exact pre-D4 inline code path.
+pub fn dispatch(p: ?*Pool, ctx: anytype, comptime func: anytype, n_items: usize) void {
+    if (p) |pp| return pp.run(ctx, func, n_items);
+    for (0..n_items) |i| func(ctx, i);
+}
+
 test "run covers every item exactly once, inline and pooled" {
     const Counter = struct {
         hits: [64]std.atomic.Value(u32) = @splat(.init(0)),

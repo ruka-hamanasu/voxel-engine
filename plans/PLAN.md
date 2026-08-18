@@ -799,3 +799,46 @@ entries here record scope and outcome only.
       test green; spawn bench neutral (4.77 -> 4.72 ms at 480x270).
       Baselines regenerated as views_m35* (the m31/m32 baselines had
       gone stale at HEAD's worldgen change); rerun byte-identical.
+
+36. COMPLETED - Threaded streaming + impostor gen (DISTANCE.md D4).
+      The D1 pool moves from Renderer ownership to main (Renderer,
+      Streamer, Impostor each borrow a ?*Pool; null = the pre-D4
+      inline path, so every existing test is untouched). The
+      streamer's dense fill dispatches 64-column sub-ranges
+      (terrain.genTileFillPooled — genTileFill already took a column
+      range), the pyramid 32-column downsample ranges
+      (chunk.downsampleDensePooled), and the commit encode whole 8x8
+      column groups (terrain.emitTilePooled — group = world.zig's
+      macro grid, so updateMacro never races; allocation errors
+      captured first-wins through the dispatch join). ensureChunk and
+      the cross-chunk flood stay serial in queue order, so light and
+      materials are byte-identical: new pooled-vs-inline snapshot
+      tests for the streamer (budget 37, mid-tile slicing) and
+      impostor (budget 333), zig build test green, all four PPM
+      sweeps byte-identical to views_m35*, and the --dist 100000
+      frame is byte-identical pre vs post. forceResident rides the
+      pool via loadChunk. Impostor synthesis dispatches 128-cell
+      ranges over the in-flight tile. Bench (960x540, pre -> D4):
+      walk 12.8 -> 10.3 ms (the 34 streamed chunks inside the timed
+      loop now gen ~4-wide), spawn/worst flat (~9 ms, streamer idle);
+      walk at --dist 10240 13.6 -> 11.2 ms. --dist 100000 warm-up +
+      one frame: 35 -> 10 s (3.5x; D3.1's ~2 min figure was not
+      reproduced on this machine pre-D4 either). mem.sh: default
+      73.2 MB unchanged, 10 km 95.2 MB (no per-worker scratch — the
+      builders stay shared, all writes disjoint).
+      Follow-up (streaming hole fix, pre-existing bug found via user
+      report after D4): fast flight left mid-distance areas
+      permanently unfilled — the interactive loop's per-frame
+      forceResident dropped any non-player in-flight load because
+      loadChunk clobbered the shared fine_builder scratch, discarding
+      up to whole coarse-chunk fills (a level-3 chunk is 4^3 tiles =
+      262k columns) every few frames (measured: 57 drops, ~146k
+      columns wasted in one 240-frame flight). Fix: a dedicated
+      force_builder for forceResident (+1 MB scratch); in-flight
+      loads are never dropped. Regression test: in-flight fill
+      position survives forceResident, and a simulated 3 km flight +
+      hover ends with every in-disc chunk resident. Also fixed:
+      Streamer.loads was never initialized (undefined struct fill),
+      so the bench chunk counts were diffs off a garbage base. Gates:
+      zig build test green; stream sweeps byte-identical; walk bench
+      flat (9.8 ms); mem 73.2 -> 74.2 MB (the force_builder).

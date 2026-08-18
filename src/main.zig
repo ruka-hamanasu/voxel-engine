@@ -10,6 +10,7 @@ const World = @import("world.zig").World;
 const Camera = @import("camera.zig").Camera;
 const Player = @import("player.zig").Player;
 const render = @import("render.zig");
+const pool_mod = @import("pool.zig");
 const gen = @import("gen.zig");
 const lighting = @import("lighting.zig");
 const lod_mod = @import("lod.zig");
@@ -130,11 +131,14 @@ pub fn main(init: std.process.Init) !void {
     const staging = try allocator.alloc(u32, render_w * render_h);
     defer allocator.free(staging);
 
-    // Persistent render pool (plans/DISTANCE.md D1): created once at
-    // startup, shared by bench/headless/interactive renders.
-    var rnd: render.Renderer = .{};
-    try rnd.start(render.pool_workers);
-    defer rnd.deinit();
+    // Persistent worker pool (plans/DISTANCE.md D1/D4): created once
+    // at startup, shared by the renderer, streamer, and impostor —
+    // render and gen never overlap in the frame loop. Two-phase: the
+    // Pool must not move after start (workers hold a back-pointer).
+    var pool: pool_mod.Pool = .{};
+    try pool.start(render.pool_workers);
+    defer pool.deinit();
+    var rnd: render.Renderer = .{ .pool = &pool };
 
     // World setup: bounded test world (eager gen + floodAll + eager
     // LOD build) when --world-w/d are given, else the unbounded world
@@ -227,7 +231,7 @@ pub fn main(init: std.process.Init) !void {
             lod_worlds[i] = try lod_mod.build(allocator, if (i == 0) world else &lod_worlds[i - 1].?);
         }
     } else {
-        streamer = try stream.Streamer.init(allocator, world, opts.seed, rparams.lod_dists[0..lod_count], if (imp_active) imp_dist else rparams.fog_cutoff, if (light_enabled) light_params else null, load_budget, res.args.@"exact-coarse" != 0);
+        streamer = try stream.Streamer.init(allocator, world, opts.seed, rparams.lod_dists[0..lod_count], if (imp_active) imp_dist else rparams.fog_cutoff, if (light_enabled) light_params else null, load_budget, res.args.@"exact-coarse" != 0, &pool);
     }
     var lod_ptrs: [render.max_lods]*const World = undefined;
     if (bounded) {
@@ -264,7 +268,7 @@ pub fn main(init: std.process.Init) !void {
     var impostor: ?impostor_mod.Impostor = null;
     defer if (impostor) |*im| im.deinit();
     if (imp_active) {
-        impostor = try impostor_mod.Impostor.init(allocator, generator, opts.seed, opts.h, imp_cell, imp_dist, rparams.fog_cutoff, if (bounded) .{ opts.w, opts.d } else null);
+        impostor = try impostor_mod.Impostor.init(allocator, generator, opts.seed, opts.h, imp_cell, imp_dist, rparams.fog_cutoff, if (bounded) .{ opts.w, opts.d } else null, &pool);
         const wstart = std.Io.Clock.Timestamp.now(init.io, .awake);
         try impostor.?.runToCompletion(cam);
         const wms = @as(f64, @floatFromInt(wstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;

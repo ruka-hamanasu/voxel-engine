@@ -1,5 +1,6 @@
 const std = @import("std");
 const gen = @import("gen.zig");
+const pool_mod = @import("pool.zig");
 const terrain = @import("gen/terrain.zig");
 const world_mod = @import("world.zig");
 const Camera = @import("camera.zig").Camera;
@@ -22,8 +23,10 @@ const Camera = @import("camera.zig").Camera;
 /// tiles + 1), one tile of unload hysteresis, synthesis budgeted per
 /// update in cell units (a tile commits to its map only when
 /// complete, so renders never read a partial tile). Render threads
-/// read via cellAt; synthesis runs on the main thread outside render
-/// (D4 moves it to the pool).
+/// read via cellAt; synthesis batches ride the shared pool as
+/// disjoint cell-range items over the in-flight tile (D4; null pool =
+/// inline), with tile commit/unload on the calling thread, so pooled
+/// and inline rings are byte-identical.
 pub const tile_shift = 5;
 pub const tile_cells = 1 << tile_shift; // 32x32 cells per tile
 const cells_per_tile = tile_cells * tile_cells;
@@ -93,6 +96,8 @@ pub const Impostor = struct {
     /// Cells synthesized per update (partial tiles stay invisible
     /// until complete).
     budget: usize,
+    /// Borrowed synthesis pool; null runs inline (tests).
+    pool: ?*pool_mod.Pool = null,
     in_flight: ?InFlight = null,
 
     const InFlight = struct {
@@ -108,7 +113,7 @@ pub const Impostor = struct {
     /// base_handoff, while the handoff is inside the cutoff. The last
     /// level's ring reaches the cutoff (its march range truncates
     /// there, like the cascade's last level).
-    pub fn init(allocator: std.mem.Allocator, kind: gen.Generator, seed: u64, h: usize, cell_size: u32, base_handoff: f32, cutoff: f32, bounds: ?[2]usize) !Impostor {
+    pub fn init(allocator: std.mem.Allocator, kind: gen.Generator, seed: u64, h: usize, cell_size: u32, base_handoff: f32, cutoff: f32, bounds: ?[2]usize, pool: ?*pool_mod.Pool) !Impostor {
         std.debug.assert(cell_size >= 16 and cell_size <= 4096 and std.math.isPowerOfTwo(cell_size));
         var self: Impostor = .{
             .allocator = allocator,
@@ -118,6 +123,7 @@ pub const Impostor = struct {
             .levels = undefined,
             .n_levels = 0,
             .budget = 512,
+            .pool = pool,
         };
         errdefer self.deinit();
         var handoff = base_handoff;
@@ -286,12 +292,8 @@ pub const Impostor = struct {
             const lvl = &self.levels[f.level];
             const n = @min(remaining, cells_per_tile - f.next);
             const size = @as(u32, 1) << lvl.shift;
-            for (f.next..f.next + n) |idx| {
-                const lx: i32 = @intCast(idx / tile_cells);
-                const lz: i32 = @intCast(idx % tile_cells);
-                const c = gen.impostorCell(self.gctx(), (f.tx * @as(i32, tile_cells) + lx) << lvl.shift, (f.tz * @as(i32, tile_cells) + lz) << lvl.shift, size);
-                f.tile.cells[idx] = .{ .top_y = c.top_y, .mat = c.mat };
-            }
+            const job: CellJob = .{ .gctx = self.gctx(), .tile = f.tile, .base_cx = f.tx * tile_cells, .base_cz = f.tz * tile_cells, .shift = lvl.shift, .size = size, .first = f.next, .last = f.next + n };
+            pool_mod.dispatch(self.pool, &job, CellJob.run, job.items());
             f.next += n;
             remaining -= n;
             if (f.next == cells_per_tile) {
@@ -322,12 +324,43 @@ pub const Impostor = struct {
     }
 };
 
+/// Synthesis batch job (D4): item i fills cells [first + i*gran, ...)
+/// of the in-flight tile. gen.impostorCell is a pure function of the
+/// generator context and cell origin, and items write disjoint cells,
+/// so pooled and inline fills produce identical tiles.
+const CellJob = struct {
+    const gran = 128;
+
+    gctx: gen.ImpostorCtx,
+    tile: *Tile,
+    base_cx: i32, // tile origin in cell coords
+    base_cz: i32,
+    shift: u5,
+    size: u32,
+    first: usize,
+    last: usize,
+
+    fn items(self: *const CellJob) usize {
+        return (self.last - self.first + gran - 1) / gran;
+    }
+
+    fn run(self: *const CellJob, item: usize) void {
+        const begin = self.first + item * gran;
+        for (begin..@min(begin + gran, self.last)) |idx| {
+            const lx: i32 = @intCast(idx / tile_cells);
+            const lz: i32 = @intCast(idx % tile_cells);
+            const c = gen.impostorCell(self.gctx, (self.base_cx + lx) << self.shift, (self.base_cz + lz) << self.shift, self.size);
+            self.tile.cells[idx] = .{ .top_y = c.top_y, .mat = c.mat };
+        }
+    }
+};
+
 test "budgeted synthesis matches run-to-completion and the ring tracks the camera" {
     const cam: Camera = .{ .x = 100.5, .y = 40, .z = -200.5, .yaw = 0 };
     // Budgeted: one cell at a time must produce the same cells.
-    var a = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 4096, null);
+    var a = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 4096, null, null);
     defer a.deinit();
-    var b = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 4096, null);
+    var b = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 4096, null, null);
     defer b.deinit();
     try a.runToCompletion(cam);
     while (try b.updateBudgeted(cam, 1)) {}
@@ -352,8 +385,33 @@ test "budgeted synthesis matches run-to-completion and the ring tracks the camer
     try std.testing.expect(a.cellAt(0, ccx + 625, ccz) != null);
 }
 
+test "pooled synthesis matches inline (plans/DISTANCE.md D4)" {
+    const cam: Camera = .{ .x = 100.5, .y = 40, .z = -200.5, .yaw = 0 };
+    var a = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 10240, null, null);
+    defer a.deinit();
+    try a.runToCompletion(cam);
+
+    var pool: pool_mod.Pool = .{};
+    try pool.start(pool_mod.max_participants - 1);
+    defer pool.deinit();
+    var b = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 10240, null, &pool);
+    defer b.deinit();
+    // Odd budget so tile fills slice mid-batch across updates.
+    while (try b.updateBudgeted(cam, 333)) {}
+
+    try std.testing.expectEqual(a.n_levels, b.n_levels);
+    for (0..a.n_levels) |li| {
+        try std.testing.expectEqual(a.levels[li].tiles.count(), b.levels[li].tiles.count());
+        var it = a.levels[li].tiles.iterator();
+        while (it.next()) |e| {
+            const bt = b.levels[li].tiles.get(e.key_ptr.*).?;
+            try std.testing.expectEqualSlices(Cell, &e.value_ptr.*.cells, &bt.cells);
+        }
+    }
+}
+
 test "bounded worlds never synthesize outside the bounds" {
-    var imp = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 4096, .{ 300, 300 });
+    var imp = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 4096, .{ 300, 300 }, null);
     defer imp.deinit();
     try imp.runToCompletion(.{ .x = 150, .y = 40, .z = 150, .yaw = 0 });
     // Cell (9, 4) covers voxels x in [288, 320): partially inside.
@@ -364,7 +422,7 @@ test "bounded worlds never synthesize outside the bounds" {
 }
 
 test "levels follow the 72x pixel-matched schedule" {
-    var imp = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 10240, null);
+    var imp = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 10240, null, null);
     defer imp.deinit();
     // 2304, 4608, 9216 inside the 10240 cutoff; 18432 beyond.
     try std.testing.expectEqual(@as(usize, 3), imp.n_levels);
@@ -372,7 +430,7 @@ test "levels follow the 72x pixel-matched schedule" {
     try std.testing.expectEqual(@as(f32, 9216), imp.levels[2].handoff);
     try std.testing.expectEqual(@as(u5, 5), imp.levels[0].shift); // 32 vox
     try std.testing.expectEqual(@as(u5, 7), imp.levels[2].shift); // 128 vox
-    var big = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 100000, null);
+    var big = try Impostor.init(std.testing.allocator, .terrain, 7, 96, 32, 2304, 100000, null, null);
     defer big.deinit();
     try std.testing.expectEqual(@as(usize, 6), big.n_levels); // 32..1024
 }

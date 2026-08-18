@@ -166,7 +166,20 @@ Retained findings (original text below the F-list):
   design text's "~1-2 km"; the pixel-matched schedule fixes the
   intent rather than the number.
 
-### D4. Threaded streaming + impostor gen
+### D4. Threaded streaming + impostor gen — COMPLETED (milestone 36)
+
+Outcome: the D1 pool moved to main and is shared by render, streamer,
+and impostor (null pool = the pre-D4 inline path; tests untouched).
+Fill dispatches 64-column ranges, the pyramid 32-column ranges, the
+commit encode 8x8 macro-grid groups; ensureChunk and the cross-chunk
+flood stay serial in queue order, so worlds stay byte-identical
+(pooled-vs-inline snapshot tests, all four sweeps + the 10 km frame
+identical). Impostor synthesis rides the pool as 128-cell ranges.
+Numbers: walk 12.8 -> 10.3 ms (672), 13.6 -> 11.2 ms (10 km);
+--dist 100000 warm-up 35 -> 10 s (3.5x); mem unchanged. Details:
+PLAN.md milestone 36.
+
+Retained design notes:
 
 Move fine-chunk gen/pyramid/encode onto the D1 pool; impostor ring
 synthesis rides the same pool (cheap: ~1 us/cell, incremental ~ms).

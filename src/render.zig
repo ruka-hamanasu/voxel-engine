@@ -284,26 +284,17 @@ fn detailBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, detail_dist: f32) f3
     return @max(detail_dist + t_enter, 0.0);
 }
 
-/// Renderer instance owning the persistent worker pool
-/// (plans/DISTANCE.md D1). render/transpose split into disjoint work
-/// items grabbed via the pool's atomic counter; writes are
-/// column/tile-disjoint with no cross-item state, so pooled output is
-/// byte-identical to the inline zero-worker path. The shade/fog/palette
-/// LUTs stay module-global, written on the main thread before dispatch.
+/// Renderer instance dispatching to the shared persistent worker pool
+/// (plans/DISTANCE.md D1/D4): main owns the pool and the streamer and
+/// impostor borrow it between renders (gen and render never overlap).
+/// render/transpose split into disjoint work items grabbed via the
+/// pool's atomic counter; writes are column/tile-disjoint with no
+/// cross-item state, so pooled output is byte-identical to the inline
+/// path. The shade/fog/palette LUTs stay module-global, written on the
+/// main thread before dispatch.
 pub const Renderer = struct {
-    pool: pool_mod.Pool = .{},
-
-    /// Spawn worker_count render threads (pool_workers for the full
-    /// pool); never started, the renderer runs inline single-threaded.
-    /// Two-phase: the Renderer must not move after start (the pool's
-    /// workers hold a back-pointer).
-    pub fn start(self: *Renderer, worker_count: usize) !void {
-        try self.pool.start(worker_count);
-    }
-
-    pub fn deinit(self: *Renderer) void {
-        self.pool.deinit();
-    }
+    /// Borrowed pool; null runs everything inline (tests).
+    pool: ?*pool_mod.Pool = null,
 
     pub fn render(self: *Renderer, fb: []u32, width: usize, height: usize, world: *const World, lods: []const *const World, cam: Camera, params: RenderParams, imp: ?*const Impostor) void {
         std.debug.assert(height <= shade.max_sky_height);
@@ -334,12 +325,12 @@ pub const Renderer = struct {
         const s_max = hf0 * 0.5 / f;
 
         const job: ColumnJob = .{ .fb = fb, .width = width, .height = height, .world = world, .lods = lods, .cam = cam, .f = f, .s_max = s_max, .sky = sky, .params = params, .imp = imp };
-        self.pool.run(&job, ColumnJob.run, (width + ColumnJob.strip - 1) / ColumnJob.strip);
+        pool_mod.dispatch(self.pool, &job, ColumnJob.run, (width + ColumnJob.strip - 1) / ColumnJob.strip);
     }
 
     pub fn transpose(self: *Renderer, dst: []u32, src: []const u32, width: usize, height: usize) void {
         const job: TransposeJob = .{ .dst = dst, .src = src, .width = width, .height = height };
-        self.pool.run(&job, TransposeJob.run, (height + TransposeJob.T - 1) / TransposeJob.T);
+        pool_mod.dispatch(self.pool, &job, TransposeJob.run, (height + TransposeJob.T - 1) / TransposeJob.T);
     }
 };
 
@@ -1379,7 +1370,7 @@ test "impostorTruncate drops handoffs at and past the handoff" {
 
 test "marchImpostor claims the below-horizon rows over solid terrain" {
     const impostor_mod_t = @import("impostor.zig");
-    var imp = try impostor_mod_t.Impostor.init(std.testing.allocator, .terrain, 1337, 256, 32, 2304, 4096, null);
+    var imp = try impostor_mod_t.Impostor.init(std.testing.allocator, .terrain, 1337, 256, 32, 2304, 4096, null, null);
     defer imp.deinit();
     const cam: Camera = .{ .x = 100.5, .y = 250, .z = 100.5, .yaw = 0 };
     try imp.runToCompletion(cam);

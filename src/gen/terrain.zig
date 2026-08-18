@@ -1,6 +1,7 @@
 const std = @import("std");
 const gen = @import("../gen.zig");
 const world_mod = @import("../world.zig");
+const pool_mod = @import("../pool.zig");
 const Noise = @import("noise.zig").Noise;
 const Builder = @import("builder.zig").Builder;
 
@@ -212,6 +213,37 @@ pub fn genTileFill(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, td: usize, 
     }
 }
 
+/// genTileFill across the pool (plans/DISTANCE.md D4): item i fills a
+/// `gran`-column sub-range of [col0, col1). Ctx is read-only and items
+/// write disjoint dense builder columns, so pooled output is
+/// byte-identical to the inline call.
+pub fn genTileFillPooled(p: ?*pool_mod.Pool, ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, td: usize, col0: usize, col1: usize, caves: bool) void {
+    const job: FillJob = .{ .ctx = ctx, .b = b, .tx0 = tx0, .tz0 = tz0, .td = td, .col0 = col0, .col1 = col1, .caves = caves };
+    pool_mod.dispatch(p, &job, FillJob.run, job.items());
+}
+
+const FillJob = struct {
+    const gran = 64;
+
+    ctx: *const Ctx,
+    b: *Builder,
+    tx0: i32,
+    tz0: i32,
+    td: usize,
+    col0: usize,
+    col1: usize,
+    caves: bool,
+
+    fn items(self: *const FillJob) usize {
+        return (self.col1 - self.col0 + gran - 1) / gran;
+    }
+
+    fn run(self: *const FillJob, item: usize) void {
+        const c0 = self.col0 + item * gran;
+        genTileFill(self.ctx, self.b, self.tx0, self.tz0, self.td, c0, @min(c0 + gran, self.col1), self.caves);
+    }
+};
+
 /// Dense stage of the staged per-tile pipeline: the column fill.
 /// No world writes — coarse-LOD synthesis (plans/STREAMING.md phase 2)
 /// consumes the dense tile directly. Tile origins are i32 so negative
@@ -230,6 +262,56 @@ pub fn emitTile(b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, keep_ligh
         }
     }
 }
+
+/// emitTile across the pool (plans/DISTANCE.md D4): work items are
+/// whole 8x8 column groups matching world.zig's macro grid, so each
+/// item's setColumnRuns/updateMacro touches only its own group's
+/// columns and macro cell — no item ever reads a column another item
+/// is writing. The world allocator is thread-safe (DebugAllocator is
+/// mutex-guarded). Allocation failures surface as the first captured
+/// item error after the dispatch joins.
+pub fn emitTilePooled(p: ?*pool_mod.Pool, b: *Builder, tx0: i32, tz0: i32, tw: usize, td: usize, keep_light: bool) !void {
+    var job: EmitJob = .{ .b = b, .tx0 = tx0, .tz0 = tz0, .tw = tw, .td = td, .keep_light = keep_light };
+    pool_mod.dispatch(p, &job, EmitJob.run, job.items());
+    if (job.failed.load(.acquire)) return job.err;
+}
+
+const EmitJob = struct {
+    /// world.zig's macro grid group: updateMacro rescans the 8x8
+    /// columns of a column's group, so group-granular items stay
+    /// race-free.
+    const group = 8;
+
+    b: *Builder,
+    tx0: i32,
+    tz0: i32,
+    tw: usize,
+    td: usize,
+    keep_light: bool,
+    failed: std.atomic.Value(bool) = .init(false),
+    err: anyerror = error.OutOfMemory,
+
+    fn items(self: *const EmitJob) usize {
+        return ((self.tw + group - 1) / group) * ((self.td + group - 1) / group);
+    }
+
+    fn run(self: *EmitJob, item: usize) void {
+        const gz = item % ((self.td + group - 1) / group);
+        const gx = item / ((self.td + group - 1) / group);
+        const lx1 = @min(gx * group + group, self.tw);
+        const lz1 = @min(gz * group + group, self.td);
+        for (gx * group..lx1) |lx| {
+            for (gz * group..lz1) |lz| {
+                self.b.emit(self.tx0 + @as(i32, @intCast(lx)), self.tz0 + @as(i32, @intCast(lz)), lx, lz, self.keep_light) catch |e| {
+                    // First failure wins; the dispatch's join makes the
+                    // write visible before the caller reads the flag.
+                    if (self.failed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) self.err = e;
+                    return;
+                };
+            }
+        }
+    }
+};
 
 /// The full pipeline (dense -> emit), exactly what a phase-1 chunk
 /// load runs, so chunk gen == whole-world gen.
