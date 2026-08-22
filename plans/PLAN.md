@@ -856,14 +856,47 @@ entries here record scope and outcome only.
        recursing deeper while the fill itself hits holes and a chain
        world exists. Intervals snap outward to coarse-cell planes
        (cellEntryAt/cellExitAt) so coarse voxels render whole, and the
-       fill runs with handoff no_cull + detail=false. Correctness rides
-       existing invariants: spans claim front-to-back, so the later
-       fill can only claim spans the finer march left open (never
-       overwrites finer pixels), and the coarse silhouette overestimate
-       over fine air is the <= 1 fine voxel the regular handoff already
-       accepts — transient until the fine chunk commits. Zero cost when
-       no holes: an empty Holes short-circuits, so the warmed-up sweeps
-       stay byte-identical. Gates: zig build test green (new test: a
-       missing fine chunk renders the coarse floor where the no-fill
-       control renders sky); all 78 stream-sweep views byte-identical
-       pre vs post.
+        fill runs with handoff no_cull + detail=false. Correctness rides
+        existing invariants: spans claim front-to-back, so the later
+        fill can only claim spans the finer march left open (never
+        overwrites finer pixels), and the coarse silhouette overestimate
+        over fine air is the <= 1 fine voxel the regular handoff already
+        accepts — transient until the fine chunk commits. Zero cost when
+        no holes: an empty Holes short-circuits, so the warmed-up sweeps
+        stay byte-identical. Gates: zig build test green (new test: a
+        missing fine chunk renders the coarse floor where the no-fill
+        control renders sky); all 78 stream-sweep views byte-identical
+        pre vs post.
+
+38. COMPLETED - LOD boundary morph (the flat-terrain handoff line).
+       Conservative coarse solidity (any of 8 fine voxels) renders a
+       flat surface whose top face sits on an odd fine plane one fine
+       voxel higher across the whole coarse field, and the handoff
+       drew that step as a vertical riser — on flat terrain the
+       distance circle projects to a constant screen row, so it read
+       as a razor-straight line spanning the screen, glued in place
+       under yaw (worst with m33's clear fog, which leaves the 144
+       handoff nearly unfogged). Clipping alone was ruled out: the
+       step would relocate to the boundary cell's back edge, where the
+       riser is culled against the coarse neighbor's union-solidity —
+       pinholes. The boundary cell is now a 1-cell morph zone: its
+       topmost top face ramps from the exact fine height at the entry
+       plane (CellCtx.h_front, from the fronting fine column's
+       top_solid_y via the existing bsel, clamped into the topmost
+       coarse voxel) up to the coarse top at the exit plane, and its
+       topmost back face clips to the same height — front edge meets
+       the fine render, back edge meets the coarse field, no riser
+       anywhere. Even-parity surfaces are unchanged (h_front == the
+       coarse top exactly); interior runs keep conservative geometry,
+       so caves/hole-fill are untouched; the mechanism composes per
+       cascade level via the existing MarchCfg.fine chain. Deferred
+       lever if the coarse field's 1-voxel raise ever matters on
+       distant silhouettes: store exact fine tops per coarse column
+       (fits the 64 B Column tail padding; needs a parallel max-pool
+       pyramid in chunk.zig + snapshot hashing). Gates: zig build test
+       green (new regression test — flat odd-parity floor, center
+       column is exactly {sky, top-face color}; verified to FAIL
+       pre-fix); both --lod 0 sweeps byte-identical; def/l0f0 sweeps
+       diff on 0.05-1.0% of terrain pixels (caves byte-identical),
+       baselines regenerated as views_m37*; bench neutral (perf stat:
+       +0.5% instructions, branch-misses flat, wall time in noise).

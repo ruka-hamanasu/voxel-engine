@@ -902,9 +902,23 @@ const CellCtx = struct {
     bflanka: [2]i32,
     bflankb: [2]i32,
     bu: f32,
+    /// LOD boundary morph: exact fine top-face height of the fronting
+    /// fine column in coarse units, clamped into the topmost coarse
+    /// voxel [sky_y, sky_y + 1]; NaN = no ramp (missing/empty column).
+    /// The coarse top quantizes odd fine tops up by 1 fine voxel, so
+    /// the boundary cell ramps its top face from h_front (entry plane,
+    /// meeting the fine render) to the coarse top (exit plane) and
+    /// clips its topmost back face to match — the fine->coarse height
+    /// step never appears as a vertical face (a straight line on flat
+    /// odd-parity terrain). Interior runs keep conservative geometry.
+    h_front: f32,
 
     fn row(self: *const CellCtx, y: i32, t: f32) f32 {
         return rowAt(y, self.cam_y, self.f, t, self.hf);
+    }
+
+    fn rowF(self: *const CellCtx, y: f32, t: f32) f32 {
+        return rowAtF(y, self.cam_y, self.f, t, self.hf);
     }
 
     /// Light of the current column at y (camera-cell side faces only;
@@ -1035,6 +1049,7 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         .bflanka = .{ 0, 0 },
         .bflankb = .{ 0, 0 },
         .bu = 0,
+        .h_front = std.math.nan(f32),
     };
 
     // LOD boundary cell: locate the fine column the entry point backs
@@ -1054,6 +1069,12 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
             ctx.bsel = .{ 2 * ix + s, fz };
             ctx.bflanka = .{ 2 * ix + s - 1, fz };
             ctx.bflankb = .{ 2 * ix + s + 1, fz };
+        }
+        if (fine.?.columnAt(ctx.bsel[0], ctx.bsel[1])) |fc| {
+            if (fc.top_solid_y != world_mod.no_solid and ctx.sky_y >= 0) {
+                const tyc: f32 = @floatFromInt(ctx.sky_y);
+                ctx.h_front = std.math.clamp(@as(f32, @floatFromInt(fc.top_solid_y + 1)) * 0.5, tyc, tyc + 1);
+            }
         }
     }
 
@@ -1136,10 +1157,16 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
                 // fragment is actually exposed to.
                 var yy = seg_lo;
                 while (yy <= seg_hi) : (yy += 1) {
-                    if (!spans.spanOverlap(free, ctx.row(yy + 1, ctx.t0), ctx.row(yy, ctx.t0))) continue;
+                    // Topmost voxel: clip the riser to the exact fine
+                    // height (the ramp's front edge) instead of the
+                    // quantized coarse top; h_front == yy + 1 exactly
+                    // when the fine top already sits on an even plane.
+                    const r_top = if (yy == ctx.sky_y and !std.math.isNan(ctx.h_front)) ctx.rowF(ctx.h_front, ctx.t0) else ctx.row(yy + 1, ctx.t0);
+                    const r_bot = ctx.row(yy, ctx.t0);
+                    if (!spans.spanOverlap(free, r_top, r_bot)) continue;
                     const stops: [2]f32 = if (detail) ao.sideAoStopsFine(fine, ctx.bsel, ctx.bflanka, ctx.bflankb, yy, ctx.bu) else .{ 3, 3 };
                     const sky: u1 = if (!ctx.sky_on) 1 else boundarySky(fine, ctx.bsel, yy);
-                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = if (lit) boundaryLight(fine, ctx.bsel, yy) else .{}, .sky = sky });
+                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = r_top, .r1 = r_bot, .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = if (lit) boundaryLight(fine, ctx.bsel, yy) else .{}, .sky = sky });
                     if (free.isEmpty()) return;
                 }
             } else if (ctx.ncur) |*n| {
@@ -1244,6 +1271,11 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
     y = ctx.y_hi;
     // cur already covers y_hi after the upward walk's normal exit —
     // no fresh cursor scan needed.
+    // LOD boundary morph (per-cell, hoisted): the boundary cell's
+    // topmost top face ramps from the exact fine height at the entry
+    // plane up to the coarse top at the exit plane, so the 1-fine-voxel
+    // height quantization never reads as a vertical step.
+    const morph = ctx.bfine != null and !std.math.isNan(ctx.h_front);
     while (y >= ctx.y_lo) {
         const seg_hi = y;
         const seg_lo = @max(cur.lo, ctx.y_lo);
@@ -1256,7 +1288,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
                 (cur.idx == 0 or cur.runs[cur.idx - 1].palette_id == 0);
             if (above_air) {
                 const r_far = ctx.row(seg_hi + 1, ctx.t1);
-                const r_near = ctx.row(seg_hi + 1, ctx.t0);
+                const r_near = if (morph and seg_hi == ctx.sky_y) ctx.rowF(ctx.h_front, ctx.t0) else ctx.row(seg_hi + 1, ctx.t0);
                 if (spans.spanOverlap(free, r_far, r_near)) {
                     const stops: [2]f32 = if (detail) ao.faceAoStops(ctx.world, ctx.ix, ctx.iz, seg_hi + 1, ctx.ua, ctx.va, ctx.ub, ctx.vb) else .{ 3, 3 };
                     sink.emit(.{ .mat = cur.mat(), .face = top_face, .r0 = r_far, .r1 = r_near, .t = .{ ctx.t1, ctx.t0 }, .ao = .{ stops[1], stops[0] }, .light = if (lit) lighting.sampleLight(ctx.col, seg_hi + 1) else .{}, .sky = skyStop(ctx.sky_on, ctx.sky_y, seg_hi + 1) });
@@ -1447,6 +1479,38 @@ test "hole fill covers a missing fine chunk with the coarse world" {
         const sky = shade.skyColor(row, h);
         try std.testing.expectEqual(sky, fb_nofill[w / 2 * h + row]);
         try std.testing.expect(fb[w / 2 * h + row] != sky);
+    }
+}
+
+test "LOD boundary morph hides the coarse height quantization step" {
+    const allocator = std.testing.allocator;
+    const w = 64;
+    const h = 64;
+    // Flat floor with top solid voxel at fine y = 8: the top face at 9
+    // sits on an odd plane, so conservative coarse solidity renders the
+    // coarse floor one fine voxel higher (top face at 10). Without the
+    // boundary morph the handoff draws that step as a vertical riser
+    // (a straight side-face-shaded line across flat terrain); with it
+    // every non-sky pixel in the column is the floor's top-face color.
+    var fine = try World.init(allocator, 128, 32, 128);
+    defer fine.deinit();
+    try fine.fillBox(0, 0, 0, 128, 9, 128, 1);
+    const lod_mod = @import("lod.zig");
+    var coarse = try lod_mod.build(allocator, &fine);
+    defer coarse.deinit();
+
+    const cam: Camera = .{ .x = 8.5, .y = 20, .z = 64.5, .yaw = 0 };
+    var params: RenderParams = .{ .fog_density = 0, .fog_cutoff = 64, .light = false, .detail_dist = 0 };
+    params.lod_dists = .{32} ++ .{0} ** (max_lods - 1);
+    var renderer: Renderer = .{};
+    var fb: [w * h]u32 = undefined;
+    const lods = [_]*const World{&coarse};
+    renderer.render(&fb, w, h, &fine, &lods, cam, params, null);
+    const top_color = fb[w / 2 * h + h - 1];
+    for (0..h) |row| {
+        const c = fb[w / 2 * h + row];
+        if (c == shade.skyColor(row, h)) continue;
+        try std.testing.expectEqual(top_color, c);
     }
 }
 
