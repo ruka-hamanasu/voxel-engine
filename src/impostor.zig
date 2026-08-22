@@ -35,6 +35,9 @@ pub const max_levels = 8;
 /// — cascade or impostor — hands off where its cell covers f/72 px,
 /// i.e. at 72 * cell_size voxels.
 pub const handoff_per_cell: f32 = 72.0;
+/// Cells synthesized per interactive update (partial tiles stay
+/// invisible until complete).
+const synth_budget = 512;
 
 pub const Cell = struct { top_y: u16, mat: u8, stamp: u8 = 0 };
 
@@ -93,9 +96,6 @@ pub const Impostor = struct {
     bounds: ?[2]usize,
     levels: [max_levels]Level,
     n_levels: usize,
-    /// Cells synthesized per update (partial tiles stay invisible
-    /// until complete).
-    budget: usize,
     /// Borrowed synthesis pool; null runs inline (tests).
     pool: ?*pool_mod.Pool = null,
     in_flight: ?InFlight = null,
@@ -122,7 +122,6 @@ pub const Impostor = struct {
             .bounds = bounds,
             .levels = undefined,
             .n_levels = 0,
-            .budget = 512,
             .pool = pool,
         };
         errdefer self.deinit();
@@ -291,8 +290,7 @@ pub const Impostor = struct {
             const f = &self.in_flight.?;
             const lvl = &self.levels[f.level];
             const n = @min(remaining, cells_per_tile - f.next);
-            const size = @as(u32, 1) << lvl.shift;
-            const job: CellJob = .{ .gctx = self.gctx(), .tile = f.tile, .base_cx = f.tx * tile_cells, .base_cz = f.tz * tile_cells, .shift = lvl.shift, .size = size, .first = f.next, .last = f.next + n };
+            const job: CellJob = .{ .gctx = self.gctx(), .tile = f.tile, .base_cx = f.tx * tile_cells, .base_cz = f.tz * tile_cells, .shift = lvl.shift, .first = f.next, .last = f.next + n };
             pool_mod.dispatch(self.pool, &job, CellJob.run, job.items());
             f.next += n;
             remaining -= n;
@@ -314,7 +312,7 @@ pub const Impostor = struct {
     }
 
     pub fn update(self: *Impostor, cam: Camera) !void {
-        _ = try self.updateBudgeted(cam, self.budget);
+        _ = try self.updateBudgeted(cam, synth_budget);
     }
 
     /// Synchronous warm-up (startup, headless, bench): the resident
@@ -336,7 +334,6 @@ const CellJob = struct {
     base_cx: i32, // tile origin in cell coords
     base_cz: i32,
     shift: u5,
-    size: u32,
     first: usize,
     last: usize,
 
@@ -349,7 +346,7 @@ const CellJob = struct {
         for (begin..@min(begin + gran, self.last)) |idx| {
             const lx: i32 = @intCast(idx / tile_cells);
             const lz: i32 = @intCast(idx % tile_cells);
-            const c = gen.impostorCell(self.gctx, (self.base_cx + lx) << self.shift, (self.base_cz + lz) << self.shift, self.size);
+            const c = gen.impostorCell(self.gctx, (self.base_cx + lx) << self.shift, (self.base_cz + lz) << self.shift, @as(u32, 1) << self.shift);
             self.tile.cells[idx] = .{ .top_y = c.top_y, .mat = c.mat };
         }
     }

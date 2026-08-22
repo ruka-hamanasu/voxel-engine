@@ -125,7 +125,7 @@ pub fn rebuildShadeLut() void {
 /// full-density curve, so the haze tints the mid-range but emissives
 /// still converge to the fog color at the cutoff like everything
 /// else (the unblended haze read as too bright through fog).
-/// fogStopV interpolates between adjacent buckets — plain truncation
+/// fogStopsV interpolates between adjacent buckets — plain truncation
 /// left visible bands at the bucket boundaries while moving.
 pub const fog_buckets = 64;
 
@@ -247,10 +247,6 @@ pub fn applyGlowV(c: V4, light: lighting.LightSample) V4 {
     return @trunc(@min(c + light_v4[light.color_id] * @as(V4, @splat(f)), @as(V4, @splat(255.0))));
 }
 
-pub fn applyGlow(c: u32, light: lighting.LightSample) u32 {
-    return packRgb(applyGlowV(unpackRgb(c), light));
-}
-
 /// Fog both stops of a segment: bucket the distances, lerp toward the
 /// material's (pre-collapsed) fog destination. Per-stop so the
 /// gradient fill lerps between fogged endpoints. LUT entries span
@@ -273,15 +269,6 @@ pub fn fogStopsV(mat: u8, ts: [2]f32, cs: [2]V4, params: RenderParams) [2]V4 {
         out[i] = lerpColorV(cs[i], dest, factor);
     }
     return out;
-}
-
-/// Fog one shaded stop (scalar wrapper around fogStopsV).
-pub fn fogStopV(mat: u8, t: f32, c: V4, params: RenderParams) V4 {
-    return fogStopsV(mat, .{ t, t }, .{ c, c }, params)[0];
-}
-
-pub fn fogStop(mat: u8, t: f32, c: u32, params: RenderParams) u32 {
-    return packRgb(fogStopV(mat, t, unpackRgb(c), params));
 }
 
 pub const max_sky_height = 4096;

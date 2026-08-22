@@ -70,16 +70,6 @@ pub const SpanList = struct {
 
 const ConstSrc = struct {
     c: u32,
-
-    fn seek(self: *ConstSrc, row: u16) void {
-        _ = self;
-        _ = row;
-    }
-
-    fn next(self: *ConstSrc, row: u16) u32 {
-        _ = row;
-        return self.c;
-    }
 };
 
 /// 16.16 fixed-point vertical lerp from c0 (at r0) to c1 (at r1). The
@@ -117,15 +107,6 @@ const GradSrc = struct {
 
 pub const SkySrc = struct {
     sky: []const u32,
-
-    fn seek(self: *SkySrc, row: u16) void {
-        _ = self;
-        _ = row;
-    }
-
-    fn next(self: *SkySrc, row: u16) u32 {
-        return self.sky[row];
-    }
 };
 
 /// The single pixel-write path: claim, gradient claim, and the sky

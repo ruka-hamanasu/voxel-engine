@@ -69,10 +69,7 @@ pub fn encodeDenseColumn(world: *world_mod.World, x: i32, z: i32, dense: []const
         try runs.append(world.allocator, .{ .count = 1, .palette_id = mat });
     }
     const owned = try runs.toOwnedSlice(world.allocator);
-    if (keep_light)
-        world.setColumnRunsKeepLight(x, z, owned)
-    else
-        world.setColumnRuns(x, z, owned);
+    world.setColumnRuns(x, z, owned, keep_light);
 }
 
 test "emit run-encodes dense column" {

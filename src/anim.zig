@@ -5,7 +5,7 @@ const world_mod = @import("world.zig");
 /// brightness per frame from the accumulated render time. Only rgb is
 /// rewritten — the emissive flag never changes, so the flood's seed set
 /// is stable and no relight is triggered; the cast light pulses for
-/// free because the renderer's applyGlow looks the tint color up from
+/// free because the renderer's applyGlowV looks the tint color up from
 /// the palette per frame.
 ///
 /// Every pulse is (1 - cos)-shaped, so t = 0 is the identity for all

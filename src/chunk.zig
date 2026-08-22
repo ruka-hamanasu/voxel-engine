@@ -24,14 +24,14 @@ const chunk_w = world_mod.chunk_w;
 /// lands exactly the fixpoint a single flood over the resident set
 /// computes. builder must be a 64x64 tile over `world`. The fill and
 /// encode ride `pool` when given (plans/DISTANCE.md D4).
-pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params, pool: ?*pool_mod.Pool) !void {
-    std.debug.assert(builder.tw == chunk_w and builder.td == chunk_w);
-    _ = try world.ensureChunk(cx, cz);
+/// The chunk's footprint as a world-space box (full height), clamped
+/// to the bounded world's edge; unbounded worlds get the full 64x64.
+fn chunkBox(world: *const World, cx: i32, cz: i32) world_mod.Region {
     var tw: usize = chunk_w;
     var td: usize = chunk_w;
     if (world.w) |w| tw = @min(tw, w - @as(usize, @intCast(cx)) * chunk_w);
     if (world.d) |d| td = @min(td, d - @as(usize, @intCast(cz)) * chunk_w);
-    const box: world_mod.Region = .{
+    return .{
         .x0 = cx * chunk_w,
         .y0 = 0,
         .z0 = cz * chunk_w,
@@ -39,7 +39,13 @@ pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: 
         .y1 = @intCast(world.h),
         .z1 = cz * chunk_w + @as(i32, @intCast(td)),
     };
-    terrain.genTileFillPooled(pool, ctx, builder, box.x0, box.z0, td, 0, tw * td, true);
+}
+
+pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params, pool: ?*pool_mod.Pool) !void {
+    std.debug.assert(builder.tw == chunk_w and builder.td == chunk_w);
+    _ = try world.ensureChunk(cx, cz);
+    const box = chunkBox(world, cx, cz);
+    terrain.genTileFillPooled(pool, ctx, builder, box.x0, box.z0, @intCast(box.z1 - box.z0), 0, @as(usize, @intCast(box.x1 - box.x0)) * @as(usize, @intCast(box.z1 - box.z0)), true);
     try commitChunk(world, builder, cx, cz, light, pool);
 }
 
@@ -51,13 +57,10 @@ pub fn loadChunk(world: *World, ctx: *const terrain.Ctx, builder: *Builder, cx: 
 /// (it propagates across chunk boundaries).
 pub fn commitChunk(world: *World, builder: *Builder, cx: i32, cz: i32, light: ?lighting.Params, pool: ?*pool_mod.Pool) !void {
     _ = try world.ensureChunk(cx, cz);
-    var tw: usize = chunk_w;
-    var td: usize = chunk_w;
-    if (world.w) |w| tw = @min(tw, w - @as(usize, @intCast(cx)) * chunk_w);
-    if (world.d) |d| td = @min(td, d - @as(usize, @intCast(cz)) * chunk_w);
-    try terrain.emitTilePooled(pool, builder, cx * chunk_w, cz * chunk_w, tw, td, false);
+    const box = chunkBox(world, cx, cz);
+    try terrain.emitTilePooled(pool, builder, box.x0, box.z0, @intCast(box.x1 - box.x0), @intCast(box.z1 - box.z0), false);
     if (light) |params| {
-        _ = try lighting.relight(world, world.allocator, .{ .x0 = cx * chunk_w, .y0 = 0, .z0 = cz * chunk_w, .x1 = cx * chunk_w + @as(i32, @intCast(tw)), .y1 = @intCast(world.h), .z1 = cz * chunk_w + @as(i32, @intCast(td)) }, params);
+        _ = try lighting.relight(world, world.allocator, box, params);
     }
 }
 
@@ -127,6 +130,32 @@ const PyrJob = struct {
     }
 };
 
+/// Dense tile plus its dimensions, as passed down the coarse pyramid.
+pub const DenseTile = struct { data: []const u8, side: usize, h: usize };
+
+/// Downsample a dense tile through `level` halving steps (pyr[l] is
+/// the level-(l+1) scratch) and return the final coarse tile. Shared
+/// by the coarse-chunk pipelines: loadCoarseChunk/synthCoarseColumn
+/// run inline, the streamer's sliced pipeline rides its pool.
+pub fn pyramidDown(pool: ?*pool_mod.Pool, src: DenseTile, pyr: [][]u8, level: u32) DenseTile {
+    var cur = src;
+    for (0..level) |l| {
+        downsampleDensePooled(pool, cur.data, cur.side, cur.h, pyr[l]);
+        cur = .{ .data = pyr[l], .side = cur.side / 2, .h = (cur.h + 1) / 2 };
+    }
+    return cur;
+}
+
+/// Copy a coarse pyramid tile's columns into the builder tile at tile
+/// position (ttx, ttz), cper columns per tile side.
+pub fn copyTileColumns(builder: *Builder, tile: DenseTile, cper: usize, ttx: usize, ttz: usize) void {
+    for (0..tile.side) |lx| {
+        for (0..tile.side) |lz| {
+            @memcpy(builder.at(ttx * cper + lx, ttz * cper + lz), tile.data[(lx * tile.side + lz) * tile.h ..][0..tile.h]);
+        }
+    }
+}
+
 /// Dense tile side/height at level L for a 64-wide chunk: 64/2^L
 /// columns, ceil(fine_h/2^L) voxels.
 pub fn levelDims(fine_h: usize, level: u32) struct { side: usize, h: usize } {
@@ -153,18 +182,7 @@ pub fn loadCoarseChunk(coarse: *World, ctx: *const terrain.Ctx, fine_builder: *B
     std.debug.assert(fine_builder.tw == chunk_w and fine_builder.td == chunk_w);
     std.debug.assert(coarse_builder.tw == chunk_w and coarse_builder.td == chunk_w);
     _ = try coarse.ensureChunk(cx, cz);
-    var tw: usize = chunk_w;
-    var td: usize = chunk_w;
-    if (coarse.w) |w| tw = @min(tw, w - @as(usize, @intCast(cx)) * chunk_w);
-    if (coarse.d) |d| td = @min(td, d - @as(usize, @intCast(cz)) * chunk_w);
-    const box: world_mod.Region = .{
-        .x0 = cx * chunk_w,
-        .y0 = 0,
-        .z0 = cz * chunk_w,
-        .x1 = cx * chunk_w + @as(i32, @intCast(tw)),
-        .y1 = @intCast(coarse.h),
-        .z1 = cz * chunk_w + @as(i32, @intCast(td)),
-    };
+    const box = chunkBox(coarse, cx, cz);
     const tiles = @as(usize, 1) << shift;
     const cper = @as(usize, chunk_w) >> shift;
     var ttx: usize = 0;
@@ -176,24 +194,11 @@ pub fn loadCoarseChunk(coarse: *World, ctx: *const terrain.Ctx, fine_builder: *B
             terrain.genTileFill(ctx, fine_builder, tx0, tz0, chunk_w, 0, chunk_w * chunk_w, caves);
             // Pyramid down to the target level, then copy the tile's
             // coarse columns into the coarse builder tile.
-            var src = fine_builder.dense;
-            var ss: usize = chunk_w;
-            var sh: usize = fine_h;
-            for (0..level) |l| {
-                downsampleDense(src, ss, sh, pyr[l]);
-                src = pyr[l];
-                ss /= 2;
-                sh = (sh + 1) / 2;
-            }
-            const dim = levelDims(fine_h, level);
-            for (0..dim.side) |lx| {
-                for (0..dim.side) |lz| {
-                    @memcpy(coarse_builder.at(ttx * cper + lx, ttz * cper + lz), src[(lx * dim.side + lz) * dim.h ..][0..dim.h]);
-                }
-            }
+            const p = pyramidDown(null, .{ .data = fine_builder.dense, .side = chunk_w, .h = fine_h }, pyr, level);
+            copyTileColumns(coarse_builder, p, cper, ttx, ttz);
         }
     }
-    try terrain.emitTile(coarse_builder, box.x0, box.z0, tw, td, false);
+    try terrain.emitTile(coarse_builder, box.x0, box.z0, @intCast(box.x1 - box.x0), @intCast(box.z1 - box.z0), false);
     if (light) |params| {
         _ = try lighting.relight(coarse, coarse.allocator, box, params);
     }
@@ -217,17 +222,9 @@ pub fn synthCoarseColumn(ctx: *const terrain.Ctx, level: u32, fine_h: usize, ccx
             if (caves) terrain.genColumn(ctx, fx, fz, col) else terrain.genColumnFast(ctx, fx, fz, col);
         }
     }
-    var src = grid;
-    var ss: usize = span;
-    var sh: usize = fine_h;
-    for (0..level) |l| {
-        downsampleDense(src, ss, sh, pyr[l]);
-        src = pyr[l];
-        ss /= 2;
-        sh = (sh + 1) / 2;
-    }
-    std.debug.assert(out.len == sh);
-    @memcpy(out, src[0..sh]);
+    const p = pyramidDown(null, .{ .data = grid, .side = span, .h = fine_h }, pyr, level);
+    std.debug.assert(out.len == p.h);
+    @memcpy(out, p.data[0..p.h]);
 }
 
 /// Re-synthesize from generation the resident coarse columns covering
@@ -271,11 +268,7 @@ pub fn unloadChunk(world: *World, cx: i32, cz: i32, params: ?lighting.Params) !v
     const chunk = world.chunks.get(world_mod.chunkKey(cx, cz)) orelse return;
     try world.blankChunk(chunk);
     if (params) |p| {
-        const x0 = cx * chunk_w;
-        const z0 = cz * chunk_w;
-        const x1 = if (world.w) |w| @min(x0 + chunk_w, @as(i32, @intCast(w))) else x0 + chunk_w;
-        const z1 = if (world.d) |d| @min(z0 + chunk_w, @as(i32, @intCast(d))) else z0 + chunk_w;
-        _ = try lighting.relight(world, world.allocator, .{ .x0 = x0, .y0 = 0, .z0 = z0, .x1 = x1, .y1 = @intCast(world.h), .z1 = z1 }, p);
+        _ = try lighting.relight(world, world.allocator, chunkBox(world, cx, cz), p);
     }
     world.freeChunk(cx, cz);
 }

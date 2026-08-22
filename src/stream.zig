@@ -423,23 +423,9 @@ pub const Streamer = struct {
                 if (f.level > 0) {
                     // Pyramid the fine tile down to the target level
                     // and copy its coarse columns into the coarse tile.
-                    var src = self.fine_builder.dense;
-                    var ss: usize = chunk_w;
-                    var sh: usize = self.fine.h;
-                    for (0..f.level) |l| {
-                        chunk_mod.downsampleDensePooled(self.pool, src, ss, sh, self.tile_pyr[l]);
-                        src = self.tile_pyr[l];
-                        ss /= 2;
-                        sh = (sh + 1) / 2;
-                    }
-                    const dim = chunk_mod.levelDims(self.fine.h, f.level);
+                    const p = chunk_mod.pyramidDown(self.pool, .{ .data = self.fine_builder.dense, .side = chunk_w, .h = self.fine.h }, self.tile_pyr, f.level);
                     const cper = @as(usize, chunk_w) >> shift;
-                    const cb = &self.coarse_builders[f.level - 1];
-                    for (0..dim.side) |lx| {
-                        for (0..dim.side) |lz| {
-                            @memcpy(cb.at(ttx * cper + lx, ttz * cper + lz), src[(lx * dim.side + lz) * dim.h ..][0..dim.h]);
-                        }
-                    }
+                    chunk_mod.copyTileColumns(&self.coarse_builders[f.level - 1], p, cper, ttx, ttz);
                 }
                 f.tile += 1;
                 f.col = 0;

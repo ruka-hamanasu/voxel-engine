@@ -43,12 +43,6 @@ pub const LightSample = struct {
     dir: Dir = .none,
 };
 
-/// color_id is the seeding material's palette id for now; this helper
-/// is the indirection point for milestone 11's dedicated light palette.
-pub fn lightColor(color_id: u8) u32 {
-    return world_mod.palette[color_id].rgb;
-}
-
 /// Light at world height y in a column: linear scan of the (few) light
 /// runs, default outside coverage. For monotonic y walks the renderer
 /// uses a lockstep LightCursor instead.
@@ -125,6 +119,11 @@ const Scratch = struct {
         const lx: u32 = @intCast(x - self.x0);
         const lz: u32 = @intCast(z - self.z0);
         return (lx * @as(u32, @intCast(self.zd)) + lz) * @as(u32, @intCast(self.h)) + @as(u32, @intCast(y));
+    }
+
+    fn contains(self: *const Scratch, nx: i64, ny: i64, nz: i64) bool {
+        return nx >= self.x0 and ny >= 0 and nz >= self.z0 and
+            nx < self.x0 + @as(i64, @intCast(self.xd)) and ny < self.h and nz < self.z0 + @as(i64, @intCast(self.zd));
     }
 
     fn coords(self: *const Scratch, vi: u32) struct { i32, i32, i32 } {
@@ -233,7 +232,7 @@ fn propagate(world: *const World, s: *Scratch, queue: *std.ArrayList(u32), alloc
             const nx = @as(i64, x) + off[0];
             const ny = @as(i64, y) + off[1];
             const nz = @as(i64, z) + off[2];
-            if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + @as(i64, @intCast(s.xd)) and ny < s.h and nz < s.z0 + @as(i64, @intCast(s.zd))) {
+            if (s.contains(nx, ny, nz)) {
                 const nvi = s.index(@intCast(nx), @intCast(ny), @intCast(nz));
                 const nm = world.getResident(@intCast(nx), @intCast(ny), @intCast(nz));
                 if (nm != null and nm.? == 0) {
@@ -478,7 +477,7 @@ fn clearChain(s: *Scratch, start: u32, params: Params, reseeds: *std.ArrayList(u
             const nx = @as(i64, x) + off[0];
             const ny = @as(i64, y) + off[1];
             const nz = @as(i64, z) + off[2];
-            if (nx >= s.x0 and ny >= 0 and nz >= s.z0 and nx < s.x0 + @as(i64, @intCast(s.xd)) and ny < s.h and nz < s.z0 + @as(i64, @intCast(s.zd))) {
+            if (s.contains(nx, ny, nz)) {
                 const nvi = s.index(@intCast(nx), @intCast(ny), @intCast(nz));
                 const n = s.get(nvi);
                 if (n.intensity != 0) {

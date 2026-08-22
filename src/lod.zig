@@ -1,5 +1,6 @@
 const std = @import("std");
 const world_mod = @import("world.zig");
+const builder = @import("gen/builder.zig");
 
 const World = world_mod.World;
 
@@ -56,26 +57,10 @@ fn rebuildColumn(lod: *World, fine: *const World, cx: i32, cz: i32, dense: []u8)
             if (dense[yc] != 0) break;
         }
     }
-    // Run-encode top-to-bottom (same rule as gen.Builder.emit).
-    var runs: std.ArrayList(world_mod.MatRun) = .empty;
-    errdefer runs.deinit(lod.allocator);
-    var y: usize = lh;
-    while (y > 0) {
-        y -= 1;
-        const mat = dense[y];
-        if (runs.items.len > 0) {
-            const last = &runs.items[runs.items.len - 1];
-            if (last.palette_id == mat and last.count < 255) {
-                last.count += 1;
-                continue;
-            }
-        }
-        try runs.append(lod.allocator, .{ .count = 1, .palette_id = mat });
-    }
     // Keep the old light runs: the caller always follows with a
     // coarse relight, whose stale-clear pass needs them to find chains
     // orphaned by removed content (e.g. a dug-out crystal).
-    lod.setColumnRunsKeepLight(cx, cz, try runs.toOwnedSlice(lod.allocator));
+    try builder.encodeDenseColumn(lod, cx, cz, dense, true);
 }
 
 /// Build the coarse world for a bounded fine world.

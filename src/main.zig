@@ -102,9 +102,9 @@ pub fn main(init: std.process.Init) !void {
     const bounded = res.args.@"world-w" != null;
     if (res.args.@"world-w") |w| opts.w = w;
     if (res.args.@"world-d") |d| opts.d = d;
+    if (res.args.@"world-h") |h| opts.h = h;
     if (opts.h == 0 or opts.h > 65535 or (bounded and (opts.w == 0 or opts.d == 0)))
         return error.BadWorldSize;
-    if (res.args.@"world-h") |h| opts.h = h;
     const load_budget = res.args.@"load-budget" orelse 1200;
     const generator = res.args.gen orelse .terrain;
     const headless_path = res.args.headless;
@@ -509,7 +509,6 @@ pub fn main(init: std.process.Init) !void {
             render.rebuildShadeLut();
         }
 
-        rparams.time_s = time_s;
         rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams, imp_ptr);
         rnd.transpose(staging, framebuffer, render_w, render_h);
 

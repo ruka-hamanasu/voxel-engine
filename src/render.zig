@@ -107,7 +107,6 @@ pub const RenderParams = struct {
     /// false = treat every column as unlit (identity tint), ignoring
     /// the flood-filled light runs; runtime toggle for the L hotkey.
     light: bool = true,
-    time_s: f64 = 0.0,
     /// March handoff distances into each coarse LOD level: past
     /// lod_dists[i] (snapped to a coarse-cell entry by lodBoundary,
     /// keeping each coarse voxel whole) the ray continues in the
@@ -135,9 +134,7 @@ pub const RenderParams = struct {
         const d = @min(dist, max_dist);
         var chain = lodChainFor(d);
         // A handoff at or past the cutoff is never marched through.
-        for (&chain) |*h| {
-            if (h.* >= d) h.* = 0;
-        }
+        impostorTruncate(&chain, d);
         return .{
             .fog_density = clearKFor(d) / d,
             .fog_cutoff = d,
@@ -290,14 +287,12 @@ const Holes = struct {
 /// point at distance t (lodBoundary's snap applied to a single cell):
 /// hole-fill ranges snap to coarse-cell planes so every coarse voxel
 /// renders whole.
-fn cellEntryAt(cam_x: f32, cam_z: f32, dx: f32, dz: f32, t: f32, scale: f32) f32 {
+fn cellEdgeAt(comptime edge: enum { entry, exit }, cam_x: f32, cam_z: f32, dx: f32, dz: f32, t: f32, scale: f32) f32 {
     const dda = DdaIterator.init(cam_x * scale + dx * scale * t, cam_z * scale + dz * scale * t, dx * scale, dz * scale, std.math.inf(f32));
-    return t + @max(prevCross(dda.t_max_x, dda.t_delta_x), prevCross(dda.t_max_z, dda.t_delta_z));
-}
-
-fn cellExitAt(cam_x: f32, cam_z: f32, dx: f32, dz: f32, t: f32, scale: f32) f32 {
-    const dda = DdaIterator.init(cam_x * scale + dx * scale * t, cam_z * scale + dz * scale * t, dx * scale, dz * scale, std.math.inf(f32));
-    return t + dda.t1();
+    return switch (edge) {
+        .entry => t + @max(prevCross(dda.t_max_x, dda.t_delta_x), prevCross(dda.t_max_z, dda.t_delta_z)),
+        .exit => t + dda.t1(),
+    };
 }
 
 /// LOD chain layout for one ray: handoff distances t_b[1..n] into
@@ -324,9 +319,7 @@ fn lodChain(params: RenderParams, n_worlds: usize, cam_x: f32, cam_z: f32, dx: f
 /// mode. Unlike lodBoundary no center-distance walk is needed: the
 /// containing cell renders simple, so its entry is the split.
 fn detailBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, detail_dist: f32) f32 {
-    const dda = DdaIterator.init(cam_x + dx * detail_dist, cam_z + dz * detail_dist, dx, dz, std.math.inf(f32));
-    const t_enter = @max(prevCross(dda.t_max_x, dda.t_delta_x), prevCross(dda.t_max_z, dda.t_delta_z));
-    return @max(detail_dist + t_enter, 0.0);
+    return @max(cellEdgeAt(.entry, cam_x, cam_z, dx, dz, detail_dist, 1.0), 0.0);
 }
 
 /// Renderer instance dispatching to the shared persistent worker pool
@@ -488,11 +481,9 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
     // the handoff past the cutoff) leaves the cascade's range ends at
     // limit — byte-identical to no impostor.
     var casc_limit = limit;
-    var t_imp = limit;
     if (imp) |ip| {
         if (ip.levels[0].handoff < limit) {
-            t_imp = lodBoundary(cam.x, cam.z, dx, dz, ip.levels[0].handoff, limit, ip.levels[0].inv_cell);
-            casc_limit = t_imp;
+            casc_limit = lodBoundary(cam.x, cam.z, dx, dz, ip.levels[0].handoff, limit, ip.levels[0].inv_cell);
         }
     }
     // Shading-detail split (RenderParams.detail_dist): the mode flips
@@ -540,7 +531,7 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
     }
     if (imp) |ip| {
         var lvl: usize = 0;
-        var t_begin = t_imp + lod_eps;
+        var t_begin = casc_limit + lod_eps;
         while (lvl < ip.n_levels and t_begin < limit and !free.isEmpty()) : (lvl += 1) {
             const t_end = if (lvl + 1 < ip.n_levels)
                 lodBoundary(cam.x, cam.z, dx, dz, ip.levels[lvl + 1].handoff, limit, ip.levels[lvl + 1].inv_cell)
@@ -569,15 +560,18 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
 /// not worth AO/light zipper setup.
 fn fillHoles(fb: []u32, height: usize, sx: usize, world: *const World, lods: []const *const World, cam: Camera, f: f32, s_max: f32, dx: f32, dz: f32, fog_ray: FogRay, range_hi: f32, lvl0: usize, n_lvls: usize, holes: *const Holes, free: *SpanList, params: RenderParams) void {
     var lvl = lvl0;
+    var scale: f32 = 1.0;
+    for (0..lvl0) |_| scale *= 0.5;
     var cur = holes.*;
-    while (cur.n > 0 and lvl <= n_lvls and !free.isEmpty()) : (lvl += 1) {
-        var scale: f32 = 1.0;
-        for (0..lvl) |_| scale *= 0.5;
+    while (cur.n > 0 and lvl <= n_lvls and !free.isEmpty()) : ({
+        lvl += 1;
+        scale *= 0.5;
+    }) {
         const cfg: MarchCfg = .{ .world = lods[lvl - 1], .fine = if (lvl == 1) world else lods[lvl - 2], .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
         var next: Holes = .{};
         for (0..cur.n) |k| {
-            const a = @max(cellEntryAt(cam.x, cam.z, dx, dz, cur.t0[k], scale), 0.0);
-            const b = @min(cellExitAt(cam.x, cam.z, dx, dz, cur.t1[k], scale), range_hi);
+            const a = @max(cellEdgeAt(.entry, cam.x, cam.z, dx, dz, cur.t0[k], scale), 0.0);
+            const b = @min(cellEdgeAt(.exit, cam.x, cam.z, dx, dz, cur.t1[k], scale), range_hi);
             if (!(b > a)) continue;
             marchRange(fb, height, sx, cfg, if (a > 0) a + lod_eps else 0, b, free, params, true, false, &next);
         }
@@ -642,33 +636,22 @@ fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, 
         // single Column (the macro grid stays L1-resident). Exact:
         // h_lo > mmax + 1 implies y_lo > top_solid for every column in
         // the group, the per-column sky-skip's own condition.
-        if (world.macro_ok) {
-            const t0c = @max(t0, 1e-4); // processCell's own clamp
-            const h_lo = cfg.cam_y - @max(cfg.s_max * t0c, cfg.s_max * t1);
-            const mmax = world.macroMax(dda.ix, dda.iz) orelse {
-                // Out of bounds is genuinely empty; in bounds but not
-                // resident is a still-generating hole worth covering.
-                if (holes) |h| {
-                    if (world.cellMissing(dda.ix, dda.iz)) h.add(t0, t1);
-                }
-                dda.advance();
-                no_cull = false;
-                continue;
-            };
-            if (h_lo > @as(f32, @floatFromInt(mmax)) + 1.0) {
-                dda.advance();
-                no_cull = false;
-                continue;
+        const t0c = @max(t0, 1e-4); // processCell's own clamp
+        const h_lo = cfg.cam_y - @max(cfg.s_max * t0c, cfg.s_max * t1);
+        const mmax = world.macroMax(dda.ix, dda.iz) orelse {
+            // Out of bounds is genuinely empty; in bounds but not
+            // resident is a still-generating hole worth covering.
+            if (holes) |h| {
+                if (world.cellMissing(dda.ix, dda.iz)) h.add(t0, t1);
             }
-        } else if (holes) |h| {
-            // No macro grid: processCell's null-column early-out is the
-            // skip path, so test residency here to catch the hole.
-            if (world.cellMissing(dda.ix, dda.iz)) {
-                h.add(t0, t1);
-                dda.advance();
-                no_cull = false;
-                continue;
-            }
+            dda.advance();
+            no_cull = false;
+            continue;
+        };
+        if (h_lo > @as(f32, @floatFromInt(mmax)) + 1.0) {
+            dda.advance();
+            no_cull = false;
+            continue;
         }
         processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cfg.cam_x, cfg.cam_y, cfg.cam_z, cfg.f, cfg.s_max, cfg.dx, cfg.dz, t0, t1, dda.axis, no_cull, cfg.fine, free, params, cfg.fog, detail);
         no_cull = false;
@@ -764,7 +747,7 @@ fn rowAt(y: i32, cam_y: f32, f: f32, t: f32, hf: f32) f32 {
     // differently than (y - cam_y) * f / t and flips tie-break rows
     // when the camera sits at an exact integer height. Keep the
     // original op sequence.
-    return hf * 0.5 - (@as(f32, @floatFromInt(y)) - cam_y) * f / t;
+    return rowAtF(@floatFromInt(y), cam_y, f, t, hf);
 }
 
 /// Visible face fragment produced by segment generation; the single
@@ -879,8 +862,8 @@ const CellCtx = struct {
     nlight_hi: i32,
     /// Analytic sky (milestone 11): sky_on gates the whole path
     /// (params.light); sky_y is this column's cached topmost solid
-    /// (-1 when fully air), nsky_y the previous DDA cell's. An air
-    /// cell at y is sky-lit iff y > its column's sky_y — side faces
+    /// (the all-air early-out keeps it valid), nsky_y the previous
+    /// DDA cell's (-1 when fully air). An air cell at y is sky-lit iff y > its column's sky_y — side faces
     /// sample the NEIGHBOR column (the air in front of the face, so a
     /// hillside above the adjacent terrain is lit), top/bottom faces
     /// their own column one voxel out.
@@ -1031,7 +1014,7 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         .nlight_lo = 0,
         .nlight_hi = -1,
         .sky_on = params.light,
-        .sky_y = if (col.top_solid_y == world_mod.no_solid) -1 else col.top_solid_y,
+        .sky_y = col.top_solid_y,
         .nsky_y = -1,
         .no_cull = no_cull,
         .bfine = null,

@@ -1,5 +1,19 @@
 # Refactor pass (pre-D5)
 
+## Status
+
+- **R1: COMPLETED.** All R1.1-R1.4 items done (uncommitted). Gates:
+  `zig build test` green; all four sweeps byte-identical to
+  views_m39*. `--world-h 0` now returns `error.BadWorldSize` (was a
+  terrain assert). +121/-250 lines. Adjustments vs the item list:
+  `macro_ok` removal also dropped the `updateMacro` guard (world.zig);
+  `chunkBox` covers 4 clamp copies (loadCoarseChunk had a 4th);
+  `shadeAt` kept (4 test uses); the merged `setColumnRuns` takes
+  `keep_light: bool` with no wrappers (callers updated);
+  cellEntryAt/cellExitAt became one `cellEdgeAt` with a comptime edge.
+- R2: not started.
+- R3: not started.
+
 Simplification pass ahead of the DISTANCE.md D5 work, from a three-way
 audit of src/. Gates after every phase: `zig build test` green and all
 four PPM sweeps byte-identical (l0f0/lod0 pinned configs, def/stream vs

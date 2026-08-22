@@ -219,9 +219,6 @@ pub const World = struct {
     allocator: std.mem.Allocator,
     /// Column.solid_mask is maintained only when h <= 64.
     masks_ok: bool,
-    /// The 8x8-group macro_max grids are valid when h fits the u16
-    /// top_solid_y cache (h <= 65535), i.e. always.
-    macro_ok: bool,
     /// Bounding box (half-open) of everything touched by set/fillBox
     /// since the last takeDirty; consumed by milestone 10's relight.
     dirty: ?Region = null,
@@ -301,7 +298,6 @@ const Memo = struct {
             .chunks = ChunkMap.init(allocator),
             .allocator = allocator,
             .masks_ok = h <= 64,
-            .macro_ok = h <= std.math.maxInt(u16),
         };
         errdefer world.deinit();
         if (w) |bw| {
@@ -428,7 +424,6 @@ const Memo = struct {
 
     /// Recompute one 8x8 group's max top_solid_y after a column change.
     fn updateMacro(self: *World, x: i32, z: i32) void {
-        if (!self.macro_ok) return;
         const chunk = self.chunkAt(x, z).?;
         const lx = (@as(usize, @intCast(x & 63)) >> 3) << 3;
         const lz = (@as(usize, @intCast(z & 63)) >> 3) << 3;
@@ -450,7 +445,7 @@ const Memo = struct {
 
     /// Max solid y of the 8x8 group holding (x, z); null when out of
     /// bounds or the chunk is not resident (all air: the march may
-    /// always skip such cells). Meaningful only when macro_ok.
+    /// always skip such cells).
     pub inline fn macroMax(self: *const World, x: i32, z: i32) ?u16 {
         if (!self.inBounds(x, z)) return null;
         const chunk = self.chunkAt(x, z) orelse return null;
@@ -483,25 +478,19 @@ const Memo = struct {
         return &chunk.columns[@as(usize, @intCast(x & 63)) * chunk_w + @as(usize, @intCast(z & 63))];
     }
 
-    pub fn setColumnRuns(self: *World, x: i32, z: i32, runs: []MatRun) void {
+    /// keep_light preserves the column's light runs: chunk loads write
+    /// terrain over an air column whose stored flood (the pre-gen field)
+    /// the following relight's stale-clear pass still needs to find the
+    /// chains detouring through the chunk (chunk.loadChunk). Transient
+    /// state: the relight re-encodes it.
+    pub fn setColumnRuns(self: *World, x: i32, z: i32, runs: []MatRun, keep_light: bool) void {
         const col = self.columnAtMut(x, z).?;
-        if (col.light) |l| self.allocator.free(l);
-        col.light = null;
-        col.light_base_y = 0;
-        col.light_lo = 0;
-        self.installRuns(col, runs);
-        col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
-        if (self.masks_ok) col.solid_mask = computeMask(col.runs, self.h);
-        self.updateMacro(x, z);
-    }
-
-    /// setColumnRuns variant that PRESERVES the light runs: chunk
-    /// loads write terrain over an air column whose stored flood (the
-    /// pre-gen field) the following relight's stale-clear pass still
-    /// needs to find the chains detouring through the chunk
-    /// (chunk.loadChunk). Transient state: the relight re-encodes it.
-    pub fn setColumnRunsKeepLight(self: *World, x: i32, z: i32, runs: []MatRun) void {
-        const col = self.columnAtMut(x, z).?;
+        if (!keep_light) {
+            if (col.light) |l| self.allocator.free(l);
+            col.light = null;
+            col.light_base_y = 0;
+            col.light_lo = 0;
+        }
         self.installRuns(col, runs);
         col.top_solid_y = if (topSolidY(col, @intCast(self.h))) |y| @intCast(y) else no_solid;
         if (self.masks_ok) col.solid_mask = computeMask(col.runs, self.h);
@@ -520,16 +509,7 @@ const Memo = struct {
     }
 
     pub inline fn get(self: *const World, x: i32, y: i32, z: i32) u8 {
-        if (y < 0) return 0;
-        const uy: usize = @intCast(y);
-        if (uy >= self.h) return 0;
-        const col = self.columnAt(x, z) orelse return 0;
-        var depth: usize = self.h - 1 - uy;
-        for (col.runs) |run| {
-            if (depth < run.count) return run.palette_id;
-            depth -= run.count;
-        }
-        return 0;
+        return self.getResident(x, y, z) orelse 0;
     }
 
     /// Material at (x, y, z), or null when the column's chunk is not
@@ -654,22 +634,6 @@ const Memo = struct {
         if (any) self.markDirty(.{ .x0 = xa, .y0 = ya, .z0 = za, .x1 = xb, .y1 = yb, .z1 = zb });
     }
 
-    pub fn buildDemoRoom(allocator: std.mem.Allocator) !World {
-        var world = try World.init(allocator, 32, 16, 32);
-        errdefer world.deinit();
-        try world.fillBox(4, 0, 4, 28, 1, 28, 1); // floor
-        try world.fillBox(4, 1, 4, 5, 10, 28, 2); // x=4 wall
-        try world.fillBox(27, 1, 4, 28, 10, 28, 2); // x=27 wall
-        try world.fillBox(4, 1, 4, 28, 10, 5, 2); // z=4 wall
-        try world.fillBox(4, 1, 27, 28, 10, 28, 2); // z=27 wall
-        try world.fillBox(19, 1, 27, 23, 5, 28, 0); // arch opening, lower
-        try world.fillBox(20, 5, 27, 22, 7, 28, 0); // arch opening, stepped top
-        try world.fillBox(11, 1, 15, 14, 9, 17, 6); // marble pillar
-        try world.fillBox(8, 1, 20, 10, 3, 22, 5); // blue block
-        try world.fillBox(21, 1, 8, 23, 2, 10, 4); // green block
-        try world.fillBox(9, 1, 9, 10, 2, 10, 3); // sand block
-        return world;
-    }
 };
 
 fn expectCoverage(world: *const World, x: i32, z: i32) !void {
@@ -820,7 +784,7 @@ test "light stream storage lifecycle" {
 
     // Replacing the material runs drops the stale light stream.
     const fresh = try World.allocUniformRuns(allocator, 16, 0);
-    world.setColumnRuns(1, 1, fresh);
+    world.setColumnRuns(1, 1, fresh, false);
     try std.testing.expect(col.light == null);
     try std.testing.expectEqual(@as(u16, 0), col.light_base_y);
 }
@@ -920,7 +884,7 @@ test "unbounded world: chunks allocate on demand, missing reads as air" {
     try std.testing.expectEqual(chunk, try world.ensureChunk(-1, 0));
 
     // Writes land through the resident chunk and update the macro grid.
-    world.setColumnRuns(-1, 5, try World.allocUniformRuns(allocator, 32, 3));
+    world.setColumnRuns(-1, 5, try World.allocUniformRuns(allocator, 32, 3), false);
     try std.testing.expectEqual(@as(u8, 3), world.get(-1, 7, 5));
     try std.testing.expectEqual(@as(u16, 31), world.macroMax(-1, 5).?);
     // The neighboring unloaded chunk still reads as air.
