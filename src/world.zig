@@ -442,6 +442,12 @@ const Memo = struct {
         chunk.macro_max[(lz >> 3) * chunk_macro_w + (lx >> 3)] = m;
     }
 
+    /// True when (x, z) is in bounds but its chunk isn't resident: a
+    /// still-generating hole (vs. out of bounds, genuinely empty).
+    pub inline fn cellMissing(self: *const World, x: i32, z: i32) bool {
+        return self.inBounds(x, z) and self.chunkAt(x, z) == null;
+    }
+
     /// Max solid y of the 8x8 group holding (x, z); null when out of
     /// bounds or the chunk is not resident (all air: the march may
     /// always skip such cells). Meaningful only when macro_ok.

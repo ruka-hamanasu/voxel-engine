@@ -255,6 +255,51 @@ fn lodBoundary(cam_x: f32, cam_z: f32, dx: f32, dz: f32, lod_dist: f32, limit: f
     return std.math.clamp(t_switch + t_enter, 0.0, limit);
 }
 
+/// t-intervals where a march skipped in-bounds cells whose chunk isn't
+/// resident yet. renderColumn re-marches these against the next coarser
+/// world so a still-generating chunk reads as its coarse cover instead
+/// of sky (each level's streamed disc contains the finer level's, so
+/// the cover is essentially always resident).
+const Holes = struct {
+    const max_intervals = 4;
+    t0: [max_intervals]f32 = undefined,
+    t1: [max_intervals]f32 = undefined,
+    n: usize = 0,
+
+    /// Record skipped cell [a, b). Cells arrive in increasing-t order,
+    /// so directly adjacent skips coalesce; a resident gap (even an
+    /// all-air one) keeps intervals separate so the fill never
+    /// re-marches resident finer range (where the coarse cover's
+    /// silhouette overestimate would show every frame).
+    fn add(self: *Holes, a: f32, b: f32) void {
+        if (self.n > 0 and a <= self.t1[self.n - 1] + 1e-3) {
+            self.t1[self.n - 1] = @max(self.t1[self.n - 1], b);
+        } else if (self.n < max_intervals) {
+            self.t0[self.n] = a;
+            self.t1[self.n] = b;
+            self.n += 1;
+        } else {
+            // Saturated: extend the last interval. Re-marching some
+            // resident range beats leaving a hole.
+            self.t1[max_intervals - 1] = b;
+        }
+    }
+};
+
+/// Entry/exit distances of the scale-`scale` cell containing the ray
+/// point at distance t (lodBoundary's snap applied to a single cell):
+/// hole-fill ranges snap to coarse-cell planes so every coarse voxel
+/// renders whole.
+fn cellEntryAt(cam_x: f32, cam_z: f32, dx: f32, dz: f32, t: f32, scale: f32) f32 {
+    const dda = DdaIterator.init(cam_x * scale + dx * scale * t, cam_z * scale + dz * scale * t, dx * scale, dz * scale, std.math.inf(f32));
+    return t + @max(prevCross(dda.t_max_x, dda.t_delta_x), prevCross(dda.t_max_z, dda.t_delta_z));
+}
+
+fn cellExitAt(cam_x: f32, cam_z: f32, dx: f32, dz: f32, t: f32, scale: f32) f32 {
+    const dda = DdaIterator.init(cam_x * scale + dx * scale * t, cam_z * scale + dz * scale * t, dx * scale, dz * scale, std.math.inf(f32));
+    return t + dda.t1();
+}
+
 /// LOD chain layout for one ray: handoff distances t_b[1..n] into
 /// coarse levels 1..n (t_b[0] = 0; level i marches lods[i-1]). The
 /// chain ends at the first non-increasing distance (0 = disabled) or
@@ -471,9 +516,11 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
     // dashes. Coincident boundaries flip nothing.
     if (n >= 1 and params.detail_dist == params.lod_dists[0]) t_detail = t_b[1];
     if (n == 0) {
-        marchFine(fb, height, sx, cfg, t_detail, casc_limit, &free, params);
+        marchFine(fb, height, sx, cfg, t_detail, casc_limit, &free, params, null);
     } else {
-        marchFine(fb, height, sx, cfg, t_detail, t_b[1], &free, params);
+        var holes: Holes = .{};
+        marchFine(fb, height, sx, cfg, t_detail, t_b[1], &free, params, &holes);
+        fillHoles(fb, height, sx, world, lods, cam, f, s_max, dx, dz, fog_ray, t_b[1], 1, n, &holes, &free, params);
         var i: usize = 1;
         var scale: f32 = 0.5;
         while (i <= n and t_b[i] < casc_limit and !free.isEmpty()) : ({
@@ -482,11 +529,13 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
         }) {
             const cfg_i: MarchCfg = .{ .world = lods[i - 1], .fine = if (i == 1) world else lods[i - 2], .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
             const t_end = if (i < n) t_b[i + 1] else casc_limit;
+            var holes_i: Holes = .{};
             if (t_b[i] >= t_detail) {
-                marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, false);
+                marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, false, &holes_i);
             } else {
-                marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, true);
+                marchRange(fb, height, sx, cfg_i, t_b[i] + lod_eps, t_end, &free, params, true, true, &holes_i);
             }
+            fillHoles(fb, height, sx, world, lods, cam, f, s_max, dx, dz, fog_ray, t_end, i + 1, n, &holes_i, &free, params);
         }
     }
     if (imp) |ip| {
@@ -505,16 +554,47 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
     spans.fillSpans(fb, height, sx, &free, 0, @floatFromInt(height), spans.SkySrc{ .sky = sky });
 }
 
+/// Cover still-generating chunks with their coarse version: re-march
+/// the hole intervals a level's march recorded (t in absolute fine
+/// units) against the next coarser world, recursing while the fill
+/// itself hits holes and a deeper chain world exists. The fill runs
+/// after the finer march, so the free-span list gates it to spans the
+/// finer content left open — it can never overwrite finer-rendered
+/// pixels, and its silhouette overestimate over fine air is the <= 1
+/// fine voxel the regular handoff already accepts (transient: the fine
+/// chunk replaces it once generated). Intervals snap outward to
+/// coarse-cell planes (cellEntryAt/cellExitAt) so coarse voxels render
+/// whole; the downward snap may dip into the previous range, which is
+/// span-gated harmless. detail is false: the fill is a brief stand-in,
+/// not worth AO/light zipper setup.
+fn fillHoles(fb: []u32, height: usize, sx: usize, world: *const World, lods: []const *const World, cam: Camera, f: f32, s_max: f32, dx: f32, dz: f32, fog_ray: FogRay, range_hi: f32, lvl0: usize, n_lvls: usize, holes: *const Holes, free: *SpanList, params: RenderParams) void {
+    var lvl = lvl0;
+    var cur = holes.*;
+    while (cur.n > 0 and lvl <= n_lvls and !free.isEmpty()) : (lvl += 1) {
+        var scale: f32 = 1.0;
+        for (0..lvl) |_| scale *= 0.5;
+        const cfg: MarchCfg = .{ .world = lods[lvl - 1], .fine = if (lvl == 1) world else lods[lvl - 2], .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
+        var next: Holes = .{};
+        for (0..cur.n) |k| {
+            const a = @max(cellEntryAt(cam.x, cam.z, dx, dz, cur.t0[k], scale), 0.0);
+            const b = @min(cellExitAt(cam.x, cam.z, dx, dz, cur.t1[k], scale), range_hi);
+            if (!(b > a)) continue;
+            marchRange(fb, height, sx, cfg, if (a > 0) a + lod_eps else 0, b, free, params, true, false, &next);
+        }
+        cur = next;
+    }
+}
+
 /// Fine march over [0, t_end), split at t_detail into a detailed and
 /// a simple range (both comptime-specialized, so no per-cell mode
 /// check). t_detail >= t_end collapses to the single detailed march.
-fn marchFine(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_detail: f32, t_end: f32, free: *SpanList, params: RenderParams) void {
+fn marchFine(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_detail: f32, t_end: f32, free: *SpanList, params: RenderParams, holes: ?*Holes) void {
     if (t_detail >= t_end) {
-        marchRange(fb, height, sx, cfg, 0, t_end, free, params, false, true);
+        marchRange(fb, height, sx, cfg, 0, t_end, free, params, false, true, holes);
         return;
     }
-    marchRange(fb, height, sx, cfg, 0, t_detail, free, params, false, true);
-    if (!free.isEmpty()) marchRange(fb, height, sx, cfg, t_detail, t_end, free, params, false, false);
+    marchRange(fb, height, sx, cfg, 0, t_detail, free, params, false, true, holes);
+    if (!free.isEmpty()) marchRange(fb, height, sx, cfg, t_detail, t_end, free, params, false, false, holes);
 }
 
 /// March cfg's world over absolute ray distances [t_begin, t_end).
@@ -532,7 +612,10 @@ fn marchFine(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_detail: f32, 
 /// and culling against the coarse neighbor's union-solidity would
 /// punch holes along the boundary. comptime detail selects per-voxel
 /// shading detail (milestone 15); false compiles AO and light away.
-fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, t_end: f32, free: *SpanList, params: RenderParams, handoff: bool, comptime detail: bool) void {
+/// holes, when non-null, collects the t-intervals of in-bounds cells
+/// skipped because their chunk isn't resident yet (fillHoles re-marches
+/// them against the next coarser world).
+fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, t_end: f32, free: *SpanList, params: RenderParams, handoff: bool, comptime detail: bool, holes: ?*Holes) void {
     const world = cfg.world;
     const t_clamp = @max(96.0, t_end);
     var dda = DdaIterator.init(cfg.cam_x + cfg.dx * t_begin, cfg.cam_z + cfg.dz * t_begin, cfg.dx, cfg.dz, t_clamp - t_begin);
@@ -563,11 +646,25 @@ fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, 
             const t0c = @max(t0, 1e-4); // processCell's own clamp
             const h_lo = cfg.cam_y - @max(cfg.s_max * t0c, cfg.s_max * t1);
             const mmax = world.macroMax(dda.ix, dda.iz) orelse {
+                // Out of bounds is genuinely empty; in bounds but not
+                // resident is a still-generating hole worth covering.
+                if (holes) |h| {
+                    if (world.cellMissing(dda.ix, dda.iz)) h.add(t0, t1);
+                }
                 dda.advance();
                 no_cull = false;
                 continue;
             };
             if (h_lo > @as(f32, @floatFromInt(mmax)) + 1.0) {
+                dda.advance();
+                no_cull = false;
+                continue;
+            }
+        } else if (holes) |h| {
+            // No macro grid: processCell's null-column early-out is the
+            // skip path, so test residency here to catch the hole.
+            if (world.cellMissing(dda.ix, dda.iz)) {
+                h.add(t0, t1);
                 dda.advance();
                 no_cull = false;
                 continue;
@@ -1313,6 +1410,44 @@ test "lodBoundary snaps the handoff to the first center-past coarse cell" {
     // with an exact-integer start both stay exact.
     try std.testing.expectApproxEqAbs(@as(f32, 48.0), lodBoundary(4.0, 10.0, 0.0, 1.0, 48.0, 96.0, 0.5), 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 48.0), lodBoundary(100.0, 10.5, -1.0, 0.0, 48.0, 96.0, 0.5), 1e-3);
+}
+
+test "hole fill covers a missing fine chunk with the coarse world" {
+    const allocator = std.testing.allocator;
+    const w = 64;
+    const h = 64;
+    // Flat floor at y in [0, 10). The fine world is missing the chunk
+    // x,z in [64, 128) (never ensured, so not resident); the level-1
+    // coarse world covers the whole area at half resolution.
+    var fine = try World.init(allocator, null, 64, null);
+    defer fine.deinit();
+    _ = try fine.ensureChunk(0, 0);
+    _ = try fine.ensureChunk(0, 1);
+    _ = try fine.ensureChunk(1, 0);
+    try fine.fillBox(0, 0, 0, 128, 10, 128, 1);
+    var coarse = try World.init(allocator, null, 32, null);
+    defer coarse.deinit();
+    _ = try coarse.ensureChunk(0, 0);
+    try coarse.fillBox(0, 0, 0, 64, 5, 64, 1);
+
+    const cam: Camera = .{ .x = 8.5, .y = 30, .z = 96.5, .yaw = 0 };
+    var params: RenderParams = .{ .fog_density = 0, .light = false, .detail_dist = 0 };
+    params.lod_dists = .{144} ++ .{0} ** (max_lods - 1);
+    var renderer: Renderer = .{};
+
+    // Rays just below the horizon first touch the floor inside the
+    // missing chunk (row 40 hits at x ~= 84): without the hole fill
+    // they read sky; with it they read the coarse floor.
+    var fb: [w * h]u32 = undefined;
+    const lods = [_]*const World{&coarse};
+    renderer.render(&fb, w, h, &fine, &lods, cam, params, null);
+    var fb_nofill: [w * h]u32 = undefined;
+    renderer.render(&fb_nofill, w, h, &fine, &.{}, cam, params, null);
+    for (38..44) |row| {
+        const sky = shade.skyColor(row, h);
+        try std.testing.expectEqual(sky, fb_nofill[w / 2 * h + row]);
+        try std.testing.expect(fb[w / 2 * h + row] != sky);
+    }
 }
 
 test "forDrawDistance derives fog, LOD, and detail from one distance" {

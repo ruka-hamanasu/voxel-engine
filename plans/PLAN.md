@@ -841,4 +841,29 @@ entries here record scope and outcome only.
       Streamer.loads was never initialized (undefined struct fill),
       so the bench chunk counts were diffs off a garbage base. Gates:
       zig build test green; stream sweeps byte-identical; walk bench
-      flat (9.8 ms); mem 73.2 -> 74.2 MB (the force_builder).
+       flat (9.8 ms); mem 73.2 -> 74.2 MB (the force_builder).
+
+37. COMPLETED - Coarse cover for still-generating chunks (hole fill).
+       Fast flight left sky-colored holes where a fine chunk was
+       still generating: each ray-distance range marched exactly one
+       world, so a non-resident fine chunk read as air even though the
+       covering coarse chunk was resident (coarse discs contain the
+       fine disc). The renderer now records the t-intervals of
+       in-bounds cells skipped for non-residency (Holes, threaded
+       through marchRange; World.cellMissing distinguishes holes from
+       out-of-bounds) and re-marches just those intervals against the
+       next coarser world after the level's own march (fillHoles),
+       recursing deeper while the fill itself hits holes and a chain
+       world exists. Intervals snap outward to coarse-cell planes
+       (cellEntryAt/cellExitAt) so coarse voxels render whole, and the
+       fill runs with handoff no_cull + detail=false. Correctness rides
+       existing invariants: spans claim front-to-back, so the later
+       fill can only claim spans the finer march left open (never
+       overwrites finer pixels), and the coarse silhouette overestimate
+       over fine air is the <= 1 fine voxel the regular handoff already
+       accepts — transient until the fine chunk commits. Zero cost when
+       no holes: an empty Holes short-circuits, so the warmed-up sweeps
+       stay byte-identical. Gates: zig build test green (new test: a
+       missing fine chunk renders the coarse floor where the no-fill
+       control renders sky); all 78 stream-sweep views byte-identical
+       pre vs post.
