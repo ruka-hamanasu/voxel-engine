@@ -175,7 +175,8 @@ commit encode 8x8 macro-grid groups; ensureChunk and the cross-chunk
 flood stay serial in queue order, so worlds stay byte-identical
 (pooled-vs-inline snapshot tests, all four sweeps + the 10 km frame
 identical). Impostor synthesis rides the pool as 128-cell ranges.
-Numbers: walk 12.8 -> 10.3 ms (672), 13.6 -> 11.2 ms (10 km);
+Numbers: walk 12.8 -> 10.3 ms (672), 13.6 -> 11.2 ms (--dist 10240,
+~1 km);
 --dist 100000 warm-up 35 -> 10 s (3.5x); mem unchanged. Details:
 PLAN.md milestone 36.
 
@@ -188,15 +189,43 @@ tests unchanged (budgeted == completion, snapshot round-trip) — the
 impostor is render-only, never lit; edits deferred to the persistence
 milestone via D3's dirty-cell re-synthesis.
 
-### D5. Budget reclamation levers (profiling-gated)
+### D5. Budget reclamation levers (profiling-gated) — current plan
 
-- Impostor-as-oracle early-out: per screen column, if every free row
-  clears the far silhouette at all distances, skip the far march.
-- Per-macro-cell `min_solid_y` (the PLAN.md hierarchical-DDA summary)
-  for long shallow rays.
-- ReleaseFast for the render module only.
-- Last resorts if still >16.6 ms: lower internal res with upscale,
-  strip-local fb (m21 remnant, est. 4-7%).
+Last measurements: 13.2 ms/frame at true 10 km (--dist 100000 = 10 km
+at 10 cm/vox, D3.1, 960x540; D4 left the 10 km frame byte-identical
+and cut warm-up 35 -> 10 s but did not re-time it), 11.2 ms walk at
+--dist 10240 (~1 km, D4) — likely already under the 16.6 ms target on
+this machine.
+So: **measure first, implement levers only if over budget.** ReleaseFast
+is excluded for now (user directive); lower internal res + upscale and
+strip-local fb remain last resorts. Preceded by the refactor pass in
+plans/REFACTOR.md (R2.3's marchRange skip-block merge leaves a single
+insertion point for lever 2).
+
+- **Lever 1 — impostor-as-oracle early-out.** After the cascade march,
+  columns with free rows walk the full impostor chain (~6 levels x ~72
+  cells at 10 km) even when the far terrain is entirely below the ray's
+  height window (high camera, or a near ridgeline occludes the horizon);
+  the per-cell skip rejects those cells individually, the oracle rejects
+  them in bulk. Cheap exact form: per-tile `max_top_y` (maintained at
+  synthesis), tested against the free spans' steepest downward slope
+  per tile span — skip tile spans the lowest free row still clears.
+  ~60-100 lines, conservative (exact-output), view-dependent payoff.
+- **Lever 2 — per-macro-cell min_solid_y** (the PLAN.md
+  hierarchical-DDA summary): extends the 8x8 macro grid from max-only
+  to [min,max] so long shallow rays also skip when the height window
+  misses the solid interval from below. Doubles the grid, and every
+  mutation path (setRange/setColumnRuns/updateMacro, chunk rebuild,
+  snapshot hashing) must maintain it. Caveat from the audit: grounded
+  heightfield columns are solid from y=0, so the below-skip fires
+  mainly under overhangs/arches/caves — its real value is the future
+  city generator. Deprioritized; implement only if lever 1 lands and
+  the frame is still over budget.
+- **Measurement plan:** 10 km frame + walk bench at --dist 100000 and
+  10240, scripts/vista_km.sh, mem.sh at 960x540, plus a perf-stat
+  attribution (cascade vs impostor vs transpose). If under 16.6 ms, D5
+  closes as evaluated-and-deferred with numbers (same disposition as
+  milestone 21's levers).
 
 ## Risks
 
