@@ -896,7 +896,32 @@ entries here record scope and outcome only.
        pyramid in chunk.zig + snapshot hashing). Gates: zig build test
        green (new regression test — flat odd-parity floor, center
        column is exactly {sky, top-face color}; verified to FAIL
-       pre-fix); both --lod 0 sweeps byte-identical; def/l0f0 sweeps
-       diff on 0.05-1.0% of terrain pixels (caves byte-identical),
-       baselines regenerated as views_m37*; bench neutral (perf stat:
-       +0.5% instructions, branch-misses flat, wall time in noise).
+        pre-fix); both --lod 0 sweeps byte-identical; def/l0f0 sweeps
+        diff on 0.05-1.0% of terrain pixels (caves byte-identical),
+        baselines regenerated as views_m37*; bench neutral (perf stat:
+        +0.5% instructions, branch-misses flat, wall time in noise).
+
+39. COMPLETED - LOD boundary sky follows the coarse rule (mountain
+       bright-band fix). m14 shaded the boundary cell's back faces
+       from the single fronting fine column (boundarySky: lit when
+       the upper fine layer clears that column's top), which left a
+       bright band on mountains: interior coarse cells shade sky from
+       the previous coarse column's union-raised top (systematically
+       higher on slopes, reading cave-dark x0.30), so the first
+       coarse blocks were lighter than the next set up. The flat-
+       terrain case m14 fixed is unaffected by re-darkening (m38 now
+       morphs that riser, and flat boundary faces are fully occluded
+       by the fine render anyway), so the boundary sky bit now uses
+       the same skyStop(nsky_y) rule as the interior coarse march;
+       boundarySky is deleted. Fine sampling stays where it is still
+       load-bearing: h_front (m38 geometry), and AO/light in the
+       non-default --detail > lod_dist config. The m14 regression
+       test is repurposed: boundary sky now matches the coarse
+       neighbor while AO stays fine-sampled. Deferred lever
+       unchanged (m38): exact fine tops per coarse column would let
+       the interior rule brighten to match reality instead. Gates:
+       zig build test green; both --lod 0 sweeps byte-identical; def
+       sweeps diff only in mountainside boundary bands (fixed: 6/78
+       views, <=0.01% px; stream: 21/78 views, <=0.07% px; caves and
+       l0f0 byte-identical), baselines regenerated as views_m39*;
+       bench neutral (walk/spawn within noise).

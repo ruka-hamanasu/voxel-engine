@@ -965,16 +965,6 @@ fn skyStop(sky_on: bool, sky_y: i32, y: i32) u1 {
     return if (!sky_on or y > sky_y) 1 else 0;
 }
 
-/// Sky bit for an LOD boundary back face: lit when the face's upper
-/// fine layer clears the fronting fine column's top. The coarse
-/// neighbor's union-raised top would read cave-dark against open
-/// fine sky.
-fn boundarySky(fine: *const World, sel: [2]i32, y: i32) u1 {
-    const col = fine.columnAt(sel[0], sel[1]) orelse return 1;
-    const t: i32 = if (col.top_solid_y == world_mod.no_solid) -1 else @as(i32, col.top_solid_y);
-    return if (2 * y + 1 > t) 1 else 0;
-}
-
 /// Light for an LOD boundary back face: the brighter of the two fine
 /// cells in front of it.
 fn boundaryLight(fine: *const World, sel: [2]i32, y: i32) lighting.LightSample {
@@ -1153,8 +1143,10 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
             if (ctx.bfine) |fine| {
                 // LOD boundary cell: never culled (span claiming
                 // resolves occlusion against the fine render in
-                // front); shaded from the fine column the face
-                // fragment is actually exposed to.
+                // front). Sky follows the coarse neighbor rule
+                // (nsky_y) so the riser shades like the interior
+                // coarse field; fine sampling stays for AO/light
+                // (detail mode) and the h_front morph.
                 var yy = seg_lo;
                 while (yy <= seg_hi) : (yy += 1) {
                     // Topmost voxel: clip the riser to the exact fine
@@ -1165,7 +1157,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
                     const r_bot = ctx.row(yy, ctx.t0);
                     if (!spans.spanOverlap(free, r_top, r_bot)) continue;
                     const stops: [2]f32 = if (detail) ao.sideAoStopsFine(fine, ctx.bsel, ctx.bflanka, ctx.bflankb, yy, ctx.bu) else .{ 3, 3 };
-                    const sky: u1 = if (!ctx.sky_on) 1 else boundarySky(fine, ctx.bsel, yy);
+                    const sky = skyStop(ctx.sky_on, ctx.nsky_y, yy);
                     sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = r_top, .r1 = r_bot, .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = if (lit) boundaryLight(fine, ctx.bsel, yy) else .{}, .sky = sky });
                     if (free.isEmpty()) return;
                 }
@@ -1642,7 +1634,7 @@ test "boundary cell back faces are never culled but take neighbor AO" {
     try std.testing.expect(fb1[10] != sentinel and fb1[15] != sentinel);
 }
 
-test "boundary cell shades back faces from the fine world in front" {
+test "boundary cell sky follows the coarse neighbor rule" {
     const lod_mod = @import("lod.zig");
     var fine = try World.init(std.testing.allocator, 8, 8, 8);
     defer fine.deinit();
@@ -1650,11 +1642,12 @@ test "boundary cell shades back faces from the fine world in front" {
     // (2,2) at fine y 4..7 -> coarse layers 2..3.
     try fine.fillBox(2, 4, 2, 3, 8, 3, 3);
     // Fronting fine columns (x=1, z=2..3) stay low (top y=1): the
-    // back faces front open sky...
+    // back faces front open fine sky...
     try fine.fillBox(1, 0, 2, 2, 2, 3, 3);
     // ...but the coarse neighbor (0,1) also covers a tall spike in
-    // its far column (0,2), union-raising its coarse top to layer 3 —
-    // coarse-folded shading would read the faces cave-dark.
+    // its far column (0,2), union-raising its coarse top to layer 3,
+    // under which the interior coarse march shades sky=0. The
+    // boundary cell must match that coarse rule, not the fine sky.
     try fine.fillBox(0, 0, 2, 1, 8, 3, 3);
     var lod = try lod_mod.build(std.testing.allocator, &fine);
     defer lod.deinit();
@@ -1664,15 +1657,16 @@ test "boundary cell shades back faces from the fine world in front" {
     var fb: [16]u32 = @splat(sentinel);
     var free = SpanList.initFull(16);
     processCell(&fb, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, &fine, &free, params, .{}, true);
-    // Sky-lit, max-AO (nothing solid beside the faces in fine air).
-    const want = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 3, 3 }, .sky = 1 }, params)[0];
+    // Coarse-rule sky (0 under the union-raised top); AO stays
+    // fine-sampled (nothing solid beside the faces in fine air).
+    const want = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 3, 3 }, .sky = 0 }, params)[0];
     try std.testing.expectEqual(want, fb[9]);
-    const dark = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 2, 2 }, .sky = 0 }, params)[0];
-    try std.testing.expect(want != dark);
+    const lit = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 3, 3 }, .sky = 1 }, params)[0];
+    try std.testing.expect(want != lit);
 
-    // Control without the fine context: coarse-neighbor shading —
-    // solid above and below (AO {2,2}) and under the union-raised
-    // top (sky 0).
+    // Control without the fine context: same coarse-rule sky, plus
+    // coarse AO {2,2} from the solids above and below.
+    const dark = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 2, 2 }, .sky = 0 }, params)[0];
     var fb2: [16]u32 = @splat(sentinel);
     var free2 = SpanList.initFull(16);
     processCell(&fb2, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, null, &free2, params, .{}, true);
