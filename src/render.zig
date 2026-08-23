@@ -233,6 +233,24 @@ fn prevCross(t_max: f32, t_delta: f32) f32 {
     return t_max - t_delta;
 }
 
+/// Seed the previous-cell record for a mid-ray start: the upstream
+/// cell at the start point and the entry crossing's axis, so the first
+/// marched cell culls and shades (x/z face factor) exactly as in an
+/// unsplit march. DdaIterator.init defaults axis to x_side, which is
+/// wrong for a z-side entry crossing.
+fn seedPrev(dda: *DdaIterator) void {
+    if (prevCross(dda.t_max_x, dda.t_delta_x) > prevCross(dda.t_max_z, dda.t_delta_z)) {
+        dda.px = dda.ix - dda.step_x;
+        dda.pz = dda.iz;
+        dda.axis = .x_side;
+    } else {
+        dda.px = dda.ix;
+        dda.pz = dda.iz - dda.step_z;
+        dda.axis = .z_side;
+    }
+    dda.has_prev = true;
+}
+
 /// Fine/coarse handoff distance, snapped to a coarse-cell boundary:
 /// the entry distance of the first coarse cell whose center along the
 /// ray is at or past lod_dist. Switching at the raw ray distance
@@ -463,6 +481,12 @@ const MarchCfg = struct {
     fog: FogRay,
 };
 
+/// Coarse-march frame at the given scale (the MarchCfg scaling rule),
+/// shared by the cascade loop and fillHoles.
+fn scaledCfg(world: *const World, fine: ?*const World, cam: Camera, f: f32, s_max: f32, dx: f32, dz: f32, fog_ray: FogRay, scale: f32) MarchCfg {
+    return .{ .world = world, .fine = fine, .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
+}
+
 fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *const World, cam: Camera, f: f32, s_max: f32, sx: usize, dx: f32, dz: f32, sky: []const u32, params: RenderParams, imp: ?*const Impostor) void {
     var free = SpanList.initFull(@intCast(height));
 
@@ -518,7 +542,7 @@ fn renderColumn(fb: []u32, height: usize, world: *const World, lods: []const *co
             i += 1;
             scale *= 0.5;
         }) {
-            const cfg_i: MarchCfg = .{ .world = lods[i - 1], .fine = if (i == 1) world else lods[i - 2], .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
+            const cfg_i = scaledCfg(lods[i - 1], if (i == 1) world else lods[i - 2], cam, f, s_max, dx, dz, fog_ray, scale);
             const t_end = if (i < n) t_b[i + 1] else casc_limit;
             var holes_i: Holes = .{};
             if (t_b[i] >= t_detail) {
@@ -567,7 +591,7 @@ fn fillHoles(fb: []u32, height: usize, sx: usize, world: *const World, lods: []c
         lvl += 1;
         scale *= 0.5;
     }) {
-        const cfg: MarchCfg = .{ .world = lods[lvl - 1], .fine = if (lvl == 1) world else lods[lvl - 2], .cam_x = cam.x * scale, .cam_y = cam.y * scale, .cam_z = cam.z * scale, .f = f / scale, .s_max = s_max * scale, .dx = dx * scale, .dz = dz * scale, .fog = fog_ray };
+        const cfg = scaledCfg(lods[lvl - 1], if (lvl == 1) world else lods[lvl - 2], cam, f, s_max, dx, dz, fog_ray, scale);
         var next: Holes = .{};
         for (0..cur.n) |k| {
             const a = @max(cellEdgeAt(.entry, cam.x, cam.z, dx, dz, cur.t0[k], scale), 0.0);
@@ -615,18 +639,10 @@ fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, 
     var dda = DdaIterator.init(cfg.cam_x + cfg.dx * t_begin, cfg.cam_z + cfg.dz * t_begin, cfg.dx, cfg.dz, t_clamp - t_begin);
     var no_cull = false;
     if (t_begin > 0) {
-        if (prevCross(dda.t_max_x, dda.t_delta_x) > prevCross(dda.t_max_z, dda.t_delta_z)) {
-            dda.px = dda.ix - dda.step_x;
-            dda.pz = dda.iz;
-            dda.axis = .x_side;
-        } else {
-            dda.px = dda.ix;
-            dda.pz = dda.iz - dda.step_z;
-            dda.axis = .z_side;
-        }
-        dda.has_prev = true;
+        seedPrev(&dda);
         no_cull = handoff;
     }
+    var sink: SegmentSink = .{ .fb = fb, .height = height, .sx = sx, .free = free, .params = params, .fog = cfg.fog };
     while (t_begin + dda.t0 < t_end and !free.isEmpty()) {
         const t0 = t_begin + dda.t0;
         const t1 = t_begin + dda.t1();
@@ -638,22 +654,23 @@ fn marchRange(fb: []u32, height: usize, sx: usize, cfg: MarchCfg, t_begin: f32, 
         // the group, the per-column sky-skip's own condition.
         const t0c = @max(t0, 1e-4); // processCell's own clamp
         const h_lo = cfg.cam_y - @max(cfg.s_max * t0c, cfg.s_max * t1);
-        const mmax = world.macroMax(dda.ix, dda.iz) orelse {
+        const mmax = world.macroMax(dda.ix, dda.iz);
+        const skip = if (mmax) |m|
+            h_lo > @as(f32, @floatFromInt(m)) + 1.0
+        else skip: {
             // Out of bounds is genuinely empty; in bounds but not
             // resident is a still-generating hole worth covering.
             if (holes) |h| {
                 if (world.cellMissing(dda.ix, dda.iz)) h.add(t0, t1);
             }
-            dda.advance();
-            no_cull = false;
-            continue;
+            break :skip true;
         };
-        if (h_lo > @as(f32, @floatFromInt(mmax)) + 1.0) {
+        if (skip) {
             dda.advance();
             no_cull = false;
             continue;
         }
-        processCell(fb, height, sx, world, dda.ix, dda.iz, dda.px, dda.pz, dda.has_prev, cfg.cam_x, cfg.cam_y, cfg.cam_z, cfg.f, cfg.s_max, cfg.dx, cfg.dz, t0, t1, dda.axis, no_cull, cfg.fine, free, params, cfg.fog, detail);
+        processCell(cfg, &dda, t0, t1, no_cull, &sink, detail);
         no_cull = false;
         dda.advance();
     }
@@ -690,6 +707,10 @@ fn marchImpostor(fb: []u32, height: usize, sx: usize, imp: *const Impostor, leve
     const sdx = dx * inv;
     const sdz = dz * inv;
     var dda = DdaIterator.init(scx + sdx * t_begin, scz + sdz * t_begin, sdx, sdz, t_end - t_begin);
+    // t_begin is always > 0 here (handoff + lod_eps): seed the entry
+    // crossing's axis so the boundary cell's side face gets the correct
+    // x/z shade factor (init defaults to x_side).
+    seedPrev(&dda);
     const hf: f32 = @floatFromInt(height);
     var sink: SegmentSink = .{ .fb = fb, .height = height, .sx = sx, .free = free, .params = params, .fog = fog_ray };
     var no_cull = true;
@@ -957,10 +978,27 @@ fn boundaryLight(fine: *const World, sel: [2]i32, y: i32) lighting.LightSample {
     return if (b.intensity > a.intensity) b else a;
 }
 
-fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32, iz: i32, px: i32, pz: i32, has_prev: bool, cam_x: f32, cam_y: f32, cam_z: f32, f: f32, s_max: f32, dx: f32, dz: f32, t0_in: f32, t1: f32, axis: Face, no_cull: bool, fine: ?*const World, free: *SpanList, params: RenderParams, fog_ray: FogRay, comptime detail: bool) void {
+fn processCell(cfg: MarchCfg, dda: *const DdaIterator, t0_in: f32, t1: f32, no_cull: bool, sink: *SegmentSink, comptime detail: bool) void {
+    const world = cfg.world;
+    const fine = cfg.fine;
+    const ix = dda.ix;
+    const iz = dda.iz;
+    const px = dda.px;
+    const pz = dda.pz;
+    const has_prev = dda.has_prev;
+    const axis = dda.axis;
+    const cam_x = cfg.cam_x;
+    const cam_y = cfg.cam_y;
+    const cam_z = cfg.cam_z;
+    const f = cfg.f;
+    const s_max = cfg.s_max;
+    const dx = cfg.dx;
+    const dz = cfg.dz;
+    const params = sink.params;
+    const free = sink.free;
     if (free.isEmpty()) return;
     const t0 = @max(t0_in, 1e-4);
-    const hf: f32 = @floatFromInt(height);
+    const hf: f32 = @floatFromInt(sink.height);
     const h_hi = cam_y + @max(s_max * t0, s_max * t1);
     const h_lo = cam_y - @max(s_max * t0, s_max * t1);
     const y_lo: i32 = @max(@as(i32, @intFromFloat(@floor(h_lo))), 0);
@@ -1094,14 +1132,20 @@ fn processCell(fb: []u32, height: usize, sx: usize, world: *const World, ix: i32
         }
     }
 
-    var sink: SegmentSink = .{ .fb = fb, .height = height, .sx = sx, .free = free, .params = params, .fog = fog_ray };
     if (!detail) {
-        genSegments(&ctx, &sink, false, false);
+        genSegments(&ctx, sink, false, false);
     } else if (ctx.lcur != null or ctx.nlcur != null or (ctx.bfine != null and ctx.sky_on)) {
-        genSegments(&ctx, &sink, true, true);
+        genSegments(&ctx, sink, true, true);
     } else {
-        genSegments(&ctx, &sink, false, true);
+        genSegments(&ctx, sink, false, true);
     }
+}
+
+/// Side-face emit shared by genSegments' visibility paths: every side
+/// fragment sits on the cell's entry plane (t0) with the cell's
+/// oriented side face.
+fn emitSide(ctx: *const CellCtx, sink: *SegmentSink, mat: u8, r0: f32, r1: f32, stops: [2]f32, light: lighting.LightSample, sky: u1) void {
+    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = r0, .r1 = r1, .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = light, .sky = sky });
 }
 
 /// Segment generation: geometry/visibility only, emitting Segment
@@ -1141,7 +1185,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
                     if (!spans.spanOverlap(free, r_top, r_bot)) continue;
                     const stops: [2]f32 = if (detail) ao.sideAoStopsFine(fine, ctx.bsel, ctx.bflanka, ctx.bflankb, yy, ctx.bu) else .{ 3, 3 };
                     const sky = skyStop(ctx.sky_on, ctx.nsky_y, yy);
-                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = r_top, .r1 = r_bot, .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = if (lit) boundaryLight(fine, ctx.bsel, yy) else .{}, .sky = sky });
+                    emitSide(ctx, sink, mat, r_top, r_bot, stops, if (lit) boundaryLight(fine, ctx.bsel, yy) else .{}, sky);
                     if (free.isEmpty()) return;
                 }
             } else if (ctx.ncur) |*n| {
@@ -1182,15 +1226,15 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
                             const sky = skyStop(ctx.sky_on, ctx.nsky_y, yy);
                             if (stops[0] == 3 and stops[1] == 3 and (!lit or std.meta.eql(lq.sample, pend_light)) and sky == pend_sky) continue;
                             if (pend < yy) {
-                                sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light, .sky = pend_sky });
+                                emitSide(ctx, sink, mat, ctx.row(yy, ctx.t0), ctx.row(pend, ctx.t0), .{ 3, 3 }, pend_light, pend_sky);
                             }
-                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(yy + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = stops, .light = lq.sample, .sky = sky });
+                            emitSide(ctx, sink, mat, ctx.row(yy + 1, ctx.t0), ctx.row(yy, ctx.t0), stops, lq.sample, sky);
                             pend = yy + 1;
                             pend_light = if (lit and pend <= e) ctx.nLightAt(lit, pend).sample else .{};
                             pend_sky = skyStop(ctx.sky_on, ctx.nsky_y, pend);
                         }
                         if (pend <= e) {
-                            sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e + 1, ctx.t0), .r1 = ctx.row(pend, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = pend_light, .sky = pend_sky });
+                            emitSide(ctx, sink, mat, ctx.row(e + 1, ctx.t0), ctx.row(pend, ctx.t0), .{ 3, 3 }, pend_light, pend_sky);
                         }
                         if (free.isEmpty()) return;
                     }
@@ -1200,10 +1244,10 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
                 // Sky is binary per segment: split the whole-run fill
                 // once when the boundary plane crosses it.
                 if (ctx.sky_on and seg_lo <= ctx.sky_y and seg_hi > ctx.sky_y) {
-                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(ctx.sky_y + 1, ctx.t0), .r1 = ctx.row(seg_lo, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .sky = 0 });
-                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(seg_hi + 1, ctx.t0), .r1 = ctx.row(ctx.sky_y + 1, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .sky = 1 });
+                    emitSide(ctx, sink, mat, ctx.row(ctx.sky_y + 1, ctx.t0), ctx.row(seg_lo, ctx.t0), .{ 3, 3 }, .{}, 0);
+                    emitSide(ctx, sink, mat, ctx.row(seg_hi + 1, ctx.t0), ctx.row(ctx.sky_y + 1, ctx.t0), .{ 3, 3 }, .{}, 1);
                 } else {
-                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(seg_hi + 1, ctx.t0), .r1 = ctx.row(seg_lo, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .sky = skyStop(ctx.sky_on, ctx.sky_y, seg_lo) });
+                    emitSide(ctx, sink, mat, ctx.row(seg_hi + 1, ctx.t0), ctx.row(seg_lo, ctx.t0), .{ 3, 3 }, .{}, skyStop(ctx.sky_on, ctx.sky_y, seg_lo));
                 }
                 if (free.isEmpty()) return;
             } else {
@@ -1218,7 +1262,7 @@ fn genSegments(ctx: *CellCtx, sink: *SegmentSink, comptime lit: bool, comptime d
                     var e2 = @min(seg_hi, lq.hi);
                     const sky = skyStop(ctx.sky_on, ctx.sky_y, yy);
                     if (sky == 0) e2 = @min(e2, ctx.sky_y);
-                    sink.emit(.{ .mat = mat, .face = ctx.side_face, .r0 = ctx.row(e2 + 1, ctx.t0), .r1 = ctx.row(yy, ctx.t0), .t = .{ ctx.t0, ctx.t0 }, .ao = .{ 3, 3 }, .light = lq.sample, .sky = sky });
+                    emitSide(ctx, sink, mat, ctx.row(e2 + 1, ctx.t0), ctx.row(yy, ctx.t0), .{ 3, 3 }, lq.sample, sky);
                     yy = e2 + 1;
                 }
                 if (free.isEmpty()) return;
@@ -1589,6 +1633,40 @@ test "lodChain ends at non-increasing distances, missing worlds, and the limit" 
     try std.testing.expectEqual(@as(f32, 448.0), t_b[2]);
 }
 
+/// DDA state for a synthetic single-cell processCell test: cell
+/// (ix,iz) entered from (px,pz) across the given axis. Only the fields
+/// processCell reads are meaningful.
+fn cellDda(ix: i32, iz: i32, px: i32, pz: i32, axis: Face) DdaIterator {
+    var dda = DdaIterator.init(@floatFromInt(ix), @floatFromInt(iz), 1.0, 0.0, 1e9);
+    dda.px = px;
+    dda.pz = pz;
+    dda.has_prev = true;
+    dda.axis = axis;
+    return dda;
+}
+
+/// SegmentSink for a synthetic single-cell processCell test.
+fn cellSink(fb: []u32, height: usize, free: *SpanList, params: RenderParams) SegmentSink {
+    return .{ .fb = fb, .height = height, .sx = 0, .free = free, .params = params, .fog = .{} };
+}
+
+test "seedPrev records the entry crossing's cell and axis" {
+    // x crossing most recent behind the start point: prev cell is x-1.
+    var dda_x = DdaIterator.init(5.2, 5.8, 0.6, 0.8, 100);
+    seedPrev(&dda_x);
+    try std.testing.expectEqual(Face.x_side, dda_x.axis);
+    try std.testing.expectEqual(@as(i32, 4), dda_x.px);
+    try std.testing.expectEqual(@as(i32, 5), dda_x.pz);
+    try std.testing.expect(dda_x.has_prev);
+
+    // z crossing most recent: prev cell is z-1.
+    var dda_z = DdaIterator.init(5.8, 5.2, 0.6, 0.8, 100);
+    seedPrev(&dda_z);
+    try std.testing.expectEqual(Face.z_side, dda_z.axis);
+    try std.testing.expectEqual(@as(i32, 5), dda_z.px);
+    try std.testing.expectEqual(@as(i32, 4), dda_z.pz);
+}
+
 test "boundary cell back faces are never culled but take neighbor AO" {
     var world = try World.init(std.testing.allocator, 4, 8, 4);
     defer world.deinit();
@@ -1597,11 +1675,15 @@ test "boundary cell back faces are never culled but take neighbor AO" {
     const params: RenderParams = .{ .fog_density = 0, .light = false };
     const sentinel: u32 = 0xdeadbeef;
 
+    const cfg: MarchCfg = .{ .world = &world, .cam_x = 0.0, .cam_y = 7.0, .cam_z = 0.0, .f = 16.0, .s_max = 0.5, .dx = 0.8, .dz = 0.0, .fog = .{} };
+    var dda = cellDda(1, 1, 0, 1, .x_side);
+
     // Control: normal culling drops every back face (the upstream
     // column is solid over the whole run), leaving the spans open.
     var fb0: [16]u32 = @splat(sentinel);
     var free0 = SpanList.initFull(16);
-    processCell(&fb0, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, false, null, &free0, params, .{}, true);
+    var sink0 = cellSink(&fb0, 16, &free0, params);
+    processCell(cfg, &dda, 10.0, 12.0, false, &sink0, true);
     try std.testing.expectEqualSlices(u32, &@as([16]u32, @splat(sentinel)), &fb0);
 
     // no_cull (the LOD boundary cell): the faces emit, shaded by the
@@ -1609,7 +1691,8 @@ test "boundary cell back faces are never culled but take neighbor AO" {
     // upstream column).
     var fb1: [16]u32 = @splat(sentinel);
     var free1 = SpanList.initFull(16);
-    processCell(&fb1, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, null, &free1, params, .{}, true);
+    var sink1 = cellSink(&fb1, 16, &free1, params);
+    processCell(cfg, &dda, 10.0, 12.0, true, &sink1, true);
     try std.testing.expect(free1.isEmpty() == false);
     const want = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 11.2, .r1 = 12.8, .t = .{ 10, 10 }, .ao = .{ 2, 2 }, .sky = 1 }, params)[0];
     try std.testing.expectEqual(want, fb1[12]);
@@ -1637,9 +1720,13 @@ test "boundary cell sky follows the coarse neighbor rule" {
     const params: RenderParams = .{ .fog_density = 0, .light = true };
     const sentinel: u32 = 0xdeadbeef;
 
+    var cfg: MarchCfg = .{ .world = &lod, .fine = &fine, .cam_x = 0.0, .cam_y = 3.5, .cam_z = 0.0, .f = 16.0, .s_max = 0.5, .dx = 0.8, .dz = 0.0, .fog = .{} };
+    var dda = cellDda(1, 1, 0, 1, .x_side);
+
     var fb: [16]u32 = @splat(sentinel);
     var free = SpanList.initFull(16);
-    processCell(&fb, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, &fine, &free, params, .{}, true);
+    var sink = cellSink(&fb, 16, &free, params);
+    processCell(cfg, &dda, 10.0, 12.0, true, &sink, true);
     // Coarse-rule sky (0 under the union-raised top); AO stays
     // fine-sampled (nothing solid beside the faces in fine air).
     const want = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 3, 3 }, .sky = 0 }, params)[0];
@@ -1650,9 +1737,11 @@ test "boundary cell sky follows the coarse neighbor rule" {
     // Control without the fine context: same coarse-rule sky, plus
     // coarse AO {2,2} from the solids above and below.
     const dark = segmentColor(.{ .mat = 3, .face = .nx, .r0 = 8.8, .r1 = 10.4, .t = .{ 10, 10 }, .ao = .{ 2, 2 }, .sky = 0 }, params)[0];
+    cfg.fine = null;
     var fb2: [16]u32 = @splat(sentinel);
     var free2 = SpanList.initFull(16);
-    processCell(&fb2, 16, 0, &lod, 1, 1, 0, 1, true, 0.0, 3.5, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, true, null, &free2, params, .{}, true);
+    var sink2 = cellSink(&fb2, 16, &free2, params);
+    processCell(cfg, &dda, 10.0, 12.0, true, &sink2, true);
     try std.testing.expectEqual(dark, fb2[9]);
 }
 
@@ -1666,12 +1755,17 @@ test "simple mode drops AO but claims identical geometry" {
     const params: RenderParams = .{ .fog_density = 0, .light = false };
     const sentinel: u32 = 0xdeadbeef;
 
+    const cfg: MarchCfg = .{ .world = &world, .cam_x = 0.0, .cam_y = 7.0, .cam_z = 0.0, .f = 16.0, .s_max = 0.5, .dx = 0.8, .dz = 0.0, .fog = .{} };
+    var dda = cellDda(1, 1, 0, 1, .x_side);
+
     var fb_det: [16]u32 = @splat(sentinel);
     var free_det = SpanList.initFull(16);
-    processCell(&fb_det, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, false, null, &free_det, params, .{}, true);
+    var sink_det = cellSink(&fb_det, 16, &free_det, params);
+    processCell(cfg, &dda, 10.0, 12.0, false, &sink_det, true);
     var fb_sim: [16]u32 = @splat(sentinel);
     var free_sim = SpanList.initFull(16);
-    processCell(&fb_sim, 16, 0, &world, 1, 1, 0, 1, true, 0.0, 7.0, 0.0, 16.0, 0.5, 0.8, 0.0, 10.0, 12.0, .x_side, false, null, &free_sim, params, .{}, false);
+    var sink_sim = cellSink(&fb_sim, 16, &free_sim, params);
+    processCell(cfg, &dda, 10.0, 12.0, false, &sink_sim, false);
 
     // Same spans claimed in both modes (geometry is detail-independent).
     try std.testing.expectEqual(free_det.len, free_sim.len);

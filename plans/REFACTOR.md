@@ -2,16 +2,26 @@
 
 ## Status
 
-- **R1: COMPLETED.** All R1.1-R1.4 items done (uncommitted). Gates:
-  `zig build test` green; all four sweeps byte-identical to
-  views_m39*. `--world-h 0` now returns `error.BadWorldSize` (was a
-  terrain assert). +121/-250 lines. Adjustments vs the item list:
-  `macro_ok` removal also dropped the `updateMacro` guard (world.zig);
-  `chunkBox` covers 4 clamp copies (loadCoarseChunk had a 4th);
-  `shadeAt` kept (4 test uses); the merged `setColumnRuns` takes
+- R1: COMPLETED. All R1.1-R1.4 items done (committed as "Refactor
+  phase 1"). Gates: `zig build test` green; all four sweeps
+  byte-identical to views_m39*. `--world-h 0` now returns
+  `error.BadWorldSize` (was a terrain assert). Adjustments vs the item
+  list: `macro_ok` removal also dropped the `updateMacro` guard
+  (world.zig); `chunkBox` covers 4 clamp copies (loadCoarseChunk had a
+  4th); `shadeAt` kept (4 test uses); the merged `setColumnRuns` takes
   `keep_light: bool` with no wrappers (callers updated);
   cellEntryAt/cellExitAt became one `cellEdgeAt` with a comptime edge.
-- R2: not started.
+- **R2: COMPLETED.** All R2.1-R2.5 items done (uncommitted). Gates:
+  `zig build test` green (new seedPrev axis/cell unit test); all four
+  sweeps byte-identical to views_m39*; --dist 2048 impostor smoke OK
+  (R2.4 changes only the un-pinned km-vista output: boundary cells
+  whose entry crossing is z-side now shade 0.6, was always x-side
+  0.8). Adjustments vs the item list: R2.1 passes `*SegmentSink`
+  (bundles fb/height/sx/free/params/fog_ray; hoisted per-march in
+  marchRange) instead of separate free/params scalars — 25 params ->
+  7; R2.2 leaves marchImpostor's scalar rescale alone (user call: a
+  MarchCfg without a world is a lie, optional world worse), scaledCfg
+  serves the two cascade sites; R2.5 found 8 emit sites, not six.
 - R3: not started.
 
 Simplification pass ahead of the DISTANCE.md D5 work, from a three-way
