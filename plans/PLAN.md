@@ -925,3 +925,26 @@ entries here record scope and outcome only.
        views, <=0.01% px; stream: 21/78 views, <=0.07% px; caves and
        l0f0 byte-identical), baselines regenerated as views_m39*;
        bench neutral (walk/spawn within noise).
+
+40. COMPLETED - Refactor pass (plans/REFACTOR.md R1-R3: -67 net lines
+       over 17 files, one real bug fix — the dead --world-h validation —
+       and one shading correctness fix — the impostor boundary cell's
+       face axis; per-phase gates: zig build test green, all four
+       sweeps byte-identical to views_m39*) + DISTANCE.md D5, which
+       closes evaluated-and-deferred with measured ceilings (detail in
+       DISTANCE.md). Bench (960x540, ReleaseSafe, ms/frame): 10 km
+       (--dist 100000) spawn 12.4, worst 12.6, walk 11.7, aerial 10.5;
+       --dist 10240 walk 10.9, spawn/worst 11.2-11.5 — 4+ ms headroom
+       under the 16.6 ms budget; mem 74.2 MB default / 99.1 MB at
+       10 km; perf stat IPC 3.84, still ALU/branch-bound. Lever 1
+       (impostor tile-max oracle) measured dead for this world: a
+       throwaway counter build showed its batched condition (the
+       window-above-top skip) fires 0 times in 126M marched cells over
+       240 10-km frames at spawn and aerial — rejections are
+       span-coverage-driven, and a span-coverage oracle's complexity
+       isn't justified by the tier's 1.6 ms (spawn) / 5.5 ms (aerial,
+       50% genuine emission) share (no-op-march probe). Lever 2
+       (macro min_solid_y) stays structurally inert on grounded
+       heightfield — the city generator's lever, with R2.3's merged
+       skip block as its insertion point. scripts/walk_bench.sh
+       gained an optional dist arg.

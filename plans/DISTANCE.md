@@ -189,18 +189,40 @@ tests unchanged (budgeted == completion, snapshot round-trip) — the
 impostor is render-only, never lit; edits deferred to the persistence
 milestone via D3's dirty-cell re-synthesis.
 
-### D5. Budget reclamation levers (profiling-gated) — current plan
+### D5. Budget reclamation levers — COMPLETED (milestone 40,
+evaluated-and-deferred)
 
-Last measurements: 13.2 ms/frame at true 10 km (--dist 100000 = 10 km
-at 10 cm/vox, D3.1, 960x540; D4 left the 10 km frame byte-identical
-and cut warm-up 35 -> 10 s but did not re-time it), 11.2 ms walk at
---dist 10240 (~1 km, D4) — likely already under the 16.6 ms target on
-this machine.
-So: **measure first, implement levers only if over budget.** ReleaseFast
-is excluded for now (user directive); lower internal res + upscale and
-strip-local fb remain last resorts. Preceded by the refactor pass in
-plans/REFACTOR.md (R2.3's marchRange skip-block merge leaves a single
-insertion point for lever 2).
+Outcome: measured first; both levers deferred with measured ceilings,
+same disposition as milestone 21's levers. Numbers (960x540,
+ReleaseSafe, ms/frame, fixed main+3-worker pool — representative of
+the 4-core target): 10 km (--dist 100000) spawn 12.4, worst 12.6,
+walk 11.7 (34 streamed chunks), aerial 10.5; ~1 km (--dist 10240)
+walk 10.9, spawn/worst 11.2-11.5; vista_km diffs unchanged from
+D3.1's pins; mem 74.2 MB default / 99.1 MB at 10 km. All under the
+16.6 ms budget with 4+ ms headroom for game logic. perf stat at
+10 km: IPC 3.84, still ALU/branch-bound (m21's finding holds at
+scale).
+
+Lever 1 measured dead for this world: a throwaway counter build
+(since reverted) showed the per-cell window-above-top skip — the
+exact condition the tile-max oracle batches — fires 0 times in
+126M marched cells over 240 10-km frames, spawn and aerial alike.
+The rejections are span-coverage-driven (the free rows' height
+window always intersects the terrain interval; the cell's faces
+land on already-claimed rows), so a max_top_y oracle rejects
+nothing. A span-coverage oracle would need per-tile row-range
+tracking against the free-span list — complexity the numbers don't
+justify: the no-op-march probe puts the whole impostor tier at
+1.6 ms (spawn) / 5.5 ms (aerial, where 50% of tested cells emit
+genuine low-passed far field).
+
+Lever 2 unchanged: structurally inert on grounded heightfield
+(solid from y=0, so the below-window skip needs overhangs);
+remains the city generator's lever, with R2.3's merged skip block
+(render.marchRange) as the single insertion point.
+
+Retained design notes (the levers as scoped, if a future world
+revives them):
 
 - **Lever 1 — impostor-as-oracle early-out.** After the cascade march,
   columns with free rows walk the full impostor chain (~6 levels x ~72
@@ -219,13 +241,8 @@ insertion point for lever 2).
   snapshot hashing) must maintain it. Caveat from the audit: grounded
   heightfield columns are solid from y=0, so the below-skip fires
   mainly under overhangs/arches/caves — its real value is the future
-  city generator. Deprioritized; implement only if lever 1 lands and
-  the frame is still over budget.
-- **Measurement plan:** 10 km frame + walk bench at --dist 100000 and
-  10240, scripts/vista_km.sh, mem.sh at 960x540, plus a perf-stat
-  attribution (cascade vs impostor vs transpose). If under 16.6 ms, D5
-  closes as evaluated-and-deferred with numbers (same disposition as
-  milestone 21's levers).
+   city generator. Deprioritized; implement only if lever 1 lands and
+   the frame is still over budget.
 
 ## Risks
 
