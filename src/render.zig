@@ -97,6 +97,32 @@ pub fn lodChainFor(dist: f32) [max_lods]f32 {
     return chain;
 }
 
+/// Length of the increasing prefix: the active chain (the first
+/// non-increasing entry, 0 = disabled, ends it).
+pub fn lodCount(dists: []const f32) usize {
+    var n: usize = 0;
+    var prev: f32 = 0;
+    while (n < dists.len and dists[n] > prev) : (n += 1) prev = dists[n];
+    return n;
+}
+
+/// Resize the chain to `count` levels (the --lods policy): zero the
+/// tail when shrinking, extend by doubling the last handoff when
+/// growing.
+pub fn resizeLodChain(dists: *[max_lods]f32, count: usize) void {
+    const want = @min(count, max_lods);
+    var n = lodCount(dists);
+    if (want < n) {
+        for (dists[want..]) |*d| d.* = 0;
+        return;
+    }
+    var prev: f32 = if (n == 0) 0 else dists[n - 1];
+    while (n < want) : (n += 1) {
+        dists[n] = prev * 2.0;
+        prev = dists[n];
+    }
+}
+
 /// Per-frame render configuration, threaded render -> renderColumn ->
 /// processCell. fog_* went live in milestone 8, light in milestone 9.
 pub const RenderParams = struct {
@@ -319,15 +345,11 @@ fn cellEdgeAt(comptime edge: enum { entry, exit }, cam_x: f32, cam_z: f32, dx: f
 /// when no world is passed for the level.
 fn lodChain(params: RenderParams, n_worlds: usize, cam_x: f32, cam_z: f32, dx: f32, dz: f32, limit: f32, t_b: *[max_lods + 1]f32) usize {
     t_b[0] = 0.0;
-    var n: usize = 0;
-    var prev_d: f32 = 0.0;
+    const n = @min(lodCount(&params.lod_dists), n_worlds);
     var scale: f32 = 1.0;
-    for (params.lod_dists) |d| {
-        if (d <= prev_d or n >= n_worlds) break;
+    for (1..n + 1) |i| {
         scale *= 0.5;
-        n += 1;
-        t_b[n] = lodBoundary(cam_x, cam_z, dx, dz, d, limit, scale);
-        prev_d = d;
+        t_b[i] = lodBoundary(cam_x, cam_z, dx, dz, params.lod_dists[i - 1], limit, scale);
     }
     return n;
 }
@@ -381,12 +403,15 @@ pub const Renderer = struct {
         const s_max = hf0 * 0.5 / f;
 
         const job: ColumnJob = .{ .fb = fb, .width = width, .height = height, .world = world, .lods = lods, .cam = cam, .f = f, .s_max = s_max, .sky = sky, .params = params, .imp = imp };
-        pool_mod.dispatch(self.pool, &job, ColumnJob.run, (width + ColumnJob.strip - 1) / ColumnJob.strip);
+        // 32-column strips: small enough to balance sky-cheap vs
+        // terrain-heavy columns across participants.
+        pool_mod.dispatchRanges(self.pool, 32, &job, ColumnJob.runRange, 0, width);
     }
 
     pub fn transpose(self: *Renderer, dst: []u32, src: []const u32, width: usize, height: usize) void {
         const job: TransposeJob = .{ .dst = dst, .src = src, .width = width, .height = height };
-        pool_mod.dispatch(self.pool, &job, TransposeJob.run, (height + TransposeJob.T - 1) / TransposeJob.T);
+        // 16-row bands to match the 16x16 cache-tiled inner walk.
+        pool_mod.dispatchRanges(self.pool, TransposeJob.T, &job, TransposeJob.runRange, 0, height);
     }
 };
 
@@ -394,14 +419,10 @@ pub const Renderer = struct {
 /// sized for the 4-core D1 target.
 pub const pool_workers = pool_mod.max_participants - 1;
 
-/// Screen-column strip job: item i renders columns
-/// [i*strip, i*strip+strip). The march state is stack-local per column
-/// and fb strips are disjoint, so items never interact.
+/// Screen-column strip job: each range renders columns [x0, x1). The
+/// march state is stack-local per column and fb strips are disjoint,
+/// so ranges never interact.
 const ColumnJob = struct {
-    /// Strip width in screen columns: small enough to balance
-    /// sky-cheap vs terrain-heavy columns across participants.
-    const strip = 32;
-
     fb: []u32,
     width: usize,
     height: usize,
@@ -414,9 +435,7 @@ const ColumnJob = struct {
     params: RenderParams,
     imp: ?*const Impostor,
 
-    fn run(self: *const ColumnJob, item: usize) void {
-        const x0 = item * strip;
-        const x1 = @min(x0 + strip, self.width);
+    fn runRange(self: *const ColumnJob, x0: usize, x1: usize) void {
         const wf: f32 = @floatFromInt(self.width);
         const fwd = self.cam.forward();
         const rgt = self.cam.right();
@@ -429,8 +448,8 @@ const ColumnJob = struct {
     }
 };
 
-/// Transpose row-band job: item i transposes tile rows
-/// [i*T, i*T+T) x [0, width) — disjoint dst bands.
+/// Transpose row-band job: each range transposes tile rows
+/// [y0, y1) x [0, width) — disjoint dst bands.
 const TransposeJob = struct {
     const T = 16;
 
@@ -439,9 +458,7 @@ const TransposeJob = struct {
     width: usize,
     height: usize,
 
-    fn run(self: *const TransposeJob, item: usize) void {
-        const y0 = item * T;
-        const ye = @min(y0 + T, self.height);
+    fn runRange(self: *const TransposeJob, y0: usize, ye: usize) void {
         var x0: usize = 0;
         while (x0 < self.width) : (x0 += T) {
             const xe = @min(x0 + T, self.width);
@@ -1606,6 +1623,21 @@ test "marchImpostor claims the below-horizon rows over solid terrain" {
     try std.testing.expectEqual(sentinel, fb[0]);
 }
 
+test "resizeLodChain truncates, extends by doubling, and clamps" {
+    var dists: [max_lods]f32 = .{ 144.0, 288.0, 576.0 } ++ .{0.0} ** (max_lods - 3);
+    try std.testing.expectEqual(@as(usize, 3), lodCount(&dists));
+    resizeLodChain(&dists, 1);
+    try std.testing.expectEqual([max_lods]f32{ 144.0, 0, 0, 0, 0, 0, 0, 0 }, dists);
+    resizeLodChain(&dists, 3);
+    try std.testing.expectEqual([max_lods]f32{ 144.0, 288.0, 576.0, 0, 0, 0, 0, 0 }, dists);
+    resizeLodChain(&dists, max_lods + 4);
+    try std.testing.expectEqual(@as(usize, max_lods), lodCount(&dists));
+    // A 0 first entry stays 0: doubling 0 never grows the chain.
+    dists = @splat(0);
+    resizeLodChain(&dists, 2);
+    try std.testing.expectEqual(@as(usize, 0), lodCount(&dists));
+}
+
 test "lodChain ends at non-increasing distances, missing worlds, and the limit" {
     var t_b: [max_lods + 1]f32 = undefined;
     // Default chain with worlds present: three handoffs ({144, 288,
@@ -1618,7 +1650,7 @@ test "lodChain ends at non-increasing distances, missing worlds, and the limit" 
     try std.testing.expectApproxEqAbs(@as(f32, 288.0), t_b[2], 4.0);
     try std.testing.expectEqual(@as(f32, 448.0), t_b[3]);
     try std.testing.expect(t_b[1] < t_b[2]);
-    // A 0 entry ends the chain (the --lod2 0 form).
+    // A 0 entry ends the chain (the --lods 1 form).
     const n1 = lodChain(.{ .lod_dists = .{ 96.0, 0.0 } ++ .{0.0} ** (max_lods - 2) }, max_lods, 3.9, 10.5, 1.0, 0.0, 448.0, &t_b);
     try std.testing.expectEqual(@as(usize, 1), n1);
     // Non-increasing entries end it too.

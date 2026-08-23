@@ -108,25 +108,23 @@ pub fn downsampleDenseCols(src: []const u8, ss: usize, sh: usize, dst: []u8, c0:
     }
 }
 
-/// downsampleDense across the pool (plans/DISTANCE.md D4).
+/// downsampleDense across the pool (plans/DISTANCE.md D4): 32-column
+/// ranges — half of fill's quantum, since the 2x2x2 scan is much
+/// cheaper per column than terrain gen.
 pub fn downsampleDensePooled(p: ?*pool_mod.Pool, src: []const u8, ss: usize, sh: usize, dst: []u8) void {
     const ds = ss / 2;
     const job: PyrJob = .{ .src = src, .ss = ss, .sh = sh, .dst = dst };
-    pool_mod.dispatch(p, &job, PyrJob.run, (ds * ds + PyrJob.gran - 1) / PyrJob.gran);
+    pool_mod.dispatchRanges(p, 32, &job, PyrJob.runRange, 0, ds * ds);
 }
 
 const PyrJob = struct {
-    const gran = 32;
-
     src: []const u8,
     ss: usize,
     sh: usize,
     dst: []u8,
 
-    fn run(self: *const PyrJob, item: usize) void {
-        const ds = self.ss / 2;
-        const c0 = item * gran;
-        downsampleDenseCols(self.src, self.ss, self.sh, self.dst, c0, @min(c0 + gran, ds * ds));
+    fn runRange(self: *const PyrJob, c0: usize, c1: usize) void {
+        downsampleDenseCols(self.src, self.ss, self.sh, self.dst, c0, c1);
     }
 };
 
@@ -135,8 +133,8 @@ pub const DenseTile = struct { data: []const u8, side: usize, h: usize };
 
 /// Downsample a dense tile through `level` halving steps (pyr[l] is
 /// the level-(l+1) scratch) and return the final coarse tile. Shared
-/// by the coarse-chunk pipelines: loadCoarseChunk/synthCoarseColumn
-/// run inline, the streamer's sliced pipeline rides its pool.
+/// by the coarse-synthesis paths: synthCoarseColumn runs inline, the
+/// streamer's sliced pipeline rides its pool.
 pub fn pyramidDown(pool: ?*pool_mod.Pool, src: DenseTile, pyr: [][]u8, level: u32) DenseTile {
     var cur = src;
     for (0..level) |l| {
@@ -161,47 +159,6 @@ pub fn copyTileColumns(builder: *Builder, tile: DenseTile, cper: usize, ttx: usi
 pub fn levelDims(fine_h: usize, level: u32) struct { side: usize, h: usize } {
     const shift: u6 = @intCast(level);
     return .{ .side = @as(usize, chunk_w) >> shift, .h = (fine_h + (@as(usize, 1) << shift) - 1) >> shift };
-}
-
-/// Coarse-LOD chunk load (plans/STREAMING.md phase 2 item 10): the chunk's
-/// 64x64 coarse columns are synthesized from position-deterministic
-/// fine generation (genColumn over the 64*2^level-wide
-/// fine footprint, tiled through fine_builder) and downsampled through
-/// a dense pyramid — never read from resident fine chunks, so coarse
-/// content carries no edits: edit-driven lod.rebuildRegion patches
-/// resident coarse columns, and resynthCoarseRegion restores gen
-/// content when a fine chunk unloads. Light floods on load exactly
-/// like loadChunk (a pure add pass under the flood's resident-cell
-/// confinement). pyr[L-1] is scratch for the level-L dense tile
-/// (levelDims); coarse_builder is a 64x64 tile over `coarse`.
-pub fn loadCoarseChunk(coarse: *World, ctx: *const terrain.Ctx, fine_builder: *Builder, coarse_builder: *Builder, pyr: [][]u8, level: u32, cx: i32, cz: i32, light: ?lighting.Params, caves: bool) !void {
-    std.debug.assert(level >= 1 and pyr.len >= level);
-    const shift: u6 = @intCast(level);
-    const fine_h = fine_builder.world.h;
-    std.debug.assert(coarse.h == levelDims(fine_h, level).h);
-    std.debug.assert(fine_builder.tw == chunk_w and fine_builder.td == chunk_w);
-    std.debug.assert(coarse_builder.tw == chunk_w and coarse_builder.td == chunk_w);
-    _ = try coarse.ensureChunk(cx, cz);
-    const box = chunkBox(coarse, cx, cz);
-    const tiles = @as(usize, 1) << shift;
-    const cper = @as(usize, chunk_w) >> shift;
-    var ttx: usize = 0;
-    while (ttx < tiles) : (ttx += 1) {
-        var ttz: usize = 0;
-        while (ttz < tiles) : (ttz += 1) {
-            const tx0 = (box.x0 << @as(u5, @intCast(level))) + @as(i32, @intCast(ttx * chunk_w));
-            const tz0 = (box.z0 << @as(u5, @intCast(level))) + @as(i32, @intCast(ttz * chunk_w));
-            terrain.genTileFill(ctx, fine_builder, tx0, tz0, chunk_w, 0, chunk_w * chunk_w, caves);
-            // Pyramid down to the target level, then copy the tile's
-            // coarse columns into the coarse builder tile.
-            const p = pyramidDown(null, .{ .data = fine_builder.dense, .side = chunk_w, .h = fine_h }, pyr, level);
-            copyTileColumns(coarse_builder, p, cper, ttx, ttz);
-        }
-    }
-    try terrain.emitTile(coarse_builder, box.x0, box.z0, @intCast(box.x1 - box.x0), @intCast(box.z1 - box.z0), false);
-    if (light) |params| {
-        _ = try lighting.relight(coarse, coarse.allocator, box, params);
-    }
 }
 
 /// One coarse column straight from generation: the 2^level x 2^level
@@ -351,6 +308,24 @@ test "per-chunk load floods match a single whole-world flood" {
     }
 }
 
+/// The streamer's coarse load path (progressLoad), unsliced and
+/// inline: fine gen over the chunk's 64*2^level-wide footprint,
+/// pyramided down into the coarse builder tile, then committed.
+fn synthCoarseChunk(coarse: *World, ctx: *const terrain.Ctx, fine_builder: *Builder, coarse_builder: *Builder, pyr: [][]u8, level: u32, cx: i32, cz: i32, light: ?lighting.Params) !void {
+    const shift: u5 = @intCast(level);
+    const cper = @as(usize, chunk_w) >> shift;
+    for (0..@as(usize, 1) << shift) |ttx| {
+        for (0..@as(usize, 1) << shift) |ttz| {
+            const tx0 = (cx * chunk_w << shift) + @as(i32, @intCast(ttx * chunk_w));
+            const tz0 = (cz * chunk_w << shift) + @as(i32, @intCast(ttz * chunk_w));
+            terrain.genTileFill(ctx, fine_builder, tx0, tz0, chunk_w, 0, chunk_w * chunk_w, true);
+            const p = pyramidDown(null, .{ .data = fine_builder.dense, .side = chunk_w, .h = fine_builder.world.h }, pyr, level);
+            copyTileColumns(coarse_builder, p, cper, ttx, ttz);
+        }
+    }
+    try commitChunk(coarse, coarse_builder, cx, cz, light, null);
+}
+
 test "coarse chunk synthesis matches eager lod.build" {
     const allocator = std.testing.allocator;
     const gen = @import("gen.zig");
@@ -383,7 +358,7 @@ test "coarse chunk synthesis matches eager lod.build" {
     defer allocator.free(pyr2);
     const pyr = [_][]u8{ pyr1, pyr2 };
     const order = [_][2]i32{ .{ 1, 0 }, .{ 0, 1 }, .{ 0, 0 }, .{ 1, 1 } };
-    for (order) |cc| try loadCoarseChunk(&c1, &ctx, &fine_builder, &cb1, @constCast(&pyr), 1, cc[0], cc[1], params, true);
+    for (order) |cc| try synthCoarseChunk(&c1, &ctx, &fine_builder, &cb1, @constCast(&pyr), 1, cc[0], cc[1], params);
 
     // Materials match over the full extent: generation is position-
     // deterministic, residency doesn't affect it.
@@ -417,7 +392,7 @@ test "coarse chunk synthesis matches eager lod.build" {
     defer c2.deinit();
     var cb2 = try Builder.init(allocator, &c2, chunk_w, chunk_w);
     defer cb2.deinit();
-    try loadCoarseChunk(&c2, &ctx, &fine_builder, &cb2, @constCast(&pyr), 2, 0, 0, null, true);
+    try synthCoarseChunk(&c2, &ctx, &fine_builder, &cb2, @constCast(&pyr), 2, 0, 0, null);
     for (0..ref2.w.?) |x| {
         for (0..ref2.d.?) |z| {
             const ca = ref2.columnAt(@intCast(x), @intCast(z)).?;

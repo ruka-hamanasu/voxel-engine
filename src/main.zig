@@ -30,6 +30,19 @@ fn parseCam(s: []const u8) ![4]f32 {
     return vals;
 }
 
+/// Milliseconds elapsed since `start` — the warm-up/bench timing
+/// pattern shared by the timed sections of main.
+fn msSince(io: std.Io, start: std.Io.Clock.Timestamp) f64 {
+    return @as(f64, @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds)) / 1e6;
+}
+
+/// Timed synchronous warm-up (streamer/impostor ring) with an ms log.
+fn logWarmup(io: std.Io, label: []const u8, target: anytype, cam: Camera) !void {
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try target.runToCompletion(cam);
+    std.log.debug("{s} warm-up: {d:.2} ms", .{ label, msSince(io, start) });
+}
+
 pub fn main(init: std.process.Init) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help            Display this help and exit.
@@ -44,8 +57,7 @@ pub fn main(init: std.process.Init) !void {
         \\    --fogcut <f32>    Fog cutoff distance override.
         \\    --fogcurve <FOGCURVE> Fog curve family: clear (default; near-clear midrange, exactly 1 at the cutoff) or old (milestone-8 normalized exponential).
         \\    --lod <f32>       First LOD switch distance (default 144; 0 disables the coarse worlds).
-        \\    --lod2 <f32>      Second LOD switch distance (default 288; 0 ends the chain there).
-    \\    --lods <u32>      Coarse LOD levels (default: the positive --lod/--lod2 entries); handoffs past --lod2 double.
+    \\    --lods <u32>      Coarse LOD levels (default: the increasing lod_dists prefix); extra handoffs double the last one, 1 ends the chain at --lod.
     \\    --impostor <u32>  Far heightfield impostor base cell size in voxels (default 32, power of two; 0 disables); levels double from it while inside the cutoff. Active only when the fog cutoff exceeds the impostor handoff.
     \\    --impdist <f32>   Cascade-to-impostor handoff distance (default 72 * base cell = 2304); the LOD chain truncates there when the impostor is active.
     \\    --detail <f32>    Per-voxel shading detail distance (default: the first LOD distance; 0 = full detail everywhere).
@@ -174,21 +186,7 @@ pub fn main(init: std.process.Init) !void {
     if (res.args.fogcut) |co| rparams.fog_cutoff = co;
     if (res.args.fogcurve) |fc| rparams.fog_curve = fc;
     if (res.args.lod) |ld| rparams.lod_dists[0] = ld;
-    if (res.args.lod2) |ld2| rparams.lod_dists[1] = ld2;
-    if (res.args.lods) |count| {
-        const want = @min(count, render.max_lods);
-        var n: usize = 0;
-        var prev: f32 = 0;
-        while (n < render.max_lods and rparams.lod_dists[n] > prev) : (n += 1) prev = rparams.lod_dists[n];
-        if (want < n) {
-            for (rparams.lod_dists[want..]) |*d| d.* = 0;
-        } else {
-            while (n < want) : (n += 1) {
-                rparams.lod_dists[n] = prev * 2.0;
-                prev = rparams.lod_dists[n];
-            }
-        }
-    }
+    if (res.args.lods) |count| render.resizeLodChain(&rparams.lod_dists, count);
     if (res.args.detail) |dd|
         rparams.detail_dist = dd
     else if (res.args.dist != null)
@@ -213,15 +211,7 @@ pub fn main(init: std.process.Init) !void {
     // increasing lod_dists entry. Bounded: built eagerly here and
     // incrementally rebuilt from dirty regions on edits. Unbounded:
     // owned by the streamer, chunks synthesized on demand.
-    var lod_count: usize = 0;
-    {
-        var prev_d: f32 = 0;
-        for (rparams.lod_dists) |d| {
-            if (d <= prev_d) break;
-            lod_count += 1;
-            prev_d = d;
-        }
-    }
+    const lod_count = render.lodCount(&rparams.lod_dists);
     var lod_worlds: [render.max_lods]?World = @splat(null);
     defer for (&lod_worlds) |*lw| {
         if (lw.*) |*w| w.deinit();
@@ -246,7 +236,7 @@ pub fn main(init: std.process.Init) !void {
     if (bounded and light_enabled) {
         const fstart = std.Io.Clock.Timestamp.now(init.io, .awake);
         flood_stats = try lighting.floodAll(world, allocator, light_params);
-        flood_ms = @as(f64, @floatFromInt(fstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
+        flood_ms = msSince(init.io, fstart);
         for (0..lod_count) |i| _ = try lighting.floodAll(&lod_worlds[i].?, allocator, light_params);
         // Generation's dirty extents are fully covered by the initial flood.
         _ = world.takeDirty();
@@ -255,12 +245,7 @@ pub fn main(init: std.process.Init) !void {
     // Synchronous streamer warm-up around the camera: headless/bench
     // output and the first interactive frames all see the full
     // resident set (plans/STREAMING.md phase 2 decision).
-    if (streamer) |*st| {
-        const wstart = std.Io.Clock.Timestamp.now(init.io, .awake);
-        try st.runToCompletion(cam);
-        const wms = @as(f64, @floatFromInt(wstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
-        std.log.debug("stream warm-up: {d:.2} ms", .{wms});
-    }
+    if (streamer) |*st| try logWarmup(init.io, "stream", st, cam);
 
     // Far heightfield impostor ring (plans/DISTANCE.md D3): same
     // warm-up discipline as the streamer, then per-frame budgeted
@@ -269,10 +254,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (impostor) |*im| im.deinit();
     if (imp_active) {
         impostor = try impostor_mod.Impostor.init(allocator, generator, opts.seed, opts.h, imp_cell, imp_dist, rparams.fog_cutoff, if (bounded) .{ opts.w, opts.d } else null, &pool);
-        const wstart = std.Io.Clock.Timestamp.now(init.io, .awake);
-        try impostor.?.runToCompletion(cam);
-        const wms = @as(f64, @floatFromInt(wstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
-        std.log.debug("impostor warm-up: {d:.2} ms", .{wms});
+        try logWarmup(init.io, "impostor", &impostor.?, cam);
     }
     const imp_ptr: ?*const impostor_mod.Impostor = if (impostor) |*im| im else null;
 
@@ -304,8 +286,8 @@ pub fn main(init: std.process.Init) !void {
             rnd.render(framebuffer, render_w, render_h, world, lods, cam, rparams, imp_ptr);
             std.mem.doNotOptimizeAway(framebuffer[0]);
         }
-        const ns: f64 = @floatFromInt(start.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds);
-        std.debug.print("bench: {} frames, {d:.3} ms/frame\n", .{ bench_frames, ns / 1e6 / @as(f64, @floatFromInt(bench_frames)) });
+        const ms = msSince(init.io, start);
+        std.debug.print("bench: {} frames, {d:.3} ms/frame\n", .{ bench_frames, ms / @as(f64, @floatFromInt(bench_frames)) });
         if (cam_to != null and streamer != null)
             std.debug.print("bench stream: {} chunks loaded\n", .{streamer.?.loads - loads_before});
         if (headless_path == null) return;
@@ -499,8 +481,7 @@ pub fn main(init: std.process.Init) !void {
                 if (light_enabled) {
                     const rstart = std.Io.Clock.Timestamp.now(init.io, .awake);
                     const rstats = try lighting.relight(world, allocator, r, light_params);
-                    const rms = @as(f64, @floatFromInt(rstart.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.nanoseconds)) / 1e6;
-                    std.log.info("relight: {} columns, {} runs, {d:.2} ms", .{ rstats.lit_columns, rstats.runs, rms });
+                    std.log.info("relight: {} columns, {} runs, {d:.2} ms", .{ rstats.lit_columns, rstats.runs, msSince(init.io, rstart) });
                 }
             }
         }

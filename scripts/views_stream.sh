@@ -9,7 +9,7 @@ BIN=$1
 OUT=$2
 mkdir -p "$OUT"
 i=0
-for mode in "--no-light --fog 0 --fogcut 96 --lod 64 --lod2 0 --detail 48" ""; do
+for mode in "--no-light --fog 0 --fogcut 96 --lod 64 --lods 1 --detail 48" ""; do
   tag=l0f0
   [ -z "$mode" ] && tag=def
   $BIN $mode --headless "$OUT/v00_spawn_${tag}.ppm"

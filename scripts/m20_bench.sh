@@ -11,8 +11,10 @@ declare -A CAMS=(
 )
 declare -A CFGS=(
   [A_nolod_long]="--lod 0 --fogcut 448"
-  [B_lod1_long]="--lod 96 --lod2 0 --fogcut 448"
-  [C_lod2_long]="--lod 96 --lod2 192 --fogcut 448"
+  [B_lod1_long]="--lod 96 --lods 1 --fogcut 448"
+  # R3 dropped --lod2: the {96,192} chain is no longer expressible, so
+  # C now benches the doubled {96,288} chain.
+  [C_lod2_long]="--lod 96 --lods 2 --fogcut 448"
   [D_nolod_short]="--lod 0 --fogcut 96"
   [E_default]="--fogcut 96"
 )

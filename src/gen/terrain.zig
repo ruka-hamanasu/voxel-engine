@@ -213,34 +213,26 @@ pub fn genTileFill(ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, td: usize, 
     }
 }
 
-/// genTileFill across the pool (plans/DISTANCE.md D4): item i fills a
-/// `gran`-column sub-range of [col0, col1). Ctx is read-only and items
-/// write disjoint dense builder columns, so pooled output is
-/// byte-identical to the inline call.
+/// genTileFill across the pool (plans/DISTANCE.md D4): 64-column
+/// ranges (a genColumn sweep per column is already a chunky quantum,
+/// and it subdivides the streamer's budget windows). Ctx is read-only
+/// and ranges write disjoint dense builder columns, so pooled output
+/// is byte-identical to the inline call.
 pub fn genTileFillPooled(p: ?*pool_mod.Pool, ctx: *const Ctx, b: *Builder, tx0: i32, tz0: i32, td: usize, col0: usize, col1: usize, caves: bool) void {
-    const job: FillJob = .{ .ctx = ctx, .b = b, .tx0 = tx0, .tz0 = tz0, .td = td, .col0 = col0, .col1 = col1, .caves = caves };
-    pool_mod.dispatch(p, &job, FillJob.run, job.items());
+    const job: FillJob = .{ .ctx = ctx, .b = b, .tx0 = tx0, .tz0 = tz0, .td = td, .caves = caves };
+    pool_mod.dispatchRanges(p, 64, &job, FillJob.runRange, col0, col1);
 }
 
 const FillJob = struct {
-    const gran = 64;
-
     ctx: *const Ctx,
     b: *Builder,
     tx0: i32,
     tz0: i32,
     td: usize,
-    col0: usize,
-    col1: usize,
     caves: bool,
 
-    fn items(self: *const FillJob) usize {
-        return (self.col1 - self.col0 + gran - 1) / gran;
-    }
-
-    fn run(self: *const FillJob, item: usize) void {
-        const c0 = self.col0 + item * gran;
-        genTileFill(self.ctx, self.b, self.tx0, self.tz0, self.td, c0, @min(c0 + gran, self.col1), self.caves);
+    fn runRange(self: *const FillJob, c0: usize, c1: usize) void {
+        genTileFill(self.ctx, self.b, self.tx0, self.tz0, self.td, c0, c1, self.caves);
     }
 };
 

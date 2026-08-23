@@ -95,18 +95,27 @@ pub fn chunkKey(cx: i32, cz: i32) u64 {
     return (@as(u64, @as(u32, @bitCast(cx))) << 32) | @as(u32, @bitCast(cz));
 }
 
-/// Chunk map with a multiplicative-mix hash: the render march pays a
-/// lookup per cell, and Wyhash (AutoHashMap's default) cost ~20% of
-/// the frame. One multiply mixes the small-int coords into the high
-/// bits the map's capacity mask uses.
-const ChunkMap = std.HashMap(u64, *Chunk, struct {
-    pub fn hash(_: @This(), k: u64) u64 {
-        return k *% 0x9E3779B97F4A7C15;
+/// Inverse of chunkKey.
+pub fn unpackKey(key: u64) [2]i32 {
+    return .{ @bitCast(@as(u32, @truncate(key >> 32))), @bitCast(@as(u32, @truncate(key))) };
+}
+
+/// Multiplicative-mix hash context for the coord/box-keyed maps
+/// (ChunkMap, impostor TileMap, lighting CellMap): one multiply mixes
+/// the small-int keys into the high bits the capacity mask uses, and
+/// Wyhash (AutoHashMap's default) cost ~20% of the render frame on
+/// ChunkMap / ~45% of a chunk load's flood on CellMap.
+pub const MixHash = struct {
+    pub fn hash(_: @This(), k: anytype) u64 {
+        return @as(u64, k) *% 0x9E3779B97F4A7C15;
     }
-    pub fn eql(_: @This(), a: u64, b: u64) bool {
+    pub fn eql(_: @This(), a: anytype, b: @TypeOf(a)) bool {
         return a == b;
     }
-}, std.hash_map.default_max_load_percentage);
+};
+
+/// The render march pays a ChunkMap lookup per cell.
+const ChunkMap = std.HashMap(u64, *Chunk, MixHash, std.hash_map.default_max_load_percentage);
 
 /// Rebuild a column's solidity bitmask from its material runs.
 /// Caller guarantees h <= 64.

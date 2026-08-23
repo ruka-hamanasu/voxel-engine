@@ -22,7 +22,21 @@
   7; R2.2 leaves marchImpostor's scalar rescale alone (user call: a
   MarchCfg without a world is a lie, optional world worse), scaledCfg
   serves the two cascade sites; R2.5 found 8 emit sites, not six.
-- R3: not started.
+- **R3: COMPLETED.** All R3.1-R3.6 items done (uncommitted). Gates:
+  `zig build test` green (new resizeLodChain unit test); all four
+  sweeps byte-identical to views_m39*; --dist 2048 impostor smoke OK.
+  Adjustments vs the item list: R3.1's dispatchRanges takes
+  (gran, ctx, func, base, end) and func gets (lo, hi); TransposeJob.T
+  survives (the inner cache-tile walk uses it). R3.2: MixHash is
+  generic over key width (u64 maps + lighting's u32 CellMap);
+  impostor tileKey is now an alias of world.chunkKey. R3.3:
+  lodChainFor stays (its doubling terminates on dist, not count); the
+  helpers cover the other three copies. R3.5: the parity test drives
+  a test-local synthCoarseChunk (shared helpers + commitChunk), order
+  pin kept. R3.6 also touched views_stream.sh (same pinned string as
+  views.sh) and m20_bench.sh, where C_lod2_long's {96,192} chain is
+  unexpressible under --lods and became {96,288} (noted in the
+  script); PLAN.md's historical milestone entries left as history.
 
 Simplification pass ahead of the DISTANCE.md D5 work, from a three-way
 audit of src/. Gates after every phase: `zig build test` green and all

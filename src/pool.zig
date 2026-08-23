@@ -138,6 +138,21 @@ pub fn dispatch(p: ?*Pool, ctx: anytype, comptime func: anytype, n_items: usize)
     for (0..n_items) |i| func(ctx, i);
 }
 
+/// dispatch() over disjoint gran-sized ranges of [base, end): item i
+/// calls func(ctx, base + i*gran, min(base + (i+1)*gran, end)).
+pub fn dispatchRanges(p: ?*Pool, comptime gran: usize, ctx: anytype, comptime func: anytype, base: usize, end: usize) void {
+    const R = struct {
+        ctx: @TypeOf(ctx),
+        base: usize,
+        end: usize,
+        fn run(self: *const @This(), item: usize) void {
+            const lo = self.base + item * gran;
+            func(self.ctx, lo, @min(lo + gran, self.end));
+        }
+    };
+    dispatch(p, &R{ .ctx = ctx, .base = base, .end = end }, R.run, if (end > base) (end - base + gran - 1) / gran else 0);
+}
+
 test "run covers every item exactly once, inline and pooled" {
     const Counter = struct {
         hits: [64]std.atomic.Value(u32) = @splat(.init(0)),

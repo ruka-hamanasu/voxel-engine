@@ -72,19 +72,9 @@ const neighbor_offsets = .{ .{ 1, 0, 0, Dir.px }, .{ -1, 0, 0, Dir.nx }, .{ 0, 1
 /// lands, plans/STREAMING.md), not the world volume. Origins are i32 so
 /// chunk boxes at negative coords work in the unbounded world.
 ///
-/// The map uses a multiplicative-mix hash (the ChunkMap trick): box-
-/// local keys are near-sequential, and Wyhash on them cost ~45% of a
-/// chunk load's flood. Hash choice doesn't affect flood OUTPUT — the
-/// BFS visit order and first-write-wins tie rule are independent of
-/// the map's internal layout.
-const CellMap = std.HashMap(u32, u32, struct {
-    pub fn hash(_: @This(), k: u32) u64 {
-        return @as(u64, k) *% 0x9E3779B97F4A7C15;
-    }
-    pub fn eql(_: @This(), a: u32, b: u32) bool {
-        return a == b;
-    }
-}, std.hash_map.default_max_load_percentage);
+/// Hash choice doesn't affect flood OUTPUT — the BFS visit order and
+/// first-write-wins tie rule are independent of the map's layout.
+const CellMap = std.HashMap(u32, u32, world_mod.MixHash, std.hash_map.default_max_load_percentage);
 
 const Scratch = struct {
     x0: i32,

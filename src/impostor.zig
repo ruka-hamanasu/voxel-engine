@@ -43,27 +43,11 @@ pub const Cell = struct { top_y: u16, mat: u8, stamp: u8 = 0 };
 
 const Tile = struct { cells: [cells_per_tile]Cell };
 
-/// Hash-map key for the tile at tile coords (tx, tz): packed i32 pair
-/// (arithmetic-shift tile coords, so negatives work), same scheme as
-/// world.zig's chunkKey.
-fn tileKey(tx: i32, tz: i32) u64 {
-    return (@as(u64, @as(u32, @bitCast(tx))) << 32) | @as(u32, @bitCast(tz));
-}
+const tileKey = world_mod.chunkKey;
+const unpackKey = world_mod.unpackKey;
 
-fn unpackKey(key: u64) [2]i32 {
-    return .{ @bitCast(@as(u32, @truncate(key >> 32))), @bitCast(@as(u32, @truncate(key))) };
-}
-
-/// Multiplicative-mix hash, same rationale as world.zig's ChunkMap:
-/// the march pays a lookup per cell-tile crossing.
-const TileMap = std.HashMap(u64, *Tile, struct {
-    pub fn hash(_: @This(), k: u64) u64 {
-        return k *% 0x9E3779B97F4A7C15;
-    }
-    pub fn eql(_: @This(), a: u64, b: u64) bool {
-        return a == b;
-    }
-}, std.hash_map.default_max_load_percentage);
+/// The march pays a lookup per cell-tile crossing.
+const TileMap = std.HashMap(u64, *Tile, world_mod.MixHash, std.hash_map.default_max_load_percentage);
 
 /// Last-lookup memo, sharded per render-pool participant exactly like
 /// world.zig's (reuses its threadlocal slot; padded to its own cache
@@ -290,8 +274,8 @@ pub const Impostor = struct {
             const f = &self.in_flight.?;
             const lvl = &self.levels[f.level];
             const n = @min(remaining, cells_per_tile - f.next);
-            const job: CellJob = .{ .gctx = self.gctx(), .tile = f.tile, .base_cx = f.tx * tile_cells, .base_cz = f.tz * tile_cells, .shift = lvl.shift, .first = f.next, .last = f.next + n };
-            pool_mod.dispatch(self.pool, &job, CellJob.run, job.items());
+            const job: CellJob = .{ .gctx = self.gctx(), .tile = f.tile, .base_cx = f.tx * tile_cells, .base_cz = f.tz * tile_cells, .shift = lvl.shift };
+            pool_mod.dispatchRanges(self.pool, 128, &job, CellJob.runRange, f.next, f.next + n);
             f.next += n;
             remaining -= n;
             if (f.next == cells_per_tile) {
@@ -322,28 +306,20 @@ pub const Impostor = struct {
     }
 };
 
-/// Synthesis batch job (D4): item i fills cells [first + i*gran, ...)
-/// of the in-flight tile. gen.impostorCell is a pure function of the
-/// generator context and cell origin, and items write disjoint cells,
-/// so pooled and inline fills produce identical tiles.
+/// Synthesis batch job (D4): 128-cell ranges — cell synthesis is
+/// cheap, so a bigger quantum amortizes atomic-counter overhead.
+/// gen.impostorCell is a pure function of the generator context and
+/// cell origin, and ranges write disjoint cells, so pooled and inline
+/// fills produce identical tiles.
 const CellJob = struct {
-    const gran = 128;
-
     gctx: gen.ImpostorCtx,
     tile: *Tile,
     base_cx: i32, // tile origin in cell coords
     base_cz: i32,
     shift: u5,
-    first: usize,
-    last: usize,
 
-    fn items(self: *const CellJob) usize {
-        return (self.last - self.first + gran - 1) / gran;
-    }
-
-    fn run(self: *const CellJob, item: usize) void {
-        const begin = self.first + item * gran;
-        for (begin..@min(begin + gran, self.last)) |idx| {
+    fn runRange(self: *const CellJob, first: usize, last: usize) void {
+        for (first..last) |idx| {
             const lx: i32 = @intCast(idx / tile_cells);
             const lz: i32 = @intCast(idx % tile_cells);
             const c = gen.impostorCell(self.gctx, (self.base_cx + lx) << self.shift, (self.base_cz + lz) << self.shift, @as(u32, 1) << self.shift);

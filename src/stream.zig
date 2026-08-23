@@ -219,10 +219,6 @@ pub const Streamer = struct {
         return @divFloor(fx, @as(i32, chunk_w) << @as(u5, @intCast(level)));
     }
 
-    fn unpackKey(key: u64) [2]i32 {
-        return .{ @bitCast(@as(u32, @truncate(key >> 32))), @bitCast(@as(u32, @truncate(key))) };
-    }
-
     /// One streaming step: unload past the hysteresis radius, refresh
     /// the load queue, and fill up to `budget` columns. Returns true
     /// while work (queued, repairing, or in flight) remains.
@@ -239,12 +235,12 @@ pub const Streamer = struct {
             defer drop.deinit(self.allocator);
             var it = w.chunks.keyIterator();
             while (it.next()) |k| {
-                const cc = unpackKey(k.*);
+                const cc = world_mod.unpackKey(k.*);
                 const d = @max(@abs(cc[0] - ccx), @abs(cc[1] - ccz));
                 if (d > self.unload_r[li]) try drop.append(self.allocator, k.*);
             }
             for (drop.items) |key| {
-                const cc = unpackKey(key);
+                const cc = world_mod.unpackKey(key);
                 if (level == 0 and self.edited.remove(key)) {
                     // The chunk's edits vanish with it: re-synthesize
                     // the covering coarse columns from generation.
