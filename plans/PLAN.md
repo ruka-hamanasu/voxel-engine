@@ -7,7 +7,8 @@ rendering, emissive voxels, sky light, directional sun shadows, fog, and fake AO
 ## Tech stack
 
 - **Language:** Zig 0.16
-- **Platform layer:** SDL2 (`libsdl2-dev` via apt), used only for window,
+- **Platform layer:** SDL2 (vendored 2.32.4, compiled from source and
+  linked statically; see plans/PORTABILITY.md), used only for window,
   input, and displaying the framebuffer.
 - **UI:** Nuklear
 - **CLI:** zig-clap (0.12.0) for option parsing and `--help` text. Lighting
@@ -242,7 +243,7 @@ identity regression path).
 ## File layout
 
 ```
-build.zig            # link system SDL2 via pkg-config
+build.zig            # vendored static SDL2 via build/sdl.zig (+ build/config/SDL_config.h)
 scripts/             # verification: views*.sh regression sweeps, walk_bench.sh, mem.sh, vista_km.sh
 src/main.zig         # SDL init, frame loop, --headless mode, edit picking
 src/world.zig        # chunk map, columns, material + light RLE streams, edit API, palette
@@ -947,4 +948,30 @@ entries here record scope and outcome only.
        (macro min_solid_y) stays structurally inert on grounded
        heightfield — the city generator's lever, with R2.3's merged
        skip block as its insertion point. scripts/walk_bench.sh
-       gained an optional dist arg.
+        gained an optional dist arg.
+
+41. COMPLETED - Portable Linux binary (plans/PORTABILITY.md). SDL2
+       2.32.4 is now vendored (hash-pinned zon dep) and compiled from
+       source with zig cc, statically linked into the executable —
+       `libsdl2-dev` is no longer needed on any build machine, and the
+       binary links nothing but glibc. SDL keeps its runtime dlopen of
+       the X11 client libraries (libX11/libXext/libXcursor/libXi/
+       libXfixes/libXrandr/libXss), so it adapts to whatever X stack the
+       host has; only X11 headers are needed at compile time (header-only
+       zon deps). build/sdl.zig is the glue (file list taken from SDL's
+       own cmake configure for Linux/X11; SDL_fcitx.c excluded — no
+       internal guard), build/config/SDL_config.h is hand-trimmed from
+       the cmake-generated config (audio/joystick/haptic/hidapi/sensor
+       off, dbus/ibus/udev/evdev out, strlcpy/wcslcpy-family HAVEs
+       removed for the glibc floor). Release build: `zig build
+       -Dtarget=x86_64-linux-gnu.2.28 -Doptimize=ReleaseSafe` — verified
+       GLIBC_2.28 max symbol, ldd shows only libc/libm/libpthread/libdl.
+       X11 text input is plain XIM (no ibus/fcitx). Wayland deferred
+       (cheap to add in this model: header-only wayland/xkbcommon deps +
+       pregenerated protocols, runtime stays dlopen). Fully-static-musl
+       remains a documented option at the cost of vendoring the static
+       X11 stack. Gates: zig build test green; all four sweeps
+       byte-identical to views_m39* with both the native and the
+       pinned-2.28 binaries; nk_impl.c now includes <SDL.h> (was
+       <SDL2/SDL.h>, a distro layout). Interactive smoke on a real X
+       session is the user's remaining check.

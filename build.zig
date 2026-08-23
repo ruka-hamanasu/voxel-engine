@@ -1,4 +1,5 @@
 const std = @import("std");
+const sdl = @import("build/sdl.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -16,7 +17,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addImport("clap", clap.module("clap"));
-    exe_mod.linkSystemLibrary("SDL2", .{});
+    // Vendored SDL2, compiled from source and linked statically (works
+    // for every target, incl. pinned old-glibc release builds).
+    sdl.addSdl(b, exe_mod);
     exe_mod.addIncludePath(nuklear.path(""));
     exe_mod.addIncludePath(nuklear.path("demo/sdl_renderer"));
     exe_mod.addIncludePath(b.path("src"));

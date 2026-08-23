@@ -1,4 +1,4 @@
-#include <SDL2/SDL.h>
+#include <SDL.h>
 
 #include "nk_config.h"
 #define NK_IMPLEMENTATION
